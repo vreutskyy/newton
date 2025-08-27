@@ -1009,8 +1009,6 @@ def parse_usd(
             )
             articulation_id += 1
 
-    parse_tendon_sites(tendon_sites_info)
-
     # insert remaining bodies that were not part of any articulation so far
     for path, rigid_body_desc in body_specs.items():
         parse_body(
@@ -1344,6 +1342,8 @@ def parse_usd(
             articulation_bodies = articulation_bodies_updates
 
             builder = multi_env_builder
+
+    parse_tendon_sites(tendon_sites_info) # do this after collapsing path_body_map
 
     return {
         "fps": stage.GetFramesPerSecond(),
