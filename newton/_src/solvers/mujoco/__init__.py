@@ -14,7 +14,9 @@
 # limitations under the License.
 
 from .solver_mujoco import SolverMuJoCo
+from .solver_mujoco2 import SolverMuJoCo2
 
 __all__ = [
     "SolverMuJoCo",
+    "SolverMuJoCo2",
 ]

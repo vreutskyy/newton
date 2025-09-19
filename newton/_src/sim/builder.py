@@ -112,6 +112,14 @@ class ModelBuilder:
     - Group -1: Global entities shared across all environments (e.g., ground plane)
     - Group 0, 1, 2, ...: Environment-specific entities
 
+    Important grouping rules:
+    
+    - **Shapes inherit their group from their body**: If a shape is attached to a body, it 
+      automatically takes that body's environment group. Shapes without bodies use current_env_group.
+    - **Joints inherit their group from their bodies**: Joints take the non-global body's group. 
+      If both bodies are in the same non-global group, the joint takes that group. Global bodies 
+      can connect to any environment. Joints cannot connect bodies from different non-global environments.
+
     There are two ways to assign environment groups:
 
     1. **Direct entity creation**: Entities inherit the builder's `current_env_group` value::
@@ -1302,7 +1310,22 @@ class ModelBuilder:
         self.joint_key.append(key or f"joint_{self.joint_count}")
         self.joint_dof_dim.append((len(linear_axes), len(angular_axes)))
         self.joint_enabled.append(enabled)
-        self.joint_group.append(self.current_env_group)
+        
+        # Joint inherits group from its bodies
+        child_group = self.body_group[child]
+        parent_group = self.body_group[parent] if parent >= 0 else child_group
+        
+        # Determine joint group: prefer non-global group, validate if both non-global
+        if parent_group == child_group or parent_group == -1 or child_group == -1:
+            joint_group = max(parent_group, child_group)  # -1 < any non-global group
+        else:
+            raise ValueError(
+                f"Joint cannot connect bodies from different environment groups: "
+                f"parent body {parent} is in group {parent_group}, "
+                f"child body {child} is in group {child_group}"
+            )
+            
+        self.joint_group.append(joint_group)
 
         def add_axis_dim(dim: ModelBuilder.JointDofConfig):
             self.joint_axis.append(dim.axis)
@@ -2425,7 +2448,7 @@ class ModelBuilder:
         self.shape_material_restitution.append(cfg.restitution)
         self.shape_collision_group.append(cfg.collision_group)
         self.shape_collision_radius.append(compute_shape_radius(type, scale, src))
-        self.shape_group.append(self.current_env_group)
+        self.shape_group.append(self.body_group[body] if body >= 0 else self.current_env_group)
         if cfg.collision_filter_parent and body > -1 and body in self.joint_parents:
             for parent_body in self.joint_parents[body]:
                 if parent_body > -1:
