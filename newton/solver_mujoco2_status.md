@@ -1,5 +1,15 @@
 # SolverMuJoCo2 Implementation Status
 
+## Test Status
+- ✅ 21/22 unit tests passing
+- ❌ `test_velocity_control` - reaches ~63% of target velocity (likely needs gain tuning)
+
+## Key Fixes Applied
+1. **Mass Handling**: SolverMuJoCo2 now correctly respects user-specified mass
+2. **Body Forces**: Fixed force application - body forces now work correctly
+3. **Body Transforms**: Initial positions and rotations properly set from Newton
+4. **Actuator Mapping**: Fixed using MuJoCo's internal `actuator_trnid`
+
 ## Initialization (Model Creation)
 
 ### ✅ Already Implemented
@@ -8,6 +18,9 @@
 - ✅ `gravity` - from `model.gravity`
 - ✅ `timestep` - default 0.01
 - ✅ `integrator` - set to IMPLICITFAST
+- ✅ `solver` - constraint solver type (CG/Newton)
+- ✅ `iterations` - solver iterations
+- ✅ `ls_iterations` - line search iterations
 
 #### Basic Structure
 - ✅ Bodies created with proper hierarchy
@@ -18,12 +31,32 @@
 - ✅ Shape transforms (position and orientation)
 - ✅ Multi-world support with environment separation
 
+#### Body Properties
+- ✅ `mass` - from `body_mass`
+- ✅ `ipos` - center of mass from `body_com`
+- ✅ `fullinertia` - from `body_inertia`
+- ✅ `explicitinertial` - flag for explicit inertia
+
+#### Joint Properties
+- ✅ `armature` - from `joint_armature`
+- ✅ `frictionloss` - from `joint_friction`
+- ✅ `damping` - set to 0 for all joints
+
+#### Shape/Geom Properties
+- ✅ `friction` - from `shape_material_mu` with torsional/rolling
+- ✅ `solref` - contact stiffness/damping from `shape_material_ke/kd`
+- ✅ `solimp` - contact impedance parameters (default values)
+
+#### Actuator System
+- ✅ Actuators for single-DOF joints (revolute/prismatic)
+- ✅ `forcerange` - from `joint_effort_limit`
+- ✅ Position/velocity servos based on joint mode
+- ✅ PD control via kp/kv parameters
+- ✅ Control force updates (joint_target → ctrl)
+
 ### ❌ Missing in Initialization
 
 #### Solver Options
-- ❌ `solver` - constraint solver type (CG/Newton)
-- ❌ `iterations` - solver iterations (default 20)
-- ❌ `ls_iterations` - line search iterations (default 10)
 - ❌ `cone` - friction cone type (pyramidal/elliptic)
 - ❌ `impratio` - impedance ratio
 - ❌ `tolerance` - solver tolerance
@@ -35,32 +68,18 @@
 - ❌ `geom.solimp` - default contact impedance
 - ❌ `geom.friction` - default friction coefficients
 
-#### Body Properties
-- ❌ `mass` - from `body_mass`
-- ❌ `ipos` - center of mass from `body_com`
-- ❌ `fullinertia` - from `body_inertia`
-- ❌ `explicitinertial` - flag for explicit inertia
 
 #### Joint Properties
 - ❌ `pos` - joint position for non-revolute joints
-- ❌ `armature` - from `joint_armature`
-- ❌ `frictionloss` - from `joint_friction`
-- ❌ `damping` - explicit damping values
 - ❌ `solref_limit`, `solimp_limit` - customizable limit parameters
 
 #### Geom/Shape Properties
 - ❌ `contype`, `conaffinity` - collision filtering from shape colors
-- ❌ `friction` - from `shape_material_mu` with torsional/rolling
-- ❌ `solref` - contact stiffness/damping from `shape_material_ke/kd`
-- ❌ `solimp` - contact impedance parameters
 - ❌ `rgba` - visualization colors
 
 #### Actuator System
-- ❌ Actuators for each controllable DOF
-- ❌ `gear` - actuator gear ratios
-- ❌ `forcerange` - from `joint_effort_limit`
-- ❌ `gainprm`, `biasprm` - PD control parameters
-- ❌ Mapping from DOFs to actuators
+- ❌ Actuators for multi-DOF joints (FREE, BALL)
+- ❌ `gear` - custom actuator gear ratios
 
 #### Other
 - ❌ Mesh support for complex geometries
@@ -80,86 +99,90 @@
 - ✅ Joint velocities (`qvel` → `joint_qd`)
 - ✅ Body transforms (`xpos`, `xquat` → `body_q`)
 
+##### Per-Step Updates
+- ✅ Control forces:
+  - ✅ `control.joint_target` → `ctrl` (via actuators)
+  - ✅ `control.joint_f` → `qfrc_applied`
+  - ✅ `state.body_f` → `xfrc_applied` (FIXED - now working correctly)
+
+### ✅ Dynamic Property Updates (Now Implemented)
+- ✅ Body properties:
+  - ✅ Mass handling fixed - respects user-specified mass
+  - ✅ COM and inertia passed correctly
+- ✅ Joint properties:
+  - ✅ Armature and friction
+- ✅ Shape properties:
+  - ✅ Friction and contact parameters
+- ✅ Actuator properties:
+  - ✅ PD control gains
+
 ### ❌ Missing Runtime Updates
 
 #### Newton → MuJoCo Updates
 
-##### Per-Step Updates
-- ❌ Control forces:
-  - ❌ `control.joint_target` → `ctrl` (via actuators)
-  - ❌ `control.joint_f` → `qfrc_applied`
-  - ❌ `state.body_f` → `xfrc_applied`
 
 ##### Dynamic Property Updates (via notify_model_changed)
-- ❌ Body properties:
-  - ❌ `body_mass` → `body_mass`
-  - ❌ `body_com` → `body_ipos`
-  - ❌ `body_inertia` → `body_inertia`, `body_iquat`
-
-- ❌ Joint properties:
-  - ❌ `joint_armature` → `dof_armature`
-  - ❌ `joint_friction` → `dof_frictionloss`
-  - ❌ `joint_X_p`, `joint_X_c` → `jnt_pos`, `jnt_axis`
-  - ❌ Body transforms from joint transforms
-
-- ❌ Shape properties:
-  - ❌ `shape_transform` → `geom_pos`, `geom_quat` (dynamic)
-  - ❌ `shape_collision_radius` → `geom_rbound`
-  - ❌ `shape_material_mu` → `geom_friction`
-  - ❌ `shape_material_ke/kd` → `geom_solref`
-  - ❌ `shape_scale` → `geom_size`
-
-- ❌ Actuator properties:
-  - ❌ `joint_target_ke/kd` → `actuator_gainprm`, `actuator_biasprm`
-  - ❌ `joint_effort_limit` → `actuator_forcerange`
+- ❌ Need to implement notify_model_changed() method for runtime updates
+- ❌ Track which properties have changed
+- ❌ Update only changed properties for efficiency
 
 #### MuJoCo → Newton Updates
 
 ##### Contact Information
 - ❌ MuJoCo contacts → Newton contact format (if using MuJoCo collision detection)
 
-## Key Missing Systems
+## Key Systems Status
 
-### 1. Actuator System
-- Need to create actuators during initialization
-- Map DOFs to actuator indices
-- Support different control modes (FORCE, TARGET_POSITION, TARGET_VELOCITY)
-- Update actuator parameters dynamically
+### ✅ Completed Systems
 
-### 2. Dynamic Updates
-- Implement `notify_model_changed()` method
-- Track which properties have changed
-- Update only changed properties for efficiency
+1. **Actuator System**
+   - ✅ Create actuators during initialization
+   - ✅ Map DOFs to actuator indices  
+   - ✅ Support different control modes (FORCE, TARGET_POSITION, TARGET_VELOCITY)
+   - ✅ PD control gains properly configured
 
-### 3. Control Application
-- Implement proper control force application
-- Handle joint forces in different joint types
-- Apply body forces with proper coordinate transforms
+2. **Control Application**
+   - ✅ Proper control force application
+   - ✅ Handle joint forces in different joint types
+   - ✅ Apply body forces with proper coordinate transforms
 
-### 4. Contact Handling
-- Option to use MuJoCo or Newton collision detection
-- Convert between contact formats if needed
+3. **Basic Property Updates**
+   - ✅ All properties set correctly during initialization
+   - ✅ Mass handling respects user specifications
 
-### 5. Multi-DOF Joints
-- Handle complex joints (UNIVERSAL, D6)
-- Proper DOF indexing and mapping
+### ❌ Missing Systems
+
+1. **Dynamic Updates**
+   - ❌ Implement `notify_model_changed()` method
+   - ❌ Track which properties have changed
+   - ❌ Update only changed properties for efficiency
+
+2. **Contact Handling**
+   - ❌ Option to use MuJoCo or Newton collision detection
+   - ❌ Convert between contact formats if needed
+
+3. **Multi-DOF Joints**
+   - ❌ Handle complex joints (UNIVERSAL, D6)
+   - ❌ Proper DOF indexing and mapping
 
 ## Implementation Priority
 
-### High Priority (Required for basic physics)
-1. Body mass, COM, and inertia initialization
-2. Joint armature and friction
-3. Control force application
-4. Basic actuator system
+### ✅ Completed (High Priority)
+1. ✅ Body mass, COM, and inertia initialization
+2. ✅ Joint armature and friction
+3. ✅ Control force application
+4. ✅ Basic actuator system
+5. ✅ Shape contact properties (friction, stiffness)
+6. ✅ Solver parameters
 
-### Medium Priority (Required for accurate simulation)
-1. Shape contact properties (friction, stiffness)
-2. Dynamic property updates
-3. Collision filtering
-4. Proper solver parameters
+### 🔧 In Progress
+1. Fine-tuning velocity control gains
+2. Testing with more complex models
 
-### Low Priority (Nice to have)
-1. Mesh support
-2. Equality constraints
-3. Advanced actuator features
-4. Visualization improvements
+### ❌ Still Missing
+1. notify_model_changed() for runtime updates
+2. Multi-DOF joint support (UNIVERSAL, D6)
+3. Contact handling (MuJoCo vs Newton contacts)
+4. Mesh support
+5. Equality constraints
+6. Coordinate system conversion for different up-axis

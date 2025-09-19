@@ -26,6 +26,7 @@ from ...sim import (
     Contacts,
     Control,
     JointType,
+    JointMode,
     Model,
     State,
 )
@@ -46,10 +47,37 @@ class SolverMuJoCo2(SolverBase):
     uses a single world. Otherwise, creates separate worlds for each environment.
     All non-global environments are expected to have the same number of bodies,
     shapes, and joints.
+    
+    SolverMuJoCo2 requirements for Newton models:
+    - For single-world simulation: all entities must be in group -1 (global)
+    - For multi-world simulation: 
+      * Each environment must have identical structure
+      * Bodies and joints must be assigned to environments (group >= 0)
+      * Only static shapes can be global (group -1)
+      
+    These constraints allow efficient mapping between Newton and MuJoCo's 
+    multi-world architecture. Note that these are solver requirements, not
+    Newton model limitations - Newton itself supports arbitrary entity
+    distributions across environments.
     """
     
-    def __init__(self, model: Model):
+    def __init__(self, model: Model, 
+                 solver: str = "newton",
+                 iterations: int = 50,
+                 ls_iterations: int = 10):
+        """
+        Args:
+            model: Newton model to simulate
+            solver: Constraint solver type ("cg" or "newton")
+            iterations: Number of solver iterations
+            ls_iterations: Number of line search iterations
+        """
         super().__init__(model)
+        
+        # Store solver parameters
+        self.solver = solver
+        self.iterations = iterations
+        self.ls_iterations = ls_iterations
         
         # Automatically determine if we should separate environments to worlds
         # by checking if any entities are in non-global environments
@@ -85,20 +113,10 @@ class SolverMuJoCo2(SolverBase):
         self.mjc_to_newton_body: wp.array2d = None  # [nworld, n_mjc_bodies] -> Newton body idx
         self.mjc_to_newton_joint: wp.array2d = None  # [nworld, n_mjc_joints] -> Newton joint idx  
         self.mjc_to_newton_geom: wp.array2d = None  # [nworld, n_mjc_geoms] -> Newton shape idx
-        self.mjc_to_newton_dof: wp.array2d = None  # [nworld, n_mjc_dofs] -> encoded (joint<<3)|dof
+        self.mjc_to_newton_dof: wp.array2d = None  # [nworld, n_mjc_dofs] -> Newton DOF idx (this IS global for multi-env)
         
         # Create mappings
         self._create_mappings(model)
-        
-        # Create MuJoCo joint info arrays once (to avoid creating them in update methods)
-        if self.mjc_model.njnt > 0:
-            self.mjc_jnt_qposadr = wp.array(self.mjc_model.jnt_qposadr, dtype=wp.int32, device=model.device)
-            self.mjc_jnt_dofadr = wp.array(self.mjc_model.jnt_dofadr, dtype=wp.int32, device=model.device)
-            self.mjc_jnt_type = wp.array(self.mjc_model.jnt_type, dtype=wp.int32, device=model.device)
-        else:
-            self.mjc_jnt_qposadr = None
-            self.mjc_jnt_dofadr = None
-            self.mjc_jnt_type = None
     
     def _validate_environment_consistency(self, model: Model):
         """Validate that all non-global environments have the same structure."""
@@ -145,6 +163,17 @@ class SolverMuJoCo2(SolverBase):
         if len(joint_counts) > 0 and len(set(joint_counts)) > 1:
             raise ValueError(f"Environments have different joint counts: {env_joint_counts}")
     
+    def _resolve_mj_opt(self, val, opts: dict[str, int], kind: str):
+        """Helper to resolve MuJoCo option strings to constants."""
+        if isinstance(val, str):
+            key = val.strip().lower()
+            try:
+                return opts[key]
+            except KeyError as e:
+                options = "', '".join(sorted(opts))
+                raise ValueError(f"Unknown {kind} '{val}'. Valid options: '{options}'.") from e
+        return val
+    
     def _build_mjc_model(self, model: Model):
         """Build MuJoCo model from Newton model."""
         import mujoco
@@ -156,14 +185,21 @@ class SolverMuJoCo2(SolverBase):
         spec.option.timestep = 0.01  # Will be set during step()
         spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
         
-        # Allow MuJoCo to compute inertia from geoms when needed
-        spec.compiler.inertiafromgeom = mujoco.mjtInertiaFromGeom.mjINERTIAFROMGEOM_AUTO
+        # Solver parameters - Newton solver is more stable than CG for our use case
+        spec.option.solver = self._resolve_mj_opt(
+            self.solver, 
+            {"cg": mujoco.mjtSolver.mjSOL_CG, "newton": mujoco.mjtSolver.mjSOL_NEWTON},
+            "solver"
+        )
+        spec.option.iterations = self.iterations
+        spec.option.ls_iterations = self.ls_iterations
         
         # Track names for later mapping
         self._name_tracking = {
             'bodies': {},   # mjc_name -> newton_idx
             'joints': {},   # mjc_name -> newton_idx
             'geoms': {},    # mjc_name -> newton_idx
+            'actuators': {},  # mjc_name -> (newton_joint_idx, dof_offset)
         }
         
         if self.separate_envs_to_worlds:
@@ -252,6 +288,7 @@ class SolverMuJoCo2(SolverBase):
         body_mass = model.body_mass.numpy()
         body_com = model.body_com.numpy()
         body_inertia = model.body_inertia.numpy()
+        body_q = model.body_q.numpy()  # Body transforms
         
         joint_parent = model.joint_parent.numpy()
         joint_child = model.joint_child.numpy()
@@ -260,12 +297,21 @@ class SolverMuJoCo2(SolverBase):
         joint_qd_start = model.joint_qd_start.numpy()
         joint_limit_lower = model.joint_limit_lower.numpy()
         joint_limit_upper = model.joint_limit_upper.numpy()
+        joint_armature = model.joint_armature.numpy()
+        joint_friction = model.joint_friction.numpy()
+        joint_effort_limit = model.joint_effort_limit.numpy()
+        joint_target_ke = model.joint_target_ke.numpy()
+        joint_target_kd = model.joint_target_kd.numpy()
+        joint_dof_mode = model.joint_dof_mode.numpy()
         
         shape_body = model.shape_body.numpy()
         shape_type = model.shape_type.numpy()
         shape_collision_radius = model.shape_collision_radius.numpy()
         shape_scale = model.shape_scale.numpy()
         shape_transforms = model.shape_transform.numpy()
+        shape_material_mu = model.shape_material_mu.numpy()
+        shape_material_ke = model.shape_material_ke.numpy()
+        shape_material_kd = model.shape_material_kd.numpy()
         
         # 1. Find root bodies (not children of any joint)
         children = set()
@@ -279,28 +325,9 @@ class SolverMuJoCo2(SolverBase):
         # 2. Add root bodies
         mjc_bodies = {}  # newton_idx -> mjc_body
         for bi in root_bodies:
-            name = f"body_{bi}"
             mass = body_mass[bi]
-            
-            # Add body to worldbody
-            if mass > 0 and np.any(body_inertia[bi] != 0):
-                # Has valid mass and inertia
-                body = spec.worldbody.add_body(
-                    name=name,
-                    mass=mass,
-                    pos=[0, 0, 0],  # Initial position
-                    ipos=body_com[bi].tolist(),
-                    fullinertia=self._get_fullinertia(body_inertia[bi]),
-                    explicitinertial=True,
-                )
-            else:
-                # Let MuJoCo compute inertia from geoms
-                body = spec.worldbody.add_body(
-                    name=name,
-                    pos=[0, 0, 0],  # Initial position
-                )
+            body = self._create_mjc_body(spec.worldbody, bi, mass, body_q, body_com, body_inertia)
             mjc_bodies[bi] = body
-            self._name_tracking['bodies'][name] = bi
         
         # 3. Add joints and their child bodies in topological order
         # TODO: Implement proper topological sort if needed
@@ -314,7 +341,6 @@ class SolverMuJoCo2(SolverBase):
                 
             # Add child body if not exists
             if child_idx not in mjc_bodies:
-                name = f"body_{child_idx}"
                 mass = body_mass[child_idx]
                 
                 # Get parent body
@@ -323,24 +349,9 @@ class SolverMuJoCo2(SolverBase):
                 else:
                     parent_body = spec.worldbody
                 
-                if mass > 0 and np.any(body_inertia[child_idx] != 0):
-                    # Has valid mass and inertia
-                    body = parent_body.add_body(
-                        name=name,
-                        mass=mass,
-                        pos=[0, 0, 0],  # Will be set by joint
-                        ipos=body_com[child_idx].tolist(),
-                        fullinertia=self._get_fullinertia(body_inertia[child_idx]),
-                        explicitinertial=True,
-                    )
-                else:
-                    # Let MuJoCo compute inertia from geoms
-                    body = parent_body.add_body(
-                        name=name,
-                        pos=[0, 0, 0],  # Will be set by joint
-                    )
+                # Create child body
+                body = self._create_mjc_body(parent_body, child_idx, mass, body_q, body_com, body_inertia)
                 mjc_bodies[child_idx] = body
-                self._name_tracking['bodies'][name] = child_idx
             
             # Add joint
             child_body = mjc_bodies[child_idx]
@@ -351,9 +362,13 @@ class SolverMuJoCo2(SolverBase):
             if jtype == JointType.FREE:
                 child_body.add_freejoint(name=joint_name)
             elif jtype == JointType.BALL:
+                qd_start = joint_qd_start[ji]
+                # Ball joints have 3 DOFs, use armature/friction from first DOF
                 child_body.add_joint(
                     name=joint_name,
                     type=mujoco.mjtJoint.mjJNT_BALL,
+                    armature=joint_armature[qd_start],
+                    damping=0.0,  # Explicit zero damping
                 )
             elif jtype == JointType.REVOLUTE:
                 # Get axis using DOF index
@@ -371,6 +386,9 @@ class SolverMuJoCo2(SolverBase):
                     "name": joint_name,
                     "type": mujoco.mjtJoint.mjJNT_HINGE,
                     "axis": axis,
+                    "armature": joint_armature[qd_start],
+                    "frictionloss": joint_friction[qd_start],
+                    "damping": 0.0,  # Explicit zero damping
                 }
                 
                 if has_limits:
@@ -394,6 +412,9 @@ class SolverMuJoCo2(SolverBase):
                     "name": joint_name,
                     "type": mujoco.mjtJoint.mjJNT_SLIDE,
                     "axis": axis,
+                    "armature": joint_armature[qd_start],
+                    "frictionloss": joint_friction[qd_start],
+                    "damping": 0.0,  # Explicit zero damping
                 }
                 
                 if has_limits:
@@ -426,55 +447,125 @@ class SolverMuJoCo2(SolverBase):
             shape_pos = [shape_tf[0], shape_tf[1], shape_tf[2]]
             shape_quat = [shape_tf[3], shape_tf[4], shape_tf[5], shape_tf[6]]
             
+            # Get material properties for this shape
+            mu = shape_material_mu[si]
+            ke = shape_material_ke[si]
+            kd = shape_material_kd[si]
+            
+            # Compute MuJoCo contact parameters
+            solref = self._get_solref(ke, kd)
+            # Friction: [sliding, torsional, rolling]
+            # Use small values for torsional and rolling friction
+            friction = [mu, 0.005, 0.0001]
+            
+            # Common geom parameters
+            geom_params = {
+                "name": geom_name,
+                "pos": shape_pos,
+                "quat": shape_quat,
+                "friction": friction,
+                "solref": solref,
+                "solimp": [0.9, 0.95, 0.001, 0.5, 2.0],  # Default impedance
+            }
+            
             # Add geom based on type
             if stype == GeoType.SPHERE:
                 # For spheres, MuJoCo wants a list with radius
                 mjc_body.add_geom(
-                    name=geom_name,
                     type=mujoco.mjtGeom.mjGEOM_SPHERE,
                     size=size.tolist(),
-                    pos=shape_pos,
-                    quat=shape_quat,
+                    **geom_params
                 )
             elif stype == GeoType.BOX:
                 # For boxes, shape_scale is half-extents
                 mjc_body.add_geom(
-                    name=geom_name,
                     type=mujoco.mjtGeom.mjGEOM_BOX,
                     size=size.tolist(),
-                    pos=shape_pos,
-                    quat=shape_quat,
+                    **geom_params
                 )
             elif stype == GeoType.CAPSULE:
                 # For capsules, size is [radius, half-height, ...]
                 mjc_body.add_geom(
-                    name=geom_name,
                     type=mujoco.mjtGeom.mjGEOM_CAPSULE,
                     size=size.tolist(),
-                    pos=shape_pos,
-                    quat=shape_quat,
+                    **geom_params
                 )
             elif stype == GeoType.CYLINDER:
                 # For cylinders, size is [radius, half-height, ...]
                 mjc_body.add_geom(
-                    name=geom_name,
                     type=mujoco.mjtGeom.mjGEOM_CYLINDER,
                     size=size.tolist(),
-                    pos=shape_pos,
-                    quat=shape_quat,
+                    **geom_params
                 )
             elif stype == GeoType.PLANE:
                 # MuJoCo plane
                 mjc_body.add_geom(
-                    name=geom_name,
                     type=mujoco.mjtGeom.mjGEOM_PLANE,
                     size=[1000, 1000, 0.1],  # Large plane
-                    pos=shape_pos,
-                    quat=shape_quat,
+                    **geom_params
                 )
             # TODO: Add mesh support
             
             self._name_tracking['geoms'][geom_name] = si
+        
+        # 5. Add actuators for controllable joints
+        # Only support single-DOF joints (revolute/prismatic) for now
+        
+        # Default actuator args following the original solver pattern
+        actuator_args = {
+            "gear": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "trntype": mujoco.mjtTrn.mjTRN_JOINT,
+            # motor actuation properties (defaults)
+            "gainprm": [1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "biasprm": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "dyntype": mujoco.mjtDyn.mjDYN_NONE,
+            "gaintype": mujoco.mjtGain.mjGAIN_FIXED,
+            "biastype": mujoco.mjtBias.mjBIAS_AFFINE,
+        }
+        
+        for ji in selected_joints:
+            joint_name = f"joint_{ji}"
+            jtype = joint_type[ji]
+            qd_start = joint_qd_start[ji]
+            
+            # Only support single-DOF joints for now
+            if jtype not in [JointType.REVOLUTE, JointType.PRISMATIC]:
+                continue
+            
+            # Get DOF parameters
+            dof_idx = qd_start
+            effort_limit = joint_effort_limit[dof_idx]
+            mode = joint_dof_mode[dof_idx]
+            ke = joint_target_ke[dof_idx]
+            kd = joint_target_kd[dof_idx]
+            
+            # Skip if no control is needed (zero effort limit)
+            if effort_limit <= 0:
+                continue
+            
+            # Create actuator parameters
+            actuator_name = f"{joint_name}_actuator"
+            args = actuator_args.copy()
+            args["name"] = actuator_name
+            args["target"] = joint_name
+            args["forcerange"] = [-effort_limit, effort_limit]
+            
+            # Set PD control parameters based on mode
+            if mode == JointMode.TARGET_POSITION:
+                args["biasprm"] = [0.0, -ke, -kd, 0, 0, 0, 0, 0, 0, 0]
+                args["gainprm"] = [ke, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            elif mode == JointMode.TARGET_VELOCITY:
+                args["biasprm"] = [0.0, 0.0, -kd, 0, 0, 0, 0, 0, 0, 0]
+                args["gainprm"] = [kd, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            else:  # JointMode.NONE
+                args["biasprm"] = [0.0, 0.0, 0.0, 0, 0, 0, 0, 0, 0, 0]
+                args["gainprm"] = [1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            
+            # Add actuator
+            spec.add_actuator(**args)
+            
+            # Track actuator mapping
+            self._name_tracking['actuators'][actuator_name] = (ji, 0)
     
     def _get_fullinertia(self, inertia_matrix: np.ndarray) -> list:
         """Convert 3x3 inertia matrix to MuJoCo's fullinertia format."""
@@ -487,6 +578,64 @@ class SolverMuJoCo2(SolverBase):
             inertia_matrix[0, 2],
             inertia_matrix[1, 2],
         ]
+    
+    def _create_mjc_body(self, parent, body_idx: int, mass: float, 
+                         body_q: np.ndarray, body_com: np.ndarray, 
+                         body_inertia: np.ndarray) -> Any:
+        """Create a MuJoCo body with proper mass, position, and rotation handling."""
+        name = f"body_{body_idx}"
+        
+        # Extract position and rotation from transform
+        # body_q is flattened: [px, py, pz, qx, qy, qz, qw]
+        tf = body_q[body_idx]
+        pos = tf[:3].tolist()  # Position
+        quat = tf[3:].tolist()  # Quaternion [x, y, z, w]
+        
+        # Create body with appropriate parameters
+        if mass > 0:
+            if np.any(body_inertia[body_idx] != 0):
+                # Has valid mass and inertia
+                body = parent.add_body(
+                    name=name,
+                    mass=mass,
+                    pos=pos,
+                    quat=quat,
+                    ipos=body_com[body_idx].tolist(),
+                    fullinertia=self._get_fullinertia(body_inertia[body_idx]),
+                    explicitinertial=True,
+                )
+            else:
+                # Has mass but no inertia - set mass only
+                body = parent.add_body(
+                    name=name,
+                    mass=mass,
+                    pos=pos,
+                    quat=quat,
+                )
+        else:
+            # No mass specified - let MuJoCo compute from geoms
+            body = parent.add_body(
+                name=name,
+                pos=pos,
+                quat=quat,
+            )
+        
+        self._name_tracking['bodies'][name] = body_idx
+        return body
+    
+    def _get_solref(self, ke: float, kd: float, dt: float = 0.01) -> list:
+        """Convert Newton's ke/kd to MuJoCo's solref format."""
+        # MuJoCo uses: solref[0] = time constant, solref[1] = damping ratio
+        # ke is stiffness, kd is damping
+        # Default to a reasonable time constant if ke is too small
+        if ke < 1e-6:
+            return [0.02, 1.0]  # Default values
+        
+        # Time constant approximation based on stiffness
+        time_const = min(0.02, 2.0 * dt)  # Usually 2x timestep is good
+        damping_ratio = 1.0  # Critical damping
+        
+        return [time_const, damping_ratio]
     
     def _get_joint_dof_count(self, mjc_joint_idx: int) -> int:
         """Get number of DOFs for a MuJoCo joint."""
@@ -507,7 +656,6 @@ class SolverMuJoCo2(SolverBase):
         import mujoco
         
         n_worlds = self.n_worlds
-            
         n_bodies = self.mjw_model.nbody
         n_joints = self.mjw_model.njnt
         n_geoms = self.mjw_model.ngeom
@@ -519,157 +667,112 @@ class SolverMuJoCo2(SolverBase):
         geom_mapping = np.full((n_worlds, n_geoms), -1, dtype=np.int32)
         dof_mapping = np.full((n_worlds, n_dofs), -1, dtype=np.int32)
         
-        # Get entity lists per environment
-        body_groups = model.body_group.numpy()
-        shape_groups = model.shape_group.numpy()
-        joint_groups = model.joint_group.numpy()
+        joint_qd_start = model.joint_qd_start.numpy()
         
-        # Build per-environment entity lists
-        env_bodies = {}
-        env_shapes = {}
-        env_joints = {}
-        
-        # Find all environments
-        all_envs = set()
-        all_envs.update(body_groups[body_groups >= 0])
-        all_envs.update(shape_groups[shape_groups >= 0])
-        all_envs.update(joint_groups[joint_groups >= 0])
-        
-        for env in sorted(all_envs):
-            env_bodies[env] = np.where(body_groups == env)[0]
-            env_shapes[env] = np.where(shape_groups == env)[0]
-            env_joints[env] = np.where(joint_groups == env)[0]
-        
-        # Global entities (env -1)
-        global_bodies = np.where(body_groups < 0)[0]
-        global_shapes = np.where(shape_groups < 0)[0]
-        global_joints = np.where(joint_groups < 0)[0]
-        
-        # Get first environment index
-        env_list = sorted(env_bodies.keys())
-        if not env_list:
-            # No environments found
-            if self.separate_envs_to_worlds:
-                raise ValueError("No environments found but separate_envs_to_worlds=True")
-            # For non-separated case, treat all entities as belonging to world 0
-            first_env = None
-        else:
-            first_env = env_list[0]
-        
-        # Special handling when there are no environments (all entities are global)
-        if first_env is None:
-            # Map all entities directly to world 0
+        if n_worlds == 1:
+            # Single world case: everything is global (group -1)
+            # Direct 1:1 mapping
             for mjc_name, newton_idx in self._name_tracking['bodies'].items():
                 mjc_idx = mujoco.mj_name2id(self.mjc_model, mujoco.mjtObj.mjOBJ_BODY, mjc_name)
                 if mjc_idx >= 0:
                     body_mapping[0, mjc_idx] = newton_idx
-        else:
-            # Body mapping with environment support
-            for mjc_name, newton_idx_in_env0 in self._name_tracking['bodies'].items():
-                mjc_idx = mujoco.mj_name2id(self.mjc_model, mujoco.mjtObj.mjOBJ_BODY, mjc_name)
-                if mjc_idx < 0:
-                    continue
                     
-                # Find position of this body within env0's body list
-                if newton_idx_in_env0 in global_bodies:
-                    # Global body - same index for all worlds
-                    for world in range(n_worlds):
-                        body_mapping[world, mjc_idx] = newton_idx_in_env0
-                else:
-                    # Environment-specific body
-                    env0_bodies = env_bodies[first_env]
-                    pos_in_env = np.where(env0_bodies == newton_idx_in_env0)[0]
-                    if len(pos_in_env) == 0:
-                        continue
-                    pos_in_env = pos_in_env[0]
-                    
-                    for world_idx, env in enumerate(env_list[:n_worlds]):
-                        if pos_in_env < len(env_bodies[env]):
-                            body_mapping[world_idx, mjc_idx] = env_bodies[env][pos_in_env]
-        
-        # Geom/Shape mapping (similar logic)
-        if first_env is None:
-            # Map all entities directly to world 0
             for mjc_name, newton_idx in self._name_tracking['geoms'].items():
                 mjc_idx = mujoco.mj_name2id(self.mjc_model, mujoco.mjtObj.mjOBJ_GEOM, mjc_name)
                 if mjc_idx >= 0:
                     geom_mapping[0, mjc_idx] = newton_idx
+                    
+            for mjc_name, newton_idx in self._name_tracking['joints'].items():
+                mjc_joint_idx = mujoco.mj_name2id(self.mjc_model, mujoco.mjtObj.mjOBJ_JOINT, mjc_name)
+                if mjc_joint_idx < 0:
+                    continue
+                    
+                joint_mapping[0, mjc_joint_idx] = newton_idx
+                
+                # Map DOFs
+                dof_start = self.mjc_model.jnt_dofadr[mjc_joint_idx]
+                n_joint_dofs = self._get_joint_dof_count(mjc_joint_idx)
+                newton_dof_base = joint_qd_start[newton_idx]
+                
+                for dof_offset in range(n_joint_dofs):
+                    mjc_dof_idx = dof_start + dof_offset
+                    dof_mapping[0, mjc_dof_idx] = newton_dof_base + dof_offset
         else:
+            # Multi-world case: identical environments + global static shapes
+            # Get entities from each environment
+            body_groups = model.body_group.numpy()
+            shape_groups = model.shape_group.numpy()
+            joint_groups = model.joint_group.numpy()
+            
+            # Find entities per environment (environments are identical)
+            env_bodies = {}
+            env_shapes = {}
+            env_joints = {}
+            
+            for env in range(n_worlds):
+                env_bodies[env] = np.where(body_groups == env)[0]
+                env_shapes[env] = np.where(shape_groups == env)[0]
+                env_joints[env] = np.where(joint_groups == env)[0]
+            
+            # Global static shapes (no global bodies or joints in multi-world)
+            global_shapes = np.where(shape_groups < 0)[0]
+            
+            # Map bodies - only from environments
+            for mjc_name, newton_idx_in_env0 in self._name_tracking['bodies'].items():
+                mjc_idx = mujoco.mj_name2id(self.mjc_model, mujoco.mjtObj.mjOBJ_BODY, mjc_name)
+                if mjc_idx < 0:
+                    continue
+                
+                # Find position in environment 0
+                pos_in_env = np.where(env_bodies[0] == newton_idx_in_env0)[0][0]
+                
+                # Map to corresponding body in each world
+                for world_idx in range(n_worlds):
+                    body_mapping[world_idx, mjc_idx] = env_bodies[world_idx][pos_in_env]
+            
+            # Map shapes - both global and per-environment
             for mjc_name, newton_idx_in_env0 in self._name_tracking['geoms'].items():
                 mjc_idx = mujoco.mj_name2id(self.mjc_model, mujoco.mjtObj.mjOBJ_GEOM, mjc_name)
                 if mjc_idx < 0:
                     continue
                     
                 if newton_idx_in_env0 in global_shapes:
-                    # Global shape - same index for all worlds
+                    # Global static shape - same index for all worlds
                     for world in range(n_worlds):
                         geom_mapping[world, mjc_idx] = newton_idx_in_env0
                 else:
-                    # Environment-specific shape
-                    env0_shapes = env_shapes[first_env]
-                    pos_in_env = np.where(env0_shapes == newton_idx_in_env0)[0]
-                    if len(pos_in_env) == 0:
-                        continue
-                    pos_in_env = pos_in_env[0]
-                    
-                    for world_idx, env in enumerate(env_list[:n_worlds]):
-                        if pos_in_env < len(env_shapes[env]):
-                            geom_mapping[world_idx, mjc_idx] = env_shapes[env][pos_in_env]
-        
-        # DOF mapping with encoded joint+dof indices
-        joint_qd_start = model.joint_qd_start.numpy()
-        
-        if first_env is None:
-            # Map all joints directly to world 0
-            for mjc_name, newton_idx in self._name_tracking['joints'].items():
-                mjc_joint_idx = mujoco.mj_name2id(self.mjc_model, mujoco.mjtObj.mjOBJ_JOINT, mjc_name)
-                if mjc_joint_idx < 0:
-                    continue
-                    
-                # Joint mapping
-                joint_mapping[0, mjc_joint_idx] = newton_idx
-                
-                # Get DOF range for this joint
-                dof_start = self.mjc_model.jnt_dofadr[mjc_joint_idx]
-                n_joint_dofs = self._get_joint_dof_count(mjc_joint_idx)
-                
-                # Map DOFs
-                for dof_offset in range(n_joint_dofs):
-                    mjc_dof_idx = dof_start + dof_offset
-                    dof_mapping[0, mjc_dof_idx] = (newton_idx << 3) | dof_offset
-        else:
+                    # Environment shape
+                    pos_in_env = np.where(env_shapes[0] == newton_idx_in_env0)[0][0]
+                    for world_idx in range(n_worlds):
+                        geom_mapping[world_idx, mjc_idx] = env_shapes[world_idx][pos_in_env]
+            
+            # Map joints and DOFs - only from environments
             for mjc_name, newton_idx_in_env0 in self._name_tracking['joints'].items():
                 mjc_joint_idx = mujoco.mj_name2id(self.mjc_model, mujoco.mjtObj.mjOBJ_JOINT, mjc_name)
                 if mjc_joint_idx < 0:
                     continue
                     
-                # Get DOF range for this joint
+                # Find position in environment 0
+                pos_in_env = np.where(env_joints[0] == newton_idx_in_env0)[0][0]
+                
+                # Get DOF info
                 dof_start = self.mjc_model.jnt_dofadr[mjc_joint_idx]
                 n_joint_dofs = self._get_joint_dof_count(mjc_joint_idx)
                 
-                # Map DOFs
-                for dof_offset in range(n_joint_dofs):
-                    mjc_dof_idx = dof_start + dof_offset
+                # Map for each world
+                for world_idx in range(n_worlds):
+                    newton_joint_idx = env_joints[world_idx][pos_in_env]
+                    joint_mapping[world_idx, mjc_joint_idx] = newton_joint_idx
                     
-                    if newton_idx_in_env0 in global_joints:
-                        # Global joint
-                        for world in range(n_worlds):
-                            joint_mapping[world, mjc_joint_idx] = newton_idx_in_env0
-                            # Encode: (joint_idx << 3) | dof_offset (3 bits for offset is enough)
-                            dof_mapping[world, mjc_dof_idx] = (newton_idx_in_env0 << 3) | dof_offset
-                    else:
-                        # Environment-specific joint
-                        env0_joints = env_joints[first_env]
-                        pos_in_env = np.where(env0_joints == newton_idx_in_env0)[0]
-                        if len(pos_in_env) == 0:
-                            continue
-                        pos_in_env = pos_in_env[0]
-                        
-                        for world_idx, env in enumerate(env_list[:n_worlds]):
-                            if pos_in_env < len(env_joints[env]):
-                                newton_joint_idx = env_joints[env][pos_in_env]
-                                joint_mapping[world_idx, mjc_joint_idx] = newton_joint_idx
-                                dof_mapping[world_idx, mjc_dof_idx] = (newton_joint_idx << 3) | dof_offset
+                    newton_dof_base = joint_qd_start[newton_joint_idx]
+                    
+                    # Map DOFs with interleaved layout
+                    for dof_offset in range(n_joint_dofs):
+                        mjc_dof_idx = dof_start + dof_offset
+                        local_dof_idx = newton_dof_base + dof_offset
+                        # DOFs are interleaved: [env0_dof0, env1_dof0, ..., env0_dof1, env1_dof1, ...]
+                        global_dof_idx = world_idx + local_dof_idx * n_worlds
+                        dof_mapping[world_idx, mjc_dof_idx] = global_dof_idx
         
         # Create warp arrays
         self.mjc_to_newton_body = wp.array(body_mapping, dtype=wp.int32, shape=(n_worlds, n_bodies))
@@ -708,9 +811,9 @@ class SolverMuJoCo2(SolverBase):
                     self.mjc_to_newton_joint,
                     self.mjw_data.qpos,
                     self.mjw_data.qvel,
-                    self.mjc_jnt_qposadr,
-                    self.mjc_jnt_dofadr,
-                    self.mjc_jnt_type,
+                    self.mjw_model.jnt_qposadr,
+                    self.mjw_model.jnt_dofadr,
+                    self.mjw_model.jnt_type,
                 ],
                 device=self.model.device
             )
@@ -724,8 +827,9 @@ class SolverMuJoCo2(SolverBase):
                 dim=(n_worlds, self.mjw_model.nv),
                 inputs=[
                     self.model.joint_armature,
-                    self.model.joint_qd_start,
                     self.mjc_to_newton_dof,
+                ],
+                outputs=[
                     self.mjw_model.dof_armature,  # MuJoCo Warp array is already 2D
                 ],
                 device=self.model.device
@@ -734,6 +838,56 @@ class SolverMuJoCo2(SolverBase):
         # Update static shape positions if they move
         # NOTE: In the initial implementation, we assume static shapes don't move during simulation
         # This kernel would be used if we support moving static shapes in the future
+        
+        # Apply control forces if provided
+        if control is not None:
+            # Apply actuator control
+            if self.mjw_model.nu > 0:  # Has actuators
+                wp.launch(
+                    kernel=apply_actuator_control,
+                    dim=(self.n_worlds, self.mjw_model.nu),  # Iterate over actuators, not DOFs!
+                    inputs=[
+                        control.joint_target,
+                        self.model.joint_dof_mode,
+                        self.mjw_model.actuator_trnid,
+                        self.mjw_model.jnt_dofadr,
+                        self.mjc_to_newton_dof,
+                    ],
+                    outputs=[
+                        self.mjw_data.ctrl,
+                    ],
+                    device=self.model.device,
+                )
+            
+            # Apply joint forces
+            if control.joint_f is not None:
+                wp.launch(
+                    kernel=apply_joint_forces,
+                    dim=(self.n_worlds, self.mjw_model.nv),
+                    inputs=[
+                        control.joint_f,
+                        self.mjc_to_newton_dof,
+                    ],
+                    outputs=[
+                        self.mjw_data.qfrc_applied,
+                    ],
+                    device=self.model.device,
+                )
+        
+        # Apply body forces if provided
+        if state.body_f is not None:
+            wp.launch(
+                kernel=apply_body_forces,
+                dim=(self.n_worlds, self.mjw_model.nbody),
+                inputs=[
+                    state.body_f,
+                    self.mjc_to_newton_body,
+                ],
+                outputs=[
+                    self.mjw_data.xfrc_applied,
+                ],
+                device=self.model.device,
+            )
     
     def _update_mjc_to_newton(self, state: State):
         """Update Newton state from MuJoCo."""
@@ -752,9 +906,9 @@ class SolverMuJoCo2(SolverBase):
                     state.joint_qd,
                     self.model.joint_q_start,
                     self.model.joint_qd_start,
-                    self.mjc_jnt_qposadr,
-                    self.mjc_jnt_dofadr,
-                    self.mjc_jnt_type,
+                    self.mjw_model.jnt_qposadr,
+                    self.mjw_model.jnt_dofadr,
+                    self.mjw_model.jnt_type,
                 ],
                 device=self.model.device
             )
@@ -807,7 +961,6 @@ def update_body_properties_mjc_to_newton(
 def update_joint_properties_newton_to_mjc(
     # Newton data
     newton_joint_armature: wp.array(dtype=float),
-    newton_joint_qd_start: wp.array(dtype=wp.int32),
     # Mapping (2D!)
     mjc_to_newton_dof: wp.array2d(dtype=wp.int32),
     # MuJoCo data (2D: [world, dof])
@@ -815,17 +968,10 @@ def update_joint_properties_newton_to_mjc(
 ):
     world_id, mjc_dof_id = wp.tid()
     
-    # Get encoded Newton joint+DOF index
-    encoded = mjc_to_newton_dof[world_id, mjc_dof_id]
-    if encoded < 0:
+    # Get Newton global DOF index from direct mapping
+    newton_dof_idx = mjc_to_newton_dof[world_id, mjc_dof_id]
+    if newton_dof_idx < 0:
         return
-    
-    # Decode: joint_idx = encoded >> 3, dof_offset = encoded & 0x7 (3 bits)
-    newton_joint_idx = encoded >> 3
-    dof_offset = encoded & 0x7
-    
-    # Get actual Newton DOF index
-    newton_dof_idx = newton_joint_qd_start[newton_joint_idx] + dof_offset
     
     # Read from Newton and write to MuJoCo
     mjc_dof_armature[world_id, mjc_dof_id] = newton_joint_armature[newton_dof_idx]
@@ -907,10 +1053,89 @@ def update_joint_positions_newton_to_mjc(
             mjc_qpos[world_id, qpos_start + i] = newton_joint_q[newton_q_start + i]
         for i in range(3):
             mjc_qvel[world_id, dof_start + i] = newton_joint_qd[newton_qd_start + i]
-    elif joint_type == 2 or joint_type == 3:  # SLIDE or HINGE
+    else:  # SLIDE or HINGE (types 2 and 3)
         # Single DOF
         mjc_qpos[world_id, qpos_start] = newton_joint_q[newton_q_start]
         mjc_qvel[world_id, dof_start] = newton_joint_qd[newton_qd_start]
+
+
+@wp.kernel
+def apply_actuator_control(
+    joint_target: wp.array(dtype=float),
+    joint_dof_mode: wp.array(dtype=int),
+    mjc_actuator_trnid: wp.array(dtype=wp.vec2i),  # [actuator] - vec2i contains (transmission type, joint id)
+    mjc_jnt_dofadr: wp.array(dtype=int),  # joint -> first DOF index
+    mjc_to_newton_dof: wp.array2d(dtype=int),
+    # outputs
+    mjw_ctrl: wp.array2d(dtype=float),
+):
+    """Apply control targets to actuators based on joint mode."""
+    world_id, actuator_id = wp.tid()
+    
+    # Get the joint this actuator targets
+    # actuator_trnid[actuator] = vec2i(transmission type, joint index)
+    trnid = mjc_actuator_trnid[actuator_id]
+    trn_type = trnid[0]  # transmission type (should be mjTRN_JOINT = 0)
+    joint_id = trnid[1]  # joint index
+    
+    # We only support joint transmissions for now
+    if trn_type != 0:  # mjTRN_JOINT = 0
+        return
+    
+    # Get the first DOF of this joint
+    dof_id = mjc_jnt_dofadr[joint_id]
+    
+    # Get Newton global DOF index from direct mapping
+    newton_dof_idx = mjc_to_newton_dof[world_id, dof_id]
+    if newton_dof_idx == -1:
+        return
+    
+    # Get control mode
+    mode = joint_dof_mode[newton_dof_idx]
+    
+    # Set control value based on mode
+    if mode != JointMode.NONE:
+        mjw_ctrl[world_id, actuator_id] = joint_target[newton_dof_idx]
+    else:
+        mjw_ctrl[world_id, actuator_id] = 0.0
+
+
+@wp.kernel
+def apply_joint_forces(
+    joint_f: wp.array(dtype=float),
+    mjc_to_newton_dof: wp.array2d(dtype=int),
+    # outputs
+    mjw_qfrc_applied: wp.array2d(dtype=float),
+):
+    """Apply joint forces from Newton to MuJoCo."""
+    world_id, dof_id = wp.tid()
+    
+    # Get Newton global DOF index from direct mapping
+    newton_dof_idx = mjc_to_newton_dof[world_id, dof_id]
+    if newton_dof_idx == -1:
+        return
+    
+    # Apply force
+    mjw_qfrc_applied[world_id, dof_id] = joint_f[newton_dof_idx]
+
+
+@wp.kernel
+def apply_body_forces(
+    body_f: wp.array(dtype=wp.spatial_vector),
+    mjc_to_newton_body: wp.array2d(dtype=int),
+    # outputs
+    mjw_xfrc_applied: wp.array2d(dtype=wp.spatial_vector),
+):
+    """Apply body forces from Newton to MuJoCo."""
+    world_id, body_id = wp.tid()
+    
+    # Get Newton body index
+    newton_body_idx = mjc_to_newton_body[world_id, body_id]
+    if newton_body_idx == -1:
+        return
+    
+    # Apply force
+    mjw_xfrc_applied[world_id, body_id] = body_f[newton_body_idx]
 
 
 @wp.kernel
