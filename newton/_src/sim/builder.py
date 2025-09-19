@@ -113,11 +113,11 @@ class ModelBuilder:
     - Group 0, 1, 2, ...: Environment-specific entities
 
     Important grouping rules:
-    
-    - **Shapes inherit their group from their body**: If a shape is attached to a body, it 
+
+    - **Shapes inherit their group from their body**: If a shape is attached to a body, it
       automatically takes that body's environment group. Shapes without bodies use current_env_group.
-    - **Joints inherit their group from their bodies**: Joints take the non-global body's group. 
-      If both bodies are in the same non-global group, the joint takes that group. Global bodies 
+    - **Joints inherit their group from their bodies**: Joints take the non-global body's group.
+      If both bodies are in the same non-global group, the joint takes that group. Global bodies
       can connect to any environment. Joints cannot connect bodies from different non-global environments.
 
     There are two ways to assign environment groups:
@@ -1310,11 +1310,11 @@ class ModelBuilder:
         self.joint_key.append(key or f"joint_{self.joint_count}")
         self.joint_dof_dim.append((len(linear_axes), len(angular_axes)))
         self.joint_enabled.append(enabled)
-        
+
         # Joint inherits group from its bodies
         child_group = self.body_group[child]
         parent_group = self.body_group[parent] if parent >= 0 else child_group
-        
+
         # Determine joint group: prefer non-global group, validate if both non-global
         if parent_group == child_group or parent_group == -1 or child_group == -1:
             joint_group = max(parent_group, child_group)  # -1 < any non-global group
@@ -1324,7 +1324,7 @@ class ModelBuilder:
                 f"parent body {parent} is in group {parent_group}, "
                 f"child body {child} is in group {child_group}"
             )
-            
+
         self.joint_group.append(joint_group)
 
         def add_axis_dim(dim: ModelBuilder.JointDofConfig):

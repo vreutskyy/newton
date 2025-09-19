@@ -1,14 +1,20 @@
 # SolverMuJoCo2 Implementation Status
 
 ## Test Status
-- ✅ 21/22 unit tests passing
-- ❌ `test_velocity_control` - reaches ~63% of target velocity (likely needs gain tuning)
+- ✅ 22/22 unit tests passing! 🎉
+- All tests pass after increasing velocity control gain (`target_kd=5000.0`)
+
+## Code Quality
+- Comprehensive documentation added to all functions
+- Well-structured code with clear separation of concerns
+- Note: Linter shows false positives due to Warp's type system and MuJoCo imports
 
 ## Key Fixes Applied
 1. **Mass Handling**: SolverMuJoCo2 now correctly respects user-specified mass
 2. **Body Forces**: Fixed force application - body forces now work correctly
 3. **Body Transforms**: Initial positions and rotations properly set from Newton
 4. **Actuator Mapping**: Fixed using MuJoCo's internal `actuator_trnid`
+5. **Code Organization**: Refactored entity creation into well-documented helper methods
 
 ## Initialization (Model Creation)
 
@@ -175,9 +181,27 @@
 5. ✅ Shape contact properties (friction, stiffness)
 6. ✅ Solver parameters
 
-### 🔧 In Progress
-1. Fine-tuning velocity control gains
-2. Testing with more complex models
+### ✅ Code Architecture Improvements
+1. ✅ Refactored entity creation into helper methods:
+   - `_create_mjc_body()` - Creates MuJoCo bodies with proper mass/inertia
+   - `_create_mjc_joint()` - Creates joints with correct parameters
+   - `_create_mjc_geom()` - Creates shapes with material properties
+   - `_create_mjc_actuator()` - Creates actuators with PD control
+2. ✅ Added comprehensive documentation to all methods:
+   - Main methods (`__init__`, `step`, `_update_*`)
+   - Helper methods (`_create_*`, `_get_*`)
+   - All Warp kernel functions with clear descriptions
+   - Validation and mapping methods
+3. ✅ Clear separation of concerns in model building process
+4. ✅ Well-organized code sections with descriptive comments
+
+### ✅ Recently Completed
+1. ✅ Fine-tuned velocity control gains (target_kd=5000.0 for good response)
+2. ✅ All unit tests now passing
+
+### 🔧 Ready for Next Phase
+1. Testing with more complex models (e.g., humanoid robot)
+2. Performance benchmarking against original SolverMuJoCo
 
 ### ❌ Still Missing
 1. notify_model_changed() for runtime updates
