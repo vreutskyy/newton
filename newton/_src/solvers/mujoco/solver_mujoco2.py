@@ -38,7 +38,7 @@ except ImportError as e:
 
 
 class SolverMuJoCo2(SolverBase):
-    """Clean MuJoCo solver.
+    """New MuJoCo solver.
 
     Automatically detects whether to separate environments to worlds based on
     entity groups. If all entities are in the global environment (group -1),
@@ -93,21 +93,14 @@ class SolverMuJoCo2(SolverBase):
         # Automatically determine if we should separate environments to worlds
         # by checking if any entities are in non-global environments
         all_groups = np.concatenate([model.body_group.numpy(), model.shape_group.numpy(), model.joint_group.numpy()])
-        # Check if any entities are in non-global environments (group >= 0)
-        has_environments = np.any(all_groups >= 0)
-        self.separate_envs_to_worlds = has_environments
+        self.separate_envs_to_worlds = np.any(all_groups >= 0)
 
-        # Validate environment consistency if separating
+        # Compute number of worlds
         if self.separate_envs_to_worlds:
+            # Since separate_envs_to_worlds is True, we know there's at least one non-negative group
+            self.n_worlds = int(np.max(all_groups)) + 1
+            # Validate environment consistency
             self._validate_environment_consistency(model)
-
-            # Compute actual number of environments from entity groups
-            env_groups = all_groups[all_groups >= 0]
-            if len(env_groups) > 0:
-                self.n_worlds = int(np.max(env_groups) + 1)
-            else:
-                # This shouldn't happen after the has_environments check
-                self.n_worlds = 1
         else:
             # Everything is global, single world
             self.n_worlds = 1
@@ -115,16 +108,11 @@ class SolverMuJoCo2(SolverBase):
         # Build MuJoCo model
         self.mjc_model, self.mjw_model, self.mjw_data = self._build_mjc_model(model)
 
-        # Create mappings (MuJoCo → Newton only!)
-        # These will be initialized in _create_mappings
-        self.mjc_to_newton_body: wp.array2d = None  # [nworld, n_mjc_bodies] -> Newton body idx
-        self.mjc_to_newton_joint: wp.array2d = None  # [nworld, n_mjc_joints] -> Newton joint idx
-        self.mjc_to_newton_geom: wp.array2d = None  # [nworld, n_mjc_geoms] -> Newton shape idx
-        self.mjc_to_newton_dof: wp.array2d = (
-            None  # [nworld, n_mjc_dofs] -> Newton DOF idx (this IS global for multi-env)
-        )
-
         # Create mappings
+        self.mjc_to_newton_body: wp.array2d = None  # [nworld, n_mjc_bodies]
+        self.mjc_to_newton_joint: wp.array2d = None  # [nworld, n_mjc_joints]
+        self.mjc_to_newton_geom: wp.array2d = None  # [nworld, n_mjc_geoms]
+        self.mjc_to_newton_dof: wp.array2d = None  # [nworld, n_mjc_dofs]
         self._create_mappings(model)
 
     def _validate_environment_consistency(self, model: Model):
@@ -166,28 +154,37 @@ class SolverMuJoCo2(SolverBase):
         env_shape_counts = {}
         env_joint_counts = {}
 
-        # Find unique non-global environments
-        all_envs = set()
-        all_envs.update(body_groups[body_groups >= 0])
-        all_envs.update(shape_groups[shape_groups >= 0])
-        all_envs.update(joint_groups[joint_groups >= 0])
-
-        for env in sorted(all_envs):
+        # Count entities for all environments from 0 to n_worlds-1
+        for env in range(self.n_worlds):
             env_body_counts[env] = np.sum(body_groups == env)
             env_shape_counts[env] = np.sum(shape_groups == env)
             env_joint_counts[env] = np.sum(joint_groups == env)
 
-        # Check consistency
-        body_counts = list(env_body_counts.values())
-        shape_counts = list(env_shape_counts.values())
-        joint_counts = list(env_joint_counts.values())
+        # Get expected counts from environment 0
+        expected_body_count = env_body_counts[0]
+        expected_shape_count = env_shape_counts[0]
+        expected_joint_count = env_joint_counts[0]
 
-        if len(body_counts) > 0 and len(set(body_counts)) > 1:
-            raise ValueError(f"Environments have different body counts: {env_body_counts}")
-        if len(shape_counts) > 0 and len(set(shape_counts)) > 1:
-            raise ValueError(f"Environments have different shape counts: {env_shape_counts}")
-        if len(joint_counts) > 0 and len(set(joint_counts)) > 1:
-            raise ValueError(f"Environments have different joint counts: {env_joint_counts}")
+        # Check that all environments have the same counts as env 0
+        for env in range(self.n_worlds):
+            if env_body_counts[env] != expected_body_count:
+                raise ValueError(
+                    f"Environment {env} has {env_body_counts[env]} bodies, "
+                    f"but environment 0 has {expected_body_count} bodies. "
+                    f"All environments must have the same structure."
+                )
+            if env_shape_counts[env] != expected_shape_count:
+                raise ValueError(
+                    f"Environment {env} has {env_shape_counts[env]} shapes, "
+                    f"but environment 0 has {expected_shape_count} shapes. "
+                    f"All environments must have the same structure."
+                )
+            if env_joint_counts[env] != expected_joint_count:
+                raise ValueError(
+                    f"Environment {env} has {env_joint_counts[env]} joints, "
+                    f"but environment 0 has {expected_joint_count} joints. "
+                    f"All environments must have the same structure."
+                )
 
     def _resolve_mj_opt(self, val, opts: dict[str, int], kind: str):
         """Helper to resolve MuJoCo option strings to constants.
@@ -1013,7 +1010,7 @@ class SolverMuJoCo2(SolverBase):
         joint_qd_start = model.joint_qd_start.numpy()
 
         if n_worlds == 1:
-            # Single world case: everything is global (group -1)
+            # Single world case: either everything is global (group -1) or only env 0 exists
             # Direct 1:1 mapping
             for mjc_name, newton_idx in self._name_tracking["bodies"].items():
                 mjc_idx = mujoco.mj_name2id(self.mjc_model, mujoco.mjtObj.mjOBJ_BODY, mjc_name)
@@ -1057,9 +1054,6 @@ class SolverMuJoCo2(SolverBase):
                 env_shapes[env] = np.where(shape_groups == env)[0]
                 env_joints[env] = np.where(joint_groups == env)[0]
 
-            # Global static shapes (no global bodies or joints in multi-world)
-            global_shapes = np.where(shape_groups < 0)[0]
-
             # Map bodies - only from environments
             for mjc_name, newton_idx_in_env0 in self._name_tracking["bodies"].items():
                 mjc_idx = mujoco.mj_name2id(self.mjc_model, mujoco.mjtObj.mjOBJ_BODY, mjc_name)
@@ -1079,7 +1073,7 @@ class SolverMuJoCo2(SolverBase):
                 if mjc_idx < 0:
                     continue
 
-                if newton_idx_in_env0 in global_shapes:
+                if shape_groups[newton_idx_in_env0] == -1:
                     # Global static shape - same index for all worlds
                     for world in range(n_worlds):
                         geom_mapping[world, mjc_idx] = newton_idx_in_env0
@@ -1199,8 +1193,6 @@ class SolverMuJoCo2(SolverBase):
 
         # Update joint properties (armature, damping, etc.)
         if self.mjw_model.njnt > 0 and self.mjw_model.nv > 0:
-            # Launch kernel to update from Newton
-            # MuJoCo Warp already has 2D arrays, so we can use them directly
             wp.launch(
                 kernel=update_joint_properties_newton_to_mjc,
                 dim=(n_worlds, self.mjw_model.nv),
@@ -1209,22 +1201,18 @@ class SolverMuJoCo2(SolverBase):
                     self.mjc_to_newton_dof,
                 ],
                 outputs=[
-                    self.mjw_model.dof_armature,  # MuJoCo Warp array is already 2D
+                    self.mjw_model.dof_armature,
                 ],
                 device=self.model.device,
             )
 
-        # Update static shape positions if they move
-        # NOTE: In the initial implementation, we assume static shapes don't move during simulation
-        # This kernel would be used if we support moving static shapes in the future
-
         # Apply control forces if provided
         if control is not None:
             # Apply actuator control
-            if self.mjw_model.nu > 0:  # Has actuators
+            if self.mjw_model.nu > 0 and control.joint_target is not None:
                 wp.launch(
                     kernel=apply_actuator_control,
-                    dim=(self.n_worlds, self.mjw_model.nu),  # Iterate over actuators, not DOFs!
+                    dim=(self.n_worlds, self.mjw_model.nu),
                     inputs=[
                         control.joint_target,
                         self.model.joint_dof_mode,
@@ -1308,14 +1296,12 @@ class SolverMuJoCo2(SolverBase):
 
         # Update body transforms
         if self.mjw_model.nbody > 0:
-            # MuJoCo Warp already has 2D arrays for xpos and xquat
-            # Launch kernel directly (includes world body in mapping)
             wp.launch(
                 kernel=update_body_properties_mjc_to_newton,
                 dim=(n_worlds, self.mjw_model.nbody),
                 inputs=[
-                    self.mjw_data.xpos,  # Already 2D in MuJoCo Warp
-                    self.mjw_data.xquat,  # Already 2D in MuJoCo Warp
+                    self.mjw_data.xpos,
+                    self.mjw_data.xquat,
                     self.mjc_to_newton_body,
                     state.body_q,
                 ],
@@ -1334,7 +1320,7 @@ def update_body_properties_mjc_to_newton(
     # MuJoCo data (2D: [world, body])
     mjc_body_pos: wp.array2d(dtype=wp.vec3),
     mjc_body_quat: wp.array2d(dtype=wp.quatf),
-    # Mapping (2D!)
+    # Mapping (2D)
     mjc_to_newton_body: wp.array2d(dtype=wp.int32),
     # Newton data (1D)
     newton_body_q: wp.array(dtype=wp.transform),
@@ -1362,9 +1348,9 @@ def update_body_properties_mjc_to_newton(
 
 @wp.kernel
 def update_joint_properties_newton_to_mjc(
-    # Newton data
+    # Newton data (1D)
     newton_joint_armature: wp.array(dtype=float),
-    # Mapping (2D!)
+    # Mapping (2D)
     mjc_to_newton_dof: wp.array2d(dtype=wp.int32),
     # MuJoCo data (2D: [world, dof])
     mjc_dof_armature: wp.array2d(dtype=float),
@@ -1387,9 +1373,9 @@ def update_joint_properties_newton_to_mjc(
 
 @wp.kernel
 def update_static_geom_positions_newton_to_mjc(
-    # Newton data
+    # Newton data (1D)
     newton_shape_transforms: wp.array(dtype=wp.transform),
-    # Mapping (2D!)
+    # Mapping (2D)
     mjc_to_newton_geom: wp.array2d(dtype=wp.int32),
     # MuJoCo data (2D: [world, geom])
     mjc_geom_pos: wp.array2d(dtype=wp.vec3),
@@ -1407,7 +1393,7 @@ def update_static_geom_positions_newton_to_mjc(
     if newton_shape_idx < 0:
         return
 
-    # Read from Newton (same shape for all worlds if it's global/static)
+    # Read from Newton
     tf = newton_shape_transforms[newton_shape_idx]
 
     # Write to MuJoCo
@@ -1423,12 +1409,12 @@ def update_static_geom_positions_newton_to_mjc(
 
 @wp.kernel
 def update_joint_positions_newton_to_mjc(
-    # Newton data
+    # Newton data (1D)
     newton_joint_q: wp.array(dtype=float),
     newton_joint_qd: wp.array(dtype=float),
     newton_joint_q_start: wp.array(dtype=wp.int32),
     newton_joint_qd_start: wp.array(dtype=wp.int32),
-    # Mapping (2D!)
+    # Mapping (2D)
     mjc_to_newton_joint: wp.array2d(dtype=wp.int32),
     # MuJoCo data (2D: [world, coord/dof])
     mjc_qpos: wp.array2d(dtype=float),
@@ -1571,7 +1557,7 @@ def update_joint_positions_mjc_to_newton(
     # MuJoCo data (2D: [world, coord/dof])
     mjc_qpos: wp.array2d(dtype=float),
     mjc_qvel: wp.array2d(dtype=float),
-    # Mapping (2D!)
+    # Mapping (2D)
     mjc_to_newton_joint: wp.array2d(dtype=wp.int32),
     # Newton data
     newton_joint_q: wp.array(dtype=float),

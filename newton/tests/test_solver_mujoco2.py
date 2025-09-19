@@ -54,7 +54,8 @@ class TestSolverMuJoCo2(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             SolverMuJoCo2(model)
 
-        self.assertIn("different body counts", str(cm.exception))
+        self.assertIn("Environment 1 has 1 bodies", str(cm.exception))
+        self.assertIn("environment 0 has 2 bodies", str(cm.exception))
 
     def test_global_body_validation(self):
         """Test that global bodies are not allowed with separate_envs_to_worlds."""
@@ -76,6 +77,28 @@ class TestSolverMuJoCo2(unittest.TestCase):
 
         self.assertIn("global bodies", str(cm.exception))
         self.assertIn("Found 1 global bodies", str(cm.exception))
+
+    def test_missing_environment(self):
+        """Test that missing environments (gaps) are detected."""
+        builder = newton.ModelBuilder()
+
+        # Create bodies in environments 0 and 2, skipping 1
+        builder.current_env_group = 0
+        builder.add_body(mass=1.0)
+        builder.add_joint_free(parent=-1, child=0)
+
+        builder.current_env_group = 2  # Skip environment 1
+        builder.add_body(mass=2.0)
+        builder.add_joint_free(parent=-1, child=1)
+
+        model = builder.finalize()
+
+        # Should raise error because env 1 has 0 bodies while env 0 has 1
+        with self.assertRaises(ValueError) as cm:
+            SolverMuJoCo2(model)
+
+        self.assertIn("Environment 1 has 0 bodies", str(cm.exception))
+        self.assertIn("environment 0 has 1 bodies", str(cm.exception))
 
     def test_all_global_entities(self):
         """Test that all-global entities work fine (no environment separation)."""
