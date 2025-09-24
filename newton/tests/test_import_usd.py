@@ -656,6 +656,34 @@ class TestImportUsd(unittest.TestCase):
         joint_dof_idx_AD = model.joint_qd_start.numpy()[joint_idx_AD]
         self.assertEqual(model.joint_effort_limit.numpy()[joint_dof_idx_AD], 30.0)
 
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_spatial_tendon(self):
+        builder = newton.ModelBuilder()
+
+        results = builder.add_usd(
+            os.path.join(os.path.dirname(__file__), "assets", "spatial_shadow_hand.usd"),
+            collapse_fixed_joints=True,
+        )
+        self.assertEqual(builder.body_count, 24)
+        self.assertEqual(builder.shape_count, 47)
+        self.assertEqual(len(builder.shape_key), len(set(builder.shape_key)))
+        self.assertEqual(len(builder.body_key), len(set(builder.body_key)))
+        self.assertEqual(len(builder.joint_key), len(set(builder.joint_key)))
+        # 8 joints + 1 free joint for the root body
+        self.assertEqual(builder.joint_count, 24)
+        self.assertEqual(builder.joint_dof_count, 24)
+        self.assertEqual(builder.joint_coord_count, 24)
+        self.assertEqual(builder.joint_type, [newton.JointType.REVOLUTE] * 24)
+        self.assertEqual(len(results["path_body_map"]), 26)
+        self.assertEqual(len(results["path_shape_map"]), 47)
+
+        collision_shapes = [
+            i for i in range(builder.shape_count) if builder.shape_flags[i] & int(newton.ShapeFlags.COLLIDE_SHAPES)
+        ]
+        self.assertEqual(len(collision_shapes), 22)
+        self.assertEqual(len(builder.site_key), 107)
+        self.assertEqual(len(builder.tendon_key), 28)
+
 
 class TestImportSampleAssets(unittest.TestCase):
     def verify_usdphysics_parser(self, file, model, compare_min_max_coords, floating):
