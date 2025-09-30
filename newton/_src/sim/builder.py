@@ -52,8 +52,8 @@ from ..geometry import (
     compute_shape_radius,
     transform_inertia,
 )
-from ..geometry.inertia import validate_and_correct_inertia_kernel, verify_and_correct_inertia
-from ..geometry.utils import RemeshingMethod, compute_obb, remesh_mesh
+from ..geometry.inertia import compute_mesh_inertia, validate_and_correct_inertia_kernel, verify_and_correct_inertia
+from ..geometry.utils import RemeshingMethod, compute_obb, remesh_convex_hull, remesh_mesh
 from .graph_coloring import ColoringAlgorithm, color_trimesh, combine_independent_particle_coloring
 from .joints import (
     EqType,
@@ -2960,6 +2960,60 @@ class ModelBuilder:
                 scale = self.shape_scale[shape]
                 vertices = mesh.vertices * np.array([*scale])
                 tf, scale = compute_obb(vertices)
+                
+                ## Use inertia tensor eigenvectors for OBB orientation
+                ## First compute convex hull to eliminate internal geometry
+                #hull_vertices, hull_faces = remesh_convex_hull(vertices)
+                #
+                ## Compute inertia tensor of the convex hull (using unit density)
+                #_, com, inertia_tensor, _ = compute_mesh_inertia(
+                #    density=1.0,
+                #    vertices=hull_vertices.tolist(),
+                #    indices=hull_faces.flatten().tolist(),
+                #    is_solid=True  # Convex hull is always solid
+                #)
+                #
+                ## Convert inertia tensor to numpy and compute eigenvectors
+                #I_matrix = np.array([
+                #    [inertia_tensor[0, 0], inertia_tensor[0, 1], inertia_tensor[0, 2]],
+                #    [inertia_tensor[1, 0], inertia_tensor[1, 1], inertia_tensor[1, 2]],
+                #    [inertia_tensor[2, 0], inertia_tensor[2, 1], inertia_tensor[2, 2]]
+                #])
+                #
+                ## Get eigenvectors (principal axes)
+                #eigenvalues, eigenvectors = np.linalg.eigh(I_matrix)
+                #
+                ## Sort by eigenvalues in descending order
+                #sorted_indices = np.argsort(eigenvalues)[::-1]
+                #eigenvectors = eigenvectors[:, sorted_indices]
+                #
+                ## Ensure right-handed coordinate system
+                #if np.linalg.det(eigenvectors) < 0:
+                #    eigenvectors[:, 2] *= -1
+                #
+                ## Center vertices at COM
+                #com_np = np.array([com[0], com[1], com[2]])
+                #centered_vertices = vertices - com_np
+                #
+                ## Project vertices onto principal axes
+                #projected = centered_vertices @ eigenvectors
+                #
+                ## Compute extents
+                #min_coords = np.min(projected, axis=0)
+                #max_coords = np.max(projected, axis=0)
+                #extents = (max_coords - min_coords) / 2.0
+                #
+                ## Calculate the center in the projected coordinate system
+                #center_offset = (max_coords + min_coords) / 2.0
+                ## Transform the center offset back to the original coordinate system
+                #center = com_np + center_offset @ eigenvectors.T
+                #
+                ## Convert rotation matrix to quaternion
+                #orientation = wp.quat_from_matrix(wp.mat33(eigenvectors))
+                #
+                #tf = wp.transform(wp.vec3(center), orientation)
+                #scale = wp.vec3(extents)
+                
                 self.shape_type[shape] = GeoType.BOX
                 self.shape_source[shape] = None
                 self.shape_scale[shape] = scale

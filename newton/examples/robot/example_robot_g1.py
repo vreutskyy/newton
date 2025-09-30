@@ -56,7 +56,10 @@ class Example:
             xform=wp.transform(wp.vec3(0, 0, 0.8)),
             collapse_fixed_joints=True,
             enable_self_collisions=False,
-            hide_collision_shapes=True,
+            #hide_collision_shapes=False,
+            #load_non_physics_prims=False,
+            #skip_mesh_approximation=True,
+            mesh_maxhullvert=1024,
         )
 
         for i in range(6, g1.joint_dof_count):
@@ -64,7 +67,7 @@ class Example:
             g1.joint_target_kd[i] = 5.0
 
         # approximate meshes for faster collision detection
-        g1.approximate_meshes("bounding_box")
+        g1.approximate_meshes("convex_hull")
 
         builder = newton.ModelBuilder()
         builder.replicate(g1, self.num_envs, spacing=(3, 3, 0))
