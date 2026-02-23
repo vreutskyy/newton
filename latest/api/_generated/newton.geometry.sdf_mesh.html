@@ -8,7 +8,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>newton.geometry.compute_shape_inertia &#8212; Newton Physics</title>
+    <title>newton.geometry.sdf_mesh &#8212; Newton Physics</title>
   
   
   
@@ -48,7 +48,7 @@
     <script src="../../_static/copybutton.js?v=f281be69"></script>
     <script src="../../_static/design-tabs.js?v=f930bc37"></script>
     <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'api/_generated/newton.geometry.compute_shape_inertia';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'api/_generated/newton.geometry.sdf_mesh';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://newton-physics.github.io/newton/switcher.json';
@@ -58,8 +58,8 @@
         </script>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
-    <link rel="next" title="newton.geometry.create_empty_sdf_data" href="newton.geometry.create_empty_sdf_data.html" />
-    <link rel="prev" title="newton.geometry.collide_sphere_sphere" href="newton.geometry.collide_sphere_sphere.html" />
+    <link rel="next" title="newton.geometry.sdf_plane" href="newton.geometry.sdf_plane.html" />
+    <link rel="prev" title="newton.geometry.sdf_cylinder" href="newton.geometry.sdf_cylinder.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="" />
@@ -790,7 +790,7 @@
     
     <li class="breadcrumb-item"><a href="../newton_geometry.html" class="nav-link">newton.geometry</a></li>
     
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">newton.geometry.compute_shape_inertia</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">newton.geometry.sdf_mesh</span></li>
   </ul>
 </nav>
 </div>
@@ -807,28 +807,22 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="newton-geometry-compute-shape-inertia">
-<h1>newton.geometry.compute_shape_inertia<a class="headerlink" href="#newton-geometry-compute-shape-inertia" title="Link to this heading">#</a></h1>
+  <section id="newton-geometry-sdf-mesh">
+<h1>newton.geometry.sdf_mesh<a class="headerlink" href="#newton-geometry-sdf-mesh" title="Link to this heading">#</a></h1>
 <dl class="py function">
-<dt class="sig sig-object py" id="newton.geometry.compute_shape_inertia">
-<span class="sig-prename descclassname"><span class="pre">newton.geometry.</span></span><span class="sig-name descname"><span class="pre">compute_shape_inertia</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">type</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scale</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">src</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">density</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">is_solid</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">thickness</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.001</span></span></em><span class="sig-paren">)</span><a class="reference external" href="https://github.com/newton-physics/newton/blob/main/newton/_src/geometry/inertia.py#L458"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#newton.geometry.compute_shape_inertia" title="Link to this definition">#</a></dt>
-<dd><p>Computes the mass, center of mass and 3x3 inertia tensor of a shape</p>
+<dt class="sig sig-object py" id="newton.geometry.sdf_mesh">
+<span class="sig-prename descclassname"><span class="pre">newton.geometry.</span></span><span class="sig-name descname"><span class="pre">sdf_mesh</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">mesh</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">point</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_dist</span></span></em><span class="sig-paren">)</span><a class="reference external" href="https://github.com/newton-physics/newton/blob/main/newton/_src/geometry/kernels.py#L893"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#newton.geometry.sdf_mesh" title="Link to this definition">#</a></dt>
+<dd><p>Compute signed distance to a triangle mesh.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>type</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a>) – The type of shape (GeoType.SPHERE, GeoType.BOX, etc.)</p></li>
-<li><p><strong>scale</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#list" title="(in Python v3.14)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>] </em><em>| </em><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#tuple" title="(in Python v3.14)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>] </em><em>| </em><a class="reference external" href="https://nvidia.github.io/warp/api_reference/_generated/warp.vec3f.html#warp.vec3f" title="(in Warp v1.11.1)"><em>vec3f</em></a>) – The scale of the shape</p></li>
-<li><p><strong>src</strong> (<a class="reference internal" href="newton.Mesh.html#newton.Mesh" title="newton._src.geometry.types.Mesh"><em>Mesh</em></a><em> | </em><a class="reference internal" href="newton.Heightfield.html#newton.Heightfield" title="newton._src.geometry.types.Heightfield"><em>Heightfield</em></a><em> | </em><em>None</em>) – The source shape (Mesh or Heightfield)</p></li>
-<li><p><strong>density</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – The density of the shape</p></li>
-<li><p><strong>is_solid</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – Whether the shape is solid or hollow</p></li>
-<li><p><strong>thickness</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#list" title="(in Python v3.14)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>] </em><em>| </em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – The thickness of the shape (used for collision detection, and inertia computation of hollow shapes)</p></li>
+<li><p><strong>mesh</strong> (<a class="reference external" href="https://nvidia.github.io/warp/api_reference/_generated/warp.uint64.html#warp.uint64" title="(in Warp v1.11.1)"><em>uint64</em></a>) – Warp mesh ID (<code class="docutils literal notranslate"><span class="pre">mesh.id</span></code>).</p></li>
+<li><p><strong>[</strong><strong>m</strong><strong>]</strong> (<em>max_dist</em>) – Query point in mesh local frame, shape [3], float.</p></li>
+<li><p><strong>[</strong><strong>m</strong><strong>]</strong> – Maximum query distance.</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p>The mass, center of mass and 3x3 inertia tensor of the shape</p>
-</dd>
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#tuple" title="(in Python v3.14)">tuple</a>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)">float</a>, <a class="reference external" href="https://nvidia.github.io/warp/api_reference/_generated/warp.vec3f.html#warp.vec3f" title="(in Warp v1.11.1)"><em>vec3f</em></a>, <a class="reference external" href="https://nvidia.github.io/warp/api_reference/_generated/warp.mat33f.html#warp.mat33f" title="(in Warp v1.11.1)"><em>mat33f</em></a>]</p>
+<dd class="field-even"><p>Signed distance [m], negative inside, zero on surface, positive outside.</p>
 </dd>
 </dl>
 </dd></dl>
@@ -858,7 +852,7 @@
   </div>
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.geometry.compute_shape_inertia"><code class="docutils literal notranslate"><span class="pre">compute_shape_inertia()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.geometry.sdf_mesh"><code class="docutils literal notranslate"><span class="pre">sdf_mesh()</span></code></a></li>
 </ul>
   </nav></div>
 

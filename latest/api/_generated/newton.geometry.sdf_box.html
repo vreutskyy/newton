@@ -8,7 +8,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>newton.sensors.MatchKind &#8212; Newton Physics</title>
+    <title>newton.geometry.sdf_box &#8212; Newton Physics</title>
   
   
   
@@ -48,7 +48,7 @@
     <script src="../../_static/copybutton.js?v=f281be69"></script>
     <script src="../../_static/design-tabs.js?v=f930bc37"></script>
     <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'api/_generated/newton.sensors.MatchKind';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'api/_generated/newton.geometry.sdf_box';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://newton-physics.github.io/newton/switcher.json';
@@ -58,8 +58,8 @@
         </script>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
-    <link rel="next" title="newton.sensors.SensorContact" href="newton.sensors.SensorContact.html" />
-    <link rel="prev" title="newton.sensors" href="../newton_sensors.html" />
+    <link rel="next" title="newton.geometry.sdf_capsule" href="newton.geometry.sdf_capsule.html" />
+    <link rel="prev" title="newton.geometry.remesh_mesh" href="newton.geometry.remesh_mesh.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="" />
@@ -265,7 +265,7 @@
 </li>
 
 
-<li class=" ">
+<li class=" current active">
   <a class="nav-link dropdown-item nav-internal" href="../newton_geometry.html">
     newton.geometry
   </a>
@@ -293,7 +293,7 @@
 </li>
 
 
-<li class=" current active">
+<li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="../newton_sensors.html">
     newton.sensors
   </a>
@@ -563,7 +563,7 @@
 </li>
 
 
-<li class="nav-item ">
+<li class="nav-item current active">
   <a class="nav-link nav-internal" href="../newton_geometry.html">
     newton.geometry
   </a>
@@ -591,7 +591,7 @@
 </li>
 
 
-<li class="nav-item current active">
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="../newton_sensors.html">
     newton.sensors
   </a>
@@ -725,11 +725,11 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1 current active"><a class="reference internal" href="../newton.html">newton</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../newton_geometry.html">newton.geometry</a></li>
+<li class="toctree-l1 current active"><a class="reference internal" href="../newton_geometry.html">newton.geometry</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_ik.html">newton.ik</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_math.html">newton.math</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_selection.html">newton.selection</a></li>
-<li class="toctree-l1 current active"><a class="reference internal" href="../newton_sensors.html">newton.sensors</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../newton_sensors.html">newton.sensors</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_solvers.html">newton.solvers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_usd.html">newton.usd</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_utils.html">newton.utils</a></li>
@@ -788,9 +788,9 @@
     <li class="breadcrumb-item"><a href="../newton.html" class="nav-link">newton</a></li>
     
     
-    <li class="breadcrumb-item"><a href="../newton_sensors.html" class="nav-link">newton.sensors</a></li>
+    <li class="breadcrumb-item"><a href="../newton_geometry.html" class="nav-link">newton.geometry</a></li>
     
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">newton.sensors.MatchKind</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">newton.geometry.sdf_box</span></li>
   </ul>
 </nav>
 </div>
@@ -807,33 +807,25 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="newton-sensors-matchkind">
-<h1>newton.sensors.MatchKind<a class="headerlink" href="#newton-sensors-matchkind" title="Link to this heading">#</a></h1>
-<dl class="py class">
-<dt class="sig sig-object py" id="newton.sensors.MatchKind">
-<em class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">newton.sensors.</span></span><span class="sig-name descname"><span class="pre">MatchKind</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">value</span></span></em><span class="sig-paren">)</span><a class="reference external" href="https://github.com/newton-physics/newton/blob/main/newton/_src/sensors/sensor_contact.py#L29"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#newton.sensors.MatchKind" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3/library/enum.html#enum.Enum" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Enum</span></code></a></p>
-<p>Indicates the object type for a sensing object or a counterpart.</p>
-<ul class="simple">
-<li><p>MATCH_ANY indicates a wildcard counterpart</p></li>
-<li><p>SHAPE indicates a shape sensing object or counterpart</p></li>
-<li><p>BODY indicates a body sensing object or counterpart</p></li>
+  <section id="newton-geometry-sdf-box">
+<h1>newton.geometry.sdf_box<a class="headerlink" href="#newton-geometry-sdf-box" title="Link to this heading">#</a></h1>
+<dl class="py function">
+<dt class="sig sig-object py" id="newton.geometry.sdf_box">
+<span class="sig-prename descclassname"><span class="pre">newton.geometry.</span></span><span class="sig-name descname"><span class="pre">sdf_box</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">point</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hy</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hz</span></span></em><span class="sig-paren">)</span><a class="reference external" href="https://github.com/newton-physics/newton/blob/main/newton/_src/geometry/kernels.py#L208"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#newton.geometry.sdf_box" title="Link to this definition">#</a></dt>
+<dd><p>Compute signed distance to an axis-aligned box.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>[</strong><strong>m</strong><strong>]</strong> (<em>hz</em>) – Query point in the mesh local frame, shape [3], float.</p></li>
+<li><p><strong>[</strong><strong>m</strong><strong>]</strong> – Half-extent along X.</p></li>
+<li><p><strong>[</strong><strong>m</strong><strong>]</strong> – Half-extent along Y.</p></li>
+<li><p><strong>[</strong><strong>m</strong><strong>]</strong> – Half-extent along Z.</p></li>
 </ul>
-<dl class="py attribute">
-<dt class="sig sig-object py" id="newton.sensors.MatchKind.BODY">
-<span class="sig-name descname"><span class="pre">BODY</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">2</span></em><a class="headerlink" href="#newton.sensors.MatchKind.BODY" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py attribute">
-<dt class="sig sig-object py" id="newton.sensors.MatchKind.MATCH_ANY">
-<span class="sig-name descname"><span class="pre">MATCH_ANY</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></em><a class="headerlink" href="#newton.sensors.MatchKind.MATCH_ANY" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py attribute">
-<dt class="sig sig-object py" id="newton.sensors.MatchKind.SHAPE">
-<span class="sig-name descname"><span class="pre">SHAPE</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1</span></em><a class="headerlink" href="#newton.sensors.MatchKind.SHAPE" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>Signed distance [m], negative inside, zero on surface, positive outside.</p>
+</dd>
+</dl>
 </dd></dl>
 
 </section>
@@ -861,12 +853,7 @@
   </div>
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.sensors.MatchKind"><code class="docutils literal notranslate"><span class="pre">MatchKind</span></code></a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.sensors.MatchKind.BODY"><code class="docutils literal notranslate"><span class="pre">MatchKind.BODY</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.sensors.MatchKind.MATCH_ANY"><code class="docutils literal notranslate"><span class="pre">MatchKind.MATCH_ANY</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.sensors.MatchKind.SHAPE"><code class="docutils literal notranslate"><span class="pre">MatchKind.SHAPE</span></code></a></li>
-</ul>
-</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.geometry.sdf_box"><code class="docutils literal notranslate"><span class="pre">sdf_box()</span></code></a></li>
 </ul>
   </nav></div>
 
