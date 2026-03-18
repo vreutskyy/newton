@@ -39,6 +39,20 @@ MAX_FACE_POINTS = 4
 GJK_MAX_ITERATIONS = 64
 GJK_EPSILON = 1.0e-6
 
+EPA_MAX_ITERATIONS = 32
+EPA_MAX_FACES = 64
+EPA_MAX_VERTS = 32
+EPA_EPSILON = 1.0e-4
+
+# Fixed-size matrix types for EPA polytope storage
+# Vertices: each row is a vec3 (Minkowski diff point)
+EPAVerts = wp.types.matrix(shape=(EPA_MAX_VERTS, 3), dtype=wp.float32)
+# Same for witness points on A and B
+EPAVertsA = wp.types.matrix(shape=(EPA_MAX_VERTS, 3), dtype=wp.float32)
+EPAVertsB = wp.types.matrix(shape=(EPA_MAX_VERTS, 3), dtype=wp.float32)
+# Faces: each row stores 3 vertex indices as floats (Warp matrices are float-only)
+EPAFaces = wp.types.matrix(shape=(EPA_MAX_FACES, 3), dtype=wp.float32)
+
 
 # ---------------------------------------------------------------------------
 # Warp structs
@@ -83,6 +97,19 @@ class GJKResult:
     point_b: wp.vec3
     normal: wp.vec3
     overlap: int  # 1 = overlap, 0 = separated
+    # Terminal simplex (valid when overlap=1, used by EPA)
+    sw0: wp.vec3
+    sw1: wp.vec3
+    sw2: wp.vec3
+    sw3: wp.vec3
+    spa0: wp.vec3
+    spa1: wp.vec3
+    spa2: wp.vec3
+    spa3: wp.vec3
+    spb0: wp.vec3
+    spb1: wp.vec3
+    spb2: wp.vec3
+    spb3: wp.vec3
 
 
 # ===================================================================
@@ -472,9 +499,7 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
     # -- Dispatch: contact face (local space) ---------------------------
 
     @wp.func
-    def contact_face_local(
-        shape_type: int, params: wp.vec3, direction: wp.vec3
-    ) -> ContactFaceResult:
+    def contact_face_local(shape_type: int, params: wp.vec3, direction: wp.vec3) -> ContactFaceResult:
         for i in range(wp.static(n_types)):
             if shape_type == wp.static(type_ids[i]):
                 return wp.static(contact_face_fns[i])(params, direction)
@@ -495,9 +520,7 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
     # -- Dispatch: contact face (world space) ---------------------------
 
     @wp.func
-    def contact_face_world(
-        shape: ShapeData, direction: wp.vec3, point: wp.vec3
-    ) -> ContactFaceResult:
+    def contact_face_world(shape: ShapeData, direction: wp.vec3, point: wp.vec3) -> ContactFaceResult:
         local_dir = wp.quat_rotate_inv(shape.rot, direction)
         result = contact_face_local(shape.shape_type, shape.params, local_dir)
         result.p0 = wp.quat_rotate(shape.rot, result.p0) + shape.pos
@@ -669,6 +692,19 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
                     result.distance = 0.0
                     result.point_a = lam0 * pa0 + lam1 * pa1 + lam2 * pa2 + lam3 * pa3
                     result.point_b = lam0 * pb0 + lam1 * pb1 + lam2 * pb2 + lam3 * pb3
+                    # Store tetrahedron for EPA
+                    result.sw0 = w0
+                    result.sw1 = w1
+                    result.sw2 = w2
+                    result.sw3 = w3
+                    result.spa0 = pa0
+                    result.spa1 = pa1
+                    result.spa2 = pa2
+                    result.spa3 = pa3
+                    result.spb0 = pb0
+                    result.spb1 = pb1
+                    result.spb2 = pb2
+                    result.spb3 = pb3
                     return result
 
                 best_dist = float(1.0e30)
@@ -751,6 +787,340 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
         result.overlap = 0
         return result
 
+    # -- EPA (Expanding Polytope Algorithm) ------------------------------
+
+    @wp.func
+    def epa(
+        shape_a: ShapeData,
+        shape_b: ShapeData,
+        s0: wp.vec3,
+        s1: wp.vec3,
+        s2: wp.vec3,
+        s3: wp.vec3,
+        pa0_in: wp.vec3,
+        pa1_in: wp.vec3,
+        pa2_in: wp.vec3,
+        pa3_in: wp.vec3,
+        pb0_in: wp.vec3,
+        pb1_in: wp.vec3,
+        pb2_in: wp.vec3,
+        pb3_in: wp.vec3,
+    ) -> GJKResult:
+        """Expand polytope from GJK tetrahedron to find penetration depth."""
+        result = GJKResult()
+        result.distance = 0.0
+        result.point_a = wp.vec3(0.0, 0.0, 0.0)
+        result.point_b = wp.vec3(0.0, 0.0, 0.0)
+        result.normal = wp.vec3(0.0, 0.0, 0.0)
+        result.overlap = 1
+
+        # Initialize polytope vertices
+        verts = EPAVerts()
+        verts_a = EPAVertsA()
+        verts_b = EPAVertsB()
+        verts[0] = s0
+        verts[1] = s1
+        verts[2] = s2
+        verts[3] = s3
+        verts_a[0] = pa0_in
+        verts_a[1] = pa1_in
+        verts_a[2] = pa2_in
+        verts_a[3] = pa3_in
+        verts_b[0] = pb0_in
+        verts_b[1] = pb1_in
+        verts_b[2] = pb2_in
+        verts_b[3] = pb3_in
+        num_verts = int(4)
+
+        # Initialize faces (4 faces of tetrahedron)
+        # Ensure outward-facing normals by checking winding
+        faces = EPAFaces()
+
+        # Check if face 0-1-2 normal points away from vertex 3
+        n012 = wp.cross(s1 - s0, s2 - s0)
+        if wp.dot(n012, s3 - s0) > 0.0:
+            # Vertex 3 is on the positive side, so 0-1-2 points toward 3 — flip
+            faces[0] = wp.vec3(0.0, 2.0, 1.0)
+            faces[1] = wp.vec3(0.0, 1.0, 3.0)
+            faces[2] = wp.vec3(1.0, 2.0, 3.0)
+            faces[3] = wp.vec3(0.0, 3.0, 2.0)
+        else:
+            faces[0] = wp.vec3(0.0, 1.0, 2.0)
+            faces[1] = wp.vec3(0.0, 3.0, 1.0)
+            faces[2] = wp.vec3(1.0, 3.0, 2.0)
+            faces[3] = wp.vec3(0.0, 2.0, 3.0)
+        num_faces = int(4)
+
+        for _epa_iter in range(EPA_MAX_ITERATIONS):
+            # Find closest face to origin
+            best_face = int(0)
+            best_dist = float(1.0e30)
+            best_normal = wp.vec3(0.0, 0.0, 0.0)
+
+            for fi in range(EPA_MAX_FACES):
+                if fi >= num_faces:
+                    break
+                i0 = int(faces[fi][0])
+                i1 = int(faces[fi][1])
+                i2 = int(faces[fi][2])
+                va = wp.vec3(verts[i0][0], verts[i0][1], verts[i0][2])
+                vb = wp.vec3(verts[i1][0], verts[i1][1], verts[i1][2])
+                vc = wp.vec3(verts[i2][0], verts[i2][1], verts[i2][2])
+                n = wp.cross(vb - va, vc - va)
+                n_len = wp.length(n)
+                if n_len < EPA_EPSILON:
+                    continue
+                n = n / n_len
+                d = wp.dot(n, va)
+                if d < 0.0:
+                    n = -n
+                    d = -d
+                if d < best_dist:
+                    best_dist = d
+                    best_normal = n
+                    best_face = fi
+
+            # Get new support point along best normal
+            sa = support_world(shape_a, best_normal)
+            sb = support_world(shape_b, -best_normal)
+            w_new = sa - sb
+
+            # Check convergence
+            new_dist = wp.dot(w_new, best_normal)
+            if new_dist - best_dist < EPA_EPSILON:
+                # Converged — compute witness points
+                result.distance = best_dist
+                result.normal = best_normal
+
+                # Barycentric coords of origin projection on best face
+                bi0 = int(faces[best_face][0])
+                bi1 = int(faces[best_face][1])
+                bi2 = int(faces[best_face][2])
+                fa = wp.vec3(verts[bi0][0], verts[bi0][1], verts[bi0][2])
+                fb = wp.vec3(verts[bi1][0], verts[bi1][1], verts[bi1][2])
+                fc = wp.vec3(verts[bi2][0], verts[bi2][1], verts[bi2][2])
+
+                # Project origin onto face plane
+                proj = best_normal * best_dist
+                v0 = fb - fa
+                v1 = fc - fa
+                v2 = proj - fa
+                d00 = wp.dot(v0, v0)
+                d01 = wp.dot(v0, v1)
+                d11 = wp.dot(v1, v1)
+                d20 = wp.dot(v2, v0)
+                d21 = wp.dot(v2, v1)
+                denom = d00 * d11 - d01 * d01
+                if wp.abs(denom) < EPA_EPSILON:
+                    denom = EPA_EPSILON
+                bv = (d11 * d20 - d01 * d21) / denom
+                bw = (d00 * d21 - d01 * d20) / denom
+                bu = 1.0 - bv - bw
+
+                pa_a = wp.vec3(verts_a[bi0][0], verts_a[bi0][1], verts_a[bi0][2])
+                pa_b = wp.vec3(verts_a[bi1][0], verts_a[bi1][1], verts_a[bi1][2])
+                pa_c = wp.vec3(verts_a[bi2][0], verts_a[bi2][1], verts_a[bi2][2])
+                pb_a = wp.vec3(verts_b[bi0][0], verts_b[bi0][1], verts_b[bi0][2])
+                pb_b = wp.vec3(verts_b[bi1][0], verts_b[bi1][1], verts_b[bi1][2])
+                pb_c = wp.vec3(verts_b[bi2][0], verts_b[bi2][1], verts_b[bi2][2])
+
+                result.point_a = bu * pa_a + bv * pa_b + bw * pa_c
+                result.point_b = bu * pb_a + bv * pb_b + bw * pb_c
+                return result
+
+            if num_verts >= EPA_MAX_VERTS:
+                break
+
+            # Add new vertex
+            new_vi = num_verts
+            verts[new_vi] = w_new
+            verts_a[new_vi] = sa
+            verts_b[new_vi] = sb
+            num_verts = num_verts + 1
+
+            # Remove faces visible from new point and collect horizon edges
+            # Use a simple edge buffer (max 64 edges)
+            # Edge stored as vec3(v0, v1, 0) — we reuse float storage
+            edges = EPAFaces()  # reuse same matrix type for edge storage
+            num_edges = int(0)
+            new_num_faces = int(0)
+
+            for fi in range(EPA_MAX_FACES):
+                if fi >= num_faces:
+                    break
+                i0 = int(faces[fi][0])
+                i1 = int(faces[fi][1])
+                i2 = int(faces[fi][2])
+                va = wp.vec3(verts[i0][0], verts[i0][1], verts[i0][2])
+                vb = wp.vec3(verts[i1][0], verts[i1][1], verts[i1][2])
+                vc = wp.vec3(verts[i2][0], verts[i2][1], verts[i2][2])
+                fn = wp.cross(vb - va, vc - va)
+                fn_len = wp.length(fn)
+                if fn_len > EPA_EPSILON:
+                    fn = fn / fn_len
+                    if wp.dot(fn, va) < 0.0:
+                        fn = -fn
+
+                # Check if face is visible from new point
+                visible = int(0)
+                if fn_len > EPA_EPSILON:
+                    if wp.dot(fn, w_new - va) > EPA_EPSILON:
+                        visible = int(1)
+
+                if visible == 1:
+                    # Add edges to horizon (remove shared edges)
+                    e0 = wp.vec3(float(i0), float(i1), 0.0)
+                    e1 = wp.vec3(float(i1), float(i2), 0.0)
+                    e2 = wp.vec3(float(i2), float(i0), 0.0)
+
+                    # For each edge, check if its reverse already exists
+                    for ei_new in range(3):
+                        if ei_new == 0:
+                            edge = e0
+                        elif ei_new == 1:
+                            edge = e1
+                        else:
+                            edge = e2
+                        rev = wp.vec3(edge[1], edge[0], 0.0)
+                        found = int(-1)
+                        for k in range(EPA_MAX_FACES):
+                            if k >= num_edges:
+                                break
+                            if edges[k][0] == rev[0] and edges[k][1] == rev[1]:
+                                found = k
+                        if found >= 0:
+                            # Remove by swapping with last
+                            num_edges = num_edges - 1
+                            edges[found] = edges[num_edges]
+                        else:
+                            if num_edges < EPA_MAX_FACES:
+                                edges[num_edges] = edge
+                                num_edges = num_edges + 1
+                else:
+                    # Keep face — compact into new_num_faces
+                    if new_num_faces != fi:
+                        faces[new_num_faces] = faces[fi]
+                    new_num_faces = new_num_faces + 1
+
+            num_faces = new_num_faces
+
+            # Create new faces from horizon edges to new vertex
+            for ei in range(EPA_MAX_FACES):
+                if ei >= num_edges:
+                    break
+                if num_faces < EPA_MAX_FACES:
+                    faces[num_faces] = wp.vec3(edges[ei][0], edges[ei][1], float(new_vi))
+                    num_faces = num_faces + 1
+
+        # Max iterations — return best so far
+        result.distance = best_dist
+        result.normal = best_normal
+        return result
+
+    # -- Combined GJK + EPA ---------------------------------------------
+
+    @wp.func
+    def build_initial_tetrahedron(shape_a: ShapeData, shape_b: ShapeData) -> GJKResult:
+        """Build an initial tetrahedron enclosing the origin for EPA.
+
+        For overlapping convex shapes, the origin lies inside their
+        Minkowski difference.  This function finds 4 support points
+        that form a tetrahedron containing the origin.
+        """
+        result = GJKResult()
+        result.overlap = 1
+        result.distance = 0.0
+
+        # Point 0: support in +x (or center-to-center) direction
+        d0 = shape_b.pos - shape_a.pos
+        if wp.length(d0) < GJK_EPSILON:
+            d0 = wp.vec3(1.0, 0.0, 0.0)
+        d0 = wp.normalize(d0)
+        sa = support_world(shape_a, d0)
+        sb = support_world(shape_b, -d0)
+        result.sw0 = sa - sb
+        result.spa0 = sa
+        result.spb0 = sb
+
+        # Point 1: support in opposite direction
+        d1 = -d0
+        sa = support_world(shape_a, d1)
+        sb = support_world(shape_b, -d1)
+        result.sw1 = sa - sb
+        result.spa1 = sa
+        result.spb1 = sb
+
+        # Point 2: perpendicular to line 0→1, toward origin
+        line = result.sw1 - result.sw0
+        # Project origin onto line to find closest point
+        t = -wp.dot(result.sw0, line) / wp.max(wp.dot(line, line), GJK_EPSILON)
+        closest = result.sw0 + t * line
+        # Direction from closest point to origin
+        d2 = -closest
+        if wp.length(d2) < GJK_EPSILON:
+            # Origin is on the line — pick any perpendicular
+            d2 = wp.cross(line, wp.vec3(1.0, 0.0, 0.0))
+            if wp.length(d2) < GJK_EPSILON:
+                d2 = wp.cross(line, wp.vec3(0.0, 1.0, 0.0))
+        d2 = wp.normalize(d2)
+        sa = support_world(shape_a, d2)
+        sb = support_world(shape_b, -d2)
+        result.sw2 = sa - sb
+        result.spa2 = sa
+        result.spb2 = sb
+
+        # Point 3: perpendicular to triangle, on the side of the origin
+        tri_n = wp.cross(result.sw1 - result.sw0, result.sw2 - result.sw0)
+        tri_n_len = wp.length(tri_n)
+        if tri_n_len < GJK_EPSILON:
+            tri_n = wp.vec3(0.0, 0.0, 1.0)
+        else:
+            tri_n = tri_n / tri_n_len
+        # Check which side of the triangle the origin is on
+        if wp.dot(tri_n, -result.sw0) < 0.0:
+            tri_n = -tri_n
+        sa = support_world(shape_a, tri_n)
+        sb = support_world(shape_b, -tri_n)
+        result.sw3 = sa - sb
+        result.spa3 = sa
+        result.spb3 = sb
+
+        return result
+
+    @wp.func
+    def gjk_epa(shape_a: ShapeData, shape_b: ShapeData) -> GJKResult:
+        """Run GJK. If overlap detected, run EPA for penetration depth."""
+        gjk_result = gjk_distance(shape_a, shape_b)
+        if gjk_result.overlap == 0:
+            return gjk_result
+
+        # Check if GJK gave us a valid tetrahedron (non-zero volume)
+        d0 = gjk_result.sw1 - gjk_result.sw0
+        d1 = gjk_result.sw2 - gjk_result.sw0
+        d2 = gjk_result.sw3 - gjk_result.sw0
+        vol = wp.abs(wp.dot(d0, wp.cross(d1, d2)))
+
+        if vol < GJK_EPSILON:
+            # GJK exited early without a full tetrahedron — build one
+            gjk_result = build_initial_tetrahedron(shape_a, shape_b)
+
+        return epa(
+            shape_a,
+            shape_b,
+            gjk_result.sw0,
+            gjk_result.sw1,
+            gjk_result.sw2,
+            gjk_result.sw3,
+            gjk_result.spa0,
+            gjk_result.spa1,
+            gjk_result.spa2,
+            gjk_result.spa3,
+            gjk_result.spb0,
+            gjk_result.spb1,
+            gjk_result.spb2,
+            gjk_result.spb3,
+        )
+
     # -- Kernels --------------------------------------------------------
 
     @wp.kernel(enable_backward=False)
@@ -805,6 +1175,24 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
         results_normal[tid] = r.normal
         results_overlap[tid] = r.overlap
 
+    @wp.kernel(enable_backward=False)
+    def gjk_epa_kernel(
+        shapes_a: wp.array(dtype=ShapeData),
+        shapes_b: wp.array(dtype=ShapeData),
+        results_dist: wp.array(dtype=float),
+        results_point_a: wp.array(dtype=wp.vec3),
+        results_point_b: wp.array(dtype=wp.vec3),
+        results_normal: wp.array(dtype=wp.vec3),
+        results_overlap: wp.array(dtype=int),
+    ):
+        tid = wp.tid()
+        r = gjk_epa(shapes_a[tid], shapes_b[tid])
+        results_dist[tid] = r.distance
+        results_point_a[tid] = r.point_a
+        results_point_b[tid] = r.point_b
+        results_normal[tid] = r.normal
+        results_overlap[tid] = r.overlap
+
     return Pipeline(
         support_local=support_local,
         support_world=support_world,
@@ -812,10 +1200,13 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
         contact_face_world=contact_face_world,
         get_aabb=get_aabb,
         gjk_distance=gjk_distance,
+        gjk_epa=gjk_epa,
+        epa=epa,
         support_kernel=support_kernel,
         contact_face_kernel=contact_face_kernel,
         aabb_kernel=aabb_kernel,
         gjk_kernel=gjk_kernel,
+        gjk_epa_kernel=gjk_epa_kernel,
     )
 
 
@@ -833,7 +1224,10 @@ class Pipeline:
     contact_face_world: Any
     get_aabb: Any
     gjk_distance: Any
+    gjk_epa: Any
+    epa: Any
     support_kernel: Any
     contact_face_kernel: Any
     aabb_kernel: Any
     gjk_kernel: Any
+    gjk_epa_kernel: Any
