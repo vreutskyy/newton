@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,9 +18,25 @@
 import unittest
 
 import numpy as np
-import warp as wp
 
 import newton._src.xcol as xc
+
+# Identity quaternion as (qx, qy, qz, qw)
+_QUAT_ID = (0.0, 0.0, 0.0, 1.0)
+
+
+def _transforms(*positions):
+    """Build a (n, 7) numpy array of transforms from positions."""
+    out = np.zeros((len(positions), 7), dtype=np.float32)
+    for i, p in enumerate(positions):
+        out[i, :3] = p
+        out[i, 3:] = _QUAT_ID
+    return out
+
+
+def _count(contacts):
+    """Read contact count from GPU."""
+    return contacts.count.numpy()[0]
 
 
 class TestAddShape(unittest.TestCase):
@@ -44,12 +60,11 @@ class TestAddShape(unittest.TestCase):
         self.assertEqual(pipeline.shape_worlds.numpy()[0], 2)
         self.assertEqual(pipeline.shape_worlds.numpy()[1], -1)
 
-    def test_transform_writable(self):
-        """User can write transforms before collide()."""
+    def test_set_transforms(self):
+        """User can upload transforms via set_transforms()."""
         pipeline = xc.create_pipeline()
         pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0)
-        # Write a transform: position (1,2,3), identity rotation
-        pipeline.shape_transforms.numpy()[0] = (1, 2, 3, 0, 0, 0, 1)
+        pipeline.set_transforms(_transforms((1, 2, 3)))
         t = pipeline.shape_transforms.numpy()[0]
         np.testing.assert_allclose(t[:3], [1, 2, 3])
 
@@ -59,75 +74,76 @@ class TestCollide(unittest.TestCase):
         pipeline = xc.create_pipeline()
         pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0)
         pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0)
-        pipeline.shape_transforms.numpy()[0] = (-0.5, 0, 0, 0, 0, 0, 1)
-        pipeline.shape_transforms.numpy()[1] = (0.5, 0, 0, 0, 0, 0, 1)
+        pipeline.set_transforms(_transforms((-0.5, 0, 0), (0.5, 0, 0)))
         contacts = pipeline.collide()
-        self.assertGreater(contacts.count, 0)
+        self.assertGreater(_count(contacts), 0)
 
     def test_separated_no_contacts(self):
         pipeline = xc.create_pipeline()
         pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0)
         pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0)
-        pipeline.shape_transforms.numpy()[0] = (-5, 0, 0, 0, 0, 0, 1)
-        pipeline.shape_transforms.numpy()[1] = (5, 0, 0, 0, 0, 0, 1)
+        pipeline.set_transforms(_transforms((-5, 0, 0), (5, 0, 0)))
         contacts = pipeline.collide()
-        self.assertEqual(contacts.count, 0)
+        self.assertEqual(_count(contacts), 0)
 
     def test_box_on_box_4_contacts(self):
         pipeline = xc.create_pipeline()
         pipeline.add_shape(xc.SHAPE_BOX, params=(1, 1, 1))
         pipeline.add_shape(xc.SHAPE_BOX, params=(1, 1, 1))
-        pipeline.shape_transforms.numpy()[0] = (0, 0, 0, 0, 0, 0, 1)
-        pipeline.shape_transforms.numpy()[1] = (1.5, 0, 0, 0, 0, 0, 1)
+        pipeline.set_transforms(_transforms((0, 0, 0), (1.5, 0, 0)))
         contacts = pipeline.collide()
-        self.assertGreater(contacts.count, 0)
-        # First pair should have 4 contact points
-        self.assertEqual(contacts.point_count[0], 4)
+        self.assertEqual(_count(contacts), 4)
+
+    def test_contact_arrays_accessible(self):
+        """Contact SoA arrays are readable from GPU."""
+        pipeline = xc.create_pipeline()
+        pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0)
+        pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0)
+        pipeline.set_transforms(_transforms((-0.5, 0, 0), (0.5, 0, 0)))
+        contacts = pipeline.collide()
+        n = _count(contacts)
+        self.assertEqual(n, 1)
+        self.assertEqual(contacts.shape_a.numpy()[0], 0)
+        self.assertEqual(contacts.shape_b.numpy()[0], 1)
+        self.assertGreater(contacts.depth.numpy()[0], 0.0)
+        self.assertAlmostEqual(np.linalg.norm(contacts.normal.numpy()[0]), 1.0, places=3)
 
 
 class TestWorldFiltering(unittest.TestCase):
     def test_different_worlds_no_collision(self):
-        """Shapes in different worlds don't collide."""
         pipeline = xc.create_pipeline()
         pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0, world=0)
         pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0, world=1)
-        pipeline.shape_transforms.numpy()[0] = (-0.5, 0, 0, 0, 0, 0, 1)
-        pipeline.shape_transforms.numpy()[1] = (0.5, 0, 0, 0, 0, 0, 1)
+        pipeline.set_transforms(_transforms((-0.5, 0, 0), (0.5, 0, 0)))
         contacts = pipeline.collide()
-        self.assertEqual(contacts.count, 0)
+        self.assertEqual(_count(contacts), 0)
 
     def test_same_world_collides(self):
         pipeline = xc.create_pipeline()
         pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0, world=0)
         pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0, world=0)
-        pipeline.shape_transforms.numpy()[0] = (-0.5, 0, 0, 0, 0, 0, 1)
-        pipeline.shape_transforms.numpy()[1] = (0.5, 0, 0, 0, 0, 0, 1)
+        pipeline.set_transforms(_transforms((-0.5, 0, 0), (0.5, 0, 0)))
         contacts = pipeline.collide()
-        self.assertGreater(contacts.count, 0)
+        self.assertGreater(_count(contacts), 0)
 
     def test_global_world_collides_with_any(self):
-        """World -1 shapes collide with everything."""
         pipeline = xc.create_pipeline()
         pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0, world=-1)
         pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0, world=42)
-        pipeline.shape_transforms.numpy()[0] = (-0.5, 0, 0, 0, 0, 0, 1)
-        pipeline.shape_transforms.numpy()[1] = (0.5, 0, 0, 0, 0, 0, 1)
+        pipeline.set_transforms(_transforms((-0.5, 0, 0), (0.5, 0, 0)))
         contacts = pipeline.collide()
-        self.assertGreater(contacts.count, 0)
+        self.assertGreater(_count(contacts), 0)
 
     def test_three_shapes_world_filtering(self):
         """Only same-world pairs collide, global collides with all."""
         pipeline = xc.create_pipeline()
-        pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0, world=0)   # 0
-        pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0, world=1)   # 1
-        pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0, world=-1)  # 2
-        # All overlapping at origin
-        pipeline.shape_transforms.numpy()[0] = (0, 0, 0, 0, 0, 0, 1)
-        pipeline.shape_transforms.numpy()[1] = (0.1, 0, 0, 0, 0, 0, 1)
-        pipeline.shape_transforms.numpy()[2] = (0.2, 0, 0, 0, 0, 0, 1)
+        pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0, world=0)
+        pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0, world=1)
+        pipeline.add_shape(xc.SHAPE_POINT, params=(0, 0, 0), margin=1.0, world=-1)
+        pipeline.set_transforms(_transforms((0, 0, 0), (0.1, 0, 0), (0.2, 0, 0)))
         contacts = pipeline.collide()
-        # Pairs: 0-1 different worlds (no), 0-2 global (yes), 1-2 global (yes)
-        self.assertEqual(contacts.count, 2)
+        # Pairs: 0-2 global (1 contact), 1-2 global (1 contact) = 2 contacts
+        self.assertEqual(_count(contacts), 2)
 
 
 if __name__ == "__main__":
