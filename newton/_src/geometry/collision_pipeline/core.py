@@ -99,6 +99,36 @@ class ContactFaceResult:
 
 
 @wp.struct
+class ContactResult:
+    """Result of contact generation between two shapes.
+
+    Attributes:
+        normal: Contact normal (A→B direction, unit length).
+        p0..p3: Up to 4 contact points (world space, on shape A surface).
+        d0..d3: Penetration depth at each contact point [m].
+        count: Number of valid contacts (0..4).
+    """
+
+    normal: wp.vec3
+    p0: wp.vec3
+    p1: wp.vec3
+    p2: wp.vec3
+    p3: wp.vec3
+    d0: float
+    d1: float
+    d2: float
+    d3: float
+    count: int
+
+
+# Maximum intermediate polygon size during clipping (face_a clipped against face_b edges)
+CLIP_MAX_POINTS = 8
+
+# Fixed-size matrix for clipped polygon storage: rows = points, cols = xyz
+ClipPoly = wp.types.matrix(shape=(CLIP_MAX_POINTS, 3), dtype=wp.float32)
+
+
+@wp.struct
 class GJKResult:
     """Result of a GJK distance query."""
 
@@ -1163,6 +1193,277 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
         epa_result.point_b = epa_result.point_b - epa_result.normal * shape_b.margin
         return epa_result
 
+    # -- Polygon clipping (Sutherland-Hodgman) --------------------------
+
+    @wp.func
+    def clip_poly_against_plane(
+        poly: ClipPoly,
+        num_pts: int,
+        plane_n: wp.vec3,
+        plane_d: float,
+    ) -> tuple[ClipPoly, int]:
+        """Clip a polygon against a single plane (keep positive side).
+
+        The plane is defined as ``dot(plane_n, x) <= plane_d``.
+        """
+        out = ClipPoly()
+        out_count = int(0)
+
+        for i in range(CLIP_MAX_POINTS):
+            if i >= num_pts:
+                break
+            j = i + 1
+            if j >= num_pts:
+                j = int(0)
+
+            pi = wp.vec3(poly[i][0], poly[i][1], poly[i][2])
+            pj = wp.vec3(poly[j][0], poly[j][1], poly[j][2])
+            di = wp.dot(plane_n, pi) - plane_d
+            dj = wp.dot(plane_n, pj) - plane_d
+
+            if di <= 0.0:
+                # pi is inside
+                if out_count < CLIP_MAX_POINTS:
+                    out[out_count] = pi
+                    out_count = out_count + 1
+                if dj > 0.0:
+                    # pj is outside — add intersection
+                    denom = di - dj
+                    if wp.abs(denom) < 1.0e-10:
+                        denom = 1.0e-10
+                    t = di / denom
+                    intersection = pi + t * (pj - pi)
+                    if out_count < CLIP_MAX_POINTS:
+                        out[out_count] = intersection
+                        out_count = out_count + 1
+            elif dj <= 0.0:
+                # pi is outside, pj is inside — add intersection
+                denom = di - dj
+                if wp.abs(denom) < 1.0e-10:
+                    denom = 1.0e-10
+                t = di / denom
+                intersection = pi + t * (pj - pi)
+                if out_count < CLIP_MAX_POINTS:
+                    out[out_count] = intersection
+                    out_count = out_count + 1
+
+        return out, out_count
+
+    @wp.func
+    def clip_face_against_face(
+        face_a: ContactFaceResult,
+        face_b: ContactFaceResult,
+        normal: wp.vec3,
+    ) -> tuple[ClipPoly, int]:
+        """Clip face_a polygon against face_b edges using Sutherland-Hodgman.
+
+        Returns clipped polygon points (on face_a side) and count.
+        """
+        # Initialize polygon from face_a points
+        poly = ClipPoly()
+        poly[0] = face_a.p0
+        poly[1] = face_a.p1
+        poly[2] = face_a.p2
+        poly[3] = face_a.p3
+        num_pts = face_a.count
+
+        # Get face_b points into an array
+        fb0 = face_b.p0
+        fb1 = face_b.p1
+        fb2 = face_b.p2
+        fb3 = face_b.p3
+        fb_count = face_b.count
+
+        # Clip against each edge of face_b
+        # Edge normal = cross(edge_dir, contact_normal) pointing inward
+        for ei in range(4):
+            if ei >= fb_count:
+                break
+            ej = ei + 1
+            if ej >= fb_count:
+                ej = int(0)
+
+            if ei == 0:
+                ea = fb0
+            elif ei == 1:
+                ea = fb1
+            elif ei == 2:
+                ea = fb2
+            else:
+                ea = fb3
+
+            if ej == 0:
+                eb = fb0
+            elif ej == 1:
+                eb = fb1
+            elif ej == 2:
+                eb = fb2
+            else:
+                eb = fb3
+
+            edge = eb - ea
+            # Clip plane normal: inward-facing perpendicular to edge
+            clip_n = wp.cross(edge, normal)
+            clip_n_len = wp.length(clip_n)
+            if clip_n_len > 1.0e-10:
+                clip_n = clip_n / clip_n_len
+                clip_d = wp.dot(clip_n, ea)
+                poly, num_pts = clip_poly_against_plane(poly, num_pts, clip_n, clip_d)
+
+        return poly, num_pts
+
+    # -- Polygon reduction -----------------------------------------------
+
+    @wp.func
+    def reduce_polygon(
+        poly: ClipPoly,
+        num_pts: int,
+        normal: wp.vec3,
+    ) -> tuple[ClipPoly, int]:
+        """Reduce a polygon to at most 4 points forming the largest quad.
+
+        Strategy:
+        1. Find the two most distant points (diameter).
+        2. Find the point most distant from this line on each side.
+        """
+        if num_pts <= 4:
+            return poly, num_pts
+
+        # Step 1: find two most distant points
+        best_dist = float(-1.0)
+        best_i = int(0)
+        best_j = int(1)
+        for i in range(CLIP_MAX_POINTS):
+            if i >= num_pts:
+                break
+            pi = wp.vec3(poly[i][0], poly[i][1], poly[i][2])
+            for j in range(CLIP_MAX_POINTS):
+                if j >= num_pts:
+                    break
+                if j <= i:
+                    continue
+                pj = wp.vec3(poly[j][0], poly[j][1], poly[j][2])
+                d = wp.length_sq(pj - pi)
+                if d > best_dist:
+                    best_dist = d
+                    best_i = i
+                    best_j = j
+
+        p0 = wp.vec3(poly[best_i][0], poly[best_i][1], poly[best_i][2])
+        p1 = wp.vec3(poly[best_j][0], poly[best_j][1], poly[best_j][2])
+
+        # Step 2: find point most distant from line p0-p1 on each side
+        line = p1 - p0
+        perp = wp.cross(normal, line)
+
+        best_pos = float(-1.0e30)
+        best_neg = float(1.0e30)
+        idx_pos = int(-1)
+        idx_neg = int(-1)
+
+        for k in range(CLIP_MAX_POINTS):
+            if k >= num_pts:
+                break
+            if k == best_i or k == best_j:
+                continue
+            pk = wp.vec3(poly[k][0], poly[k][1], poly[k][2])
+            d = wp.dot(pk - p0, perp)
+            if d > best_pos:
+                best_pos = d
+                idx_pos = k
+            if d < best_neg:
+                best_neg = d
+                idx_neg = k
+
+        out = ClipPoly()
+        out_count = int(2)
+        out[0] = p0
+        out[1] = p1
+        if idx_pos >= 0:
+            out[out_count] = wp.vec3(poly[idx_pos][0], poly[idx_pos][1], poly[idx_pos][2])
+            out_count = out_count + 1
+        if idx_neg >= 0 and idx_neg != idx_pos:
+            out[out_count] = wp.vec3(poly[idx_neg][0], poly[idx_neg][1], poly[idx_neg][2])
+            out_count = out_count + 1
+
+        return out, out_count
+
+    # -- Full contact generation -----------------------------------------
+
+    @wp.func
+    def generate_contacts(shape_a: ShapeData, shape_b: ShapeData) -> ContactResult:
+        """Generate contact patch between two shapes.
+
+        Runs GJK/EPA to find penetration, then clips contact faces to
+        produce up to 4 contact points with depths.
+        """
+        result = ContactResult()
+        result.count = 0
+
+        # Step 1: GJK + EPA
+        gjk_result = gjk_epa(shape_a, shape_b)
+        if gjk_result.overlap == 0:
+            return result
+
+        n = gjk_result.normal
+        depth = gjk_result.distance
+        result.normal = n
+
+        # Step 2: Get contact faces from both shapes
+        face_a = contact_face_world(shape_a, n, gjk_result.point_a)
+        face_b = contact_face_world(shape_b, -n, gjk_result.point_b)
+
+        # Step 3: Determine reference/incident faces
+        # Reference = face with more points (or face_a if equal).
+        # Clip incident face against reference face edges.
+        # The contact normal n points A→B. For the reference face on A,
+        # clip planes use n directly. For reference face on B, we negate
+        # because the face normal of B points toward A (opposite to n).
+        if face_b.count > face_a.count:
+            # Reference = B, incident = A
+            clipped, num_clipped = clip_face_against_face(face_a, face_b, -n)
+        else:
+            # Reference = A, incident = B
+            clipped, num_clipped = clip_face_against_face(face_b, face_a, n)
+
+        if num_clipped == 0:
+            # Clipping produced no points — fall back to single contact
+            mid = (gjk_result.point_a + gjk_result.point_b) * 0.5
+            result.p0 = mid
+            result.d0 = depth
+            result.count = 1
+            return result
+
+        # Step 4: Reduce to max 4 points
+        clipped, num_clipped = reduce_polygon(clipped, num_clipped, n)
+
+        # Step 5: Compute per-point depths and store
+        count = int(0)
+        for ci in range(CLIP_MAX_POINTS):
+            if ci >= num_clipped:
+                break
+            if count >= 4:
+                break
+            pt = wp.vec3(clipped[ci][0], clipped[ci][1], clipped[ci][2])
+            # Depth = how far below the reference face this point is
+            pt_depth = depth  # approximate: use overall penetration depth
+            if count == 0:
+                result.p0 = pt
+                result.d0 = pt_depth
+            elif count == 1:
+                result.p1 = pt
+                result.d1 = pt_depth
+            elif count == 2:
+                result.p2 = pt
+                result.d2 = pt_depth
+            elif count == 3:
+                result.p3 = pt
+                result.d3 = pt_depth
+            count = count + 1
+
+        result.count = count
+        return result
+
     # -- Kernels --------------------------------------------------------
 
     @wp.kernel(enable_backward=False)
@@ -1235,6 +1536,15 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
         results_normal[tid] = r.normal
         results_overlap[tid] = r.overlap
 
+    @wp.kernel(enable_backward=False)
+    def generate_contacts_kernel(
+        shapes_a: wp.array(dtype=ShapeData),
+        shapes_b: wp.array(dtype=ShapeData),
+        out: wp.array(dtype=ContactResult),
+    ):
+        tid = wp.tid()
+        out[tid] = generate_contacts(shapes_a[tid], shapes_b[tid])
+
     return Pipeline(
         support_local=support_local,
         support_world=support_world,
@@ -1244,11 +1554,13 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
         gjk_distance=gjk_distance,
         gjk_epa=gjk_epa,
         epa=epa,
+        generate_contacts=generate_contacts,
         support_kernel=support_kernel,
         contact_face_kernel=contact_face_kernel,
         aabb_kernel=aabb_kernel,
         gjk_kernel=gjk_kernel,
         gjk_epa_kernel=gjk_epa_kernel,
+        generate_contacts_kernel=generate_contacts_kernel,
     )
 
 
@@ -1268,8 +1580,10 @@ class Pipeline:
     gjk_distance: Any
     gjk_epa: Any
     epa: Any
+    generate_contacts: Any
     support_kernel: Any
     contact_face_kernel: Any
     aabb_kernel: Any
     gjk_kernel: Any
     gjk_epa_kernel: Any
+    generate_contacts_kernel: Any
