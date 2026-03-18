@@ -1,0 +1,150 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for Phase 1: GJK distance query (Warp)."""
+
+import unittest
+
+import numpy as np
+import warp as wp
+
+from newton._src.geometry.collision_pipeline.core import (
+    SHAPE_BOX,
+    SHAPE_SPHERE,
+    ShapeData,
+    create_pipeline,
+)
+
+_pipeline = create_pipeline()
+
+
+def _make_shape(shape_type, pos, params, rot=None):
+    s = ShapeData()
+    s.shape_type = int(shape_type)
+    s.pos = wp.vec3(*pos)
+    s.params = wp.vec3(*params)
+    s.rot = wp.quat(*rot) if rot else wp.quat_identity()
+    return s
+
+
+def _run_gjk(shape_a, shape_b):
+    sa = wp.array([shape_a], dtype=ShapeData)
+    sb = wp.array([shape_b], dtype=ShapeData)
+    dist = wp.zeros(1, dtype=float)
+    pa = wp.zeros(1, dtype=wp.vec3)
+    pb = wp.zeros(1, dtype=wp.vec3)
+    normal = wp.zeros(1, dtype=wp.vec3)
+    overlap = wp.zeros(1, dtype=int)
+    wp.launch(_pipeline.gjk_kernel, dim=1, inputs=[sa, sb], outputs=[dist, pa, pb, normal, overlap])
+    return {
+        "distance": dist.numpy()[0],
+        "point_a": pa.numpy()[0],
+        "point_b": pb.numpy()[0],
+        "normal": normal.numpy()[0],
+        "overlap": overlap.numpy()[0],
+    }
+
+
+class TestGJKSphereSphere(unittest.TestCase):
+    def test_separated_spheres(self):
+        a = _make_shape(SHAPE_SPHERE, (-2, 0, 0), (1, 0, 0))
+        b = _make_shape(SHAPE_SPHERE, (2, 0, 0), (1, 0, 0))
+        r = _run_gjk(a, b)
+        self.assertAlmostEqual(r["distance"], 2.0, places=3)
+        np.testing.assert_allclose(r["point_a"], [-1, 0, 0], atol=0.05)
+        np.testing.assert_allclose(r["point_b"], [1, 0, 0], atol=0.05)
+        self.assertEqual(r["overlap"], 0)
+
+    def test_separated_spheres_y_axis(self):
+        a = _make_shape(SHAPE_SPHERE, (0, -3, 0), (0.5, 0, 0))
+        b = _make_shape(SHAPE_SPHERE, (0, 3, 0), (0.5, 0, 0))
+        r = _run_gjk(a, b)
+        self.assertAlmostEqual(r["distance"], 5.0, places=3)
+        self.assertEqual(r["overlap"], 0)
+
+    def test_touching_spheres(self):
+        a = _make_shape(SHAPE_SPHERE, (-1, 0, 0), (1, 0, 0))
+        b = _make_shape(SHAPE_SPHERE, (1, 0, 0), (1, 0, 0))
+        r = _run_gjk(a, b)
+        self.assertAlmostEqual(r["distance"], 0.0, places=2)
+
+    def test_overlapping_spheres(self):
+        a = _make_shape(SHAPE_SPHERE, (-0.5, 0, 0), (1, 0, 0))
+        b = _make_shape(SHAPE_SPHERE, (0.5, 0, 0), (1, 0, 0))
+        r = _run_gjk(a, b)
+        self.assertEqual(r["overlap"], 1)
+
+    def test_concentric_spheres(self):
+        a = _make_shape(SHAPE_SPHERE, (0, 0, 0), (1, 0, 0))
+        b = _make_shape(SHAPE_SPHERE, (0, 0, 0), (1, 0, 0))
+        r = _run_gjk(a, b)
+        self.assertEqual(r["overlap"], 1)
+
+    def test_normal_direction(self):
+        a = _make_shape(SHAPE_SPHERE, (0, 0, 0), (1, 0, 0))
+        b = _make_shape(SHAPE_SPHERE, (5, 0, 0), (1, 0, 0))
+        r = _run_gjk(a, b)
+        np.testing.assert_allclose(r["normal"], [1, 0, 0], atol=0.05)
+
+    def test_diagonal_separation(self):
+        a = _make_shape(SHAPE_SPHERE, (0, 0, 0), (1, 0, 0))
+        b = _make_shape(SHAPE_SPHERE, (4, 4, 4), (1, 0, 0))
+        r = _run_gjk(a, b)
+        center_dist = np.linalg.norm([4, 4, 4])
+        expected = center_dist - 2.0
+        self.assertAlmostEqual(r["distance"], expected, places=2)
+        self.assertEqual(r["overlap"], 0)
+
+    def test_different_radii(self):
+        a = _make_shape(SHAPE_SPHERE, (0, 0, 0), (2, 0, 0))
+        b = _make_shape(SHAPE_SPHERE, (5, 0, 0), (0.5, 0, 0))
+        r = _run_gjk(a, b)
+        self.assertAlmostEqual(r["distance"], 2.5, places=3)
+        np.testing.assert_allclose(r["point_a"], [2, 0, 0], atol=0.05)
+        np.testing.assert_allclose(r["point_b"], [4.5, 0, 0], atol=0.05)
+
+
+class TestGJKBoxSphere(unittest.TestCase):
+    def test_separated(self):
+        box = _make_shape(SHAPE_BOX, (0, 0, 0), (1, 1, 1))
+        sphere = _make_shape(SHAPE_SPHERE, (3, 0, 0), (0.5, 0, 0))
+        r = _run_gjk(box, sphere)
+        self.assertAlmostEqual(r["distance"], 1.5, places=2)
+        self.assertEqual(r["overlap"], 0)
+
+    def test_overlapping(self):
+        box = _make_shape(SHAPE_BOX, (0, 0, 0), (1, 1, 1))
+        sphere = _make_shape(SHAPE_SPHERE, (1, 0, 0), (0.5, 0, 0))
+        r = _run_gjk(box, sphere)
+        self.assertEqual(r["overlap"], 1)
+
+
+class TestGJKBoxBox(unittest.TestCase):
+    def test_separated_along_x(self):
+        a = _make_shape(SHAPE_BOX, (0, 0, 0), (1, 1, 1))
+        b = _make_shape(SHAPE_BOX, (4, 0, 0), (1, 1, 1))
+        r = _run_gjk(a, b)
+        self.assertAlmostEqual(r["distance"], 2.0, places=2)
+        self.assertEqual(r["overlap"], 0)
+
+    def test_overlapping(self):
+        a = _make_shape(SHAPE_BOX, (0, 0, 0), (1, 1, 1))
+        b = _make_shape(SHAPE_BOX, (1.5, 0, 0), (1, 1, 1))
+        r = _run_gjk(a, b)
+        self.assertEqual(r["overlap"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
