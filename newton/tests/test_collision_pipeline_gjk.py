@@ -22,7 +22,7 @@ import warp as wp
 
 import newton._src.xcol as xc
 
-_pipeline = xc.create_pipeline()
+_collider = xc.create_collider()
 
 
 def _make_shape(shape_type, pos, params, margin=0.0, rot=None):
@@ -43,7 +43,7 @@ def _run_gjk(shape_a, shape_b):
     pb = wp.zeros(1, dtype=wp.vec3)
     normal = wp.zeros(1, dtype=wp.vec3)
     overlap = wp.zeros(1, dtype=int)
-    wp.launch(_pipeline.gjk_kernel, dim=1, inputs=[sa, sb], outputs=[dist, pa, pb, normal, overlap])
+    wp.launch(_collider.gjk_kernel, dim=1, inputs=[sa, sb], outputs=[dist, pa, pb, normal, overlap])
     return {
         "distance": dist.numpy()[0],
         "point_a": pa.numpy()[0],

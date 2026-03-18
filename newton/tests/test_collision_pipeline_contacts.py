@@ -26,7 +26,7 @@ import warp as wp
 
 import newton._src.xcol as xc
 
-_pipeline = xc.create_pipeline()
+_collider = xc.create_collider()
 
 
 def _make_shape(shape_type, pos, params, margin=0.0, rot=None):
@@ -43,7 +43,7 @@ def _run_generate_contacts(shape_a, shape_b):
     sa = wp.array([shape_a], dtype=xc.ShapeData)
     sb = wp.array([shape_b], dtype=xc.ShapeData)
     out = wp.zeros(1, dtype=xc.ContactResult)
-    wp.launch(_pipeline.generate_contacts_kernel, dim=1, inputs=[sa, sb], outputs=[out])
+    wp.launch(_collider.generate_contacts_kernel, dim=1, inputs=[sa, sb], outputs=[out])
     r = out.numpy()[0]
     # Warp struct numpy returns named fields
     return {

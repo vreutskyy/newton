@@ -13,16 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pipeline factory and compiled pipeline object for xcol.
+"""Collider factory and compiled Warp kernels for xcol.
 
-:func:`create_pipeline` generates all Warp dispatch functions and kernels
+:func:`create_collider` generates all Warp dispatch functions and kernels
 from the shape registry.  All ``@wp.func`` and ``@wp.kernel`` definitions
 live inside the factory closure so they compile into a single Warp module.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 import warp as wp
@@ -49,16 +48,15 @@ from .types import (
 )
 
 
-def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
-    """Create dispatch functions and kernels from registered shape types.
+def create_collider(shape_entries: list[ShapeEntry] | None = None):
+    """Create a :class:`Collider` with dispatch for all registered shape types.
 
     Call this after all :func:`~xcol.shapes.register_shape` calls are done
     (including custom shapes).  If *shape_entries* is ``None``, uses the
     global registry.
 
     Returns:
-        A :class:`Pipeline` object with the generated dispatch functions
-        and kernels.
+        A stateless :class:`Collider` with compiled kernels.
     """
     if shape_entries is None:
         shape_entries = get_registered_shapes()
@@ -1034,7 +1032,7 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
         out_normal: wp.array(dtype=wp.vec3),
         out_depth: wp.array(dtype=float),
     ):
-        """N×N broadphase + narrowphase + flatten in one kernel.
+        """NxN broadphase + narrowphase + flatten in one kernel.
 
         Thread tid maps to pair (i, j) where i < j, using triangular indexing.
         """
@@ -1095,7 +1093,7 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
                     out_point[idx] = r.p3
                     out_depth[idx] = r.d3
 
-    return Pipeline(
+    return Collider(
         support_local=support_local,
         support_world=support_world,
         contact_face_local=contact_face_local,
@@ -1115,194 +1113,53 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
     )
 
 
-@dataclass
-class Contacts:
-    """Flat SoA contact buffer from :meth:`Pipeline.collide`.
+class Collider:
+    """Compiled collision kernels for all registered shape types.
 
-    One entry per contact point.  All arrays are Warp arrays with
-    length up to *max_contacts*.  The actual number of valid entries
-    is stored in *count* (a single-element Warp int array).
-
-    Attributes:
-        count: ``wp.array(dtype=int, shape=(1,))`` — number of valid contact points.
-        shape_a: Shape index of first shape per contact, ``wp.array(dtype=int)``.
-        shape_b: Shape index of second shape per contact, ``wp.array(dtype=int)``.
-        point: Contact position (world space), ``wp.array(dtype=wp.vec3)``.
-        normal: Contact normal (A->B, unit), ``wp.array(dtype=wp.vec3)``.
-        depth: Penetration depth [m], ``wp.array(dtype=float)``.
-    """
-
-    count: wp.array  # shape (1,), dtype int
-    shape_a: wp.array
-    shape_b: wp.array
-    point: wp.array
-    normal: wp.array
-    depth: wp.array
-
-
-class Pipeline:
-    """Compiled collision pipeline with dispatch for all registered shapes.
-
-    Created by :func:`create_pipeline`.  Use :meth:`add_shape` to populate,
-    then :meth:`collide` to run broadphase + narrowphase.
+    Created by :func:`create_collider`.  Stateless — call
+    :meth:`collide` with a :class:`~xcol.model.Model` to run
+    broadphase + narrowphase.  Reusable across multiple models.
     """
 
     def __init__(self, **funcs: Any) -> None:
-        # Store compiled Warp functions/kernels
         for k, v in funcs.items():
             setattr(self, k, v)
 
-        # SoA shape storage (Python lists, flushed to Warp arrays on collide)
-        self._types_list: list[int] = []
-        self._params_list: list[tuple[float, float, float]] = []
-        self._margins_list: list[float] = []
-        self._worlds_list: list[int] = []
-        self._transforms_list: list[tuple[float, ...]] = []
+    def collide(self, model: Any) -> None:
+        """Run N*N broadphase + narrowphase and write contacts into *model*.
 
-        # Warp arrays (lazily built)
-        self._shape_types: wp.array | None = None
-        self._shape_params: wp.array | None = None
-        self._shape_margins: wp.array | None = None
-        self._shape_worlds: wp.array | None = None
-        self._shape_transforms: wp.array | None = None
-        self._dirty = True
-
-    @property
-    def shape_count(self) -> int:
-        return len(self._types_list)
-
-    def add_shape(
-        self,
-        shape_type: int,
-        params: tuple[float, float, float] = (0.0, 0.0, 0.0),
-        margin: float = 0.0,
-        world: int = 0,
-        transform: tuple[float, ...] | None = None,
-    ) -> int:
-        """Add a shape to the pipeline.
+        The user should update ``model.shape_transforms`` before calling this.
+        Results are written to ``model.contact_*`` arrays.  The contact count
+        is reset to 0 at the start of each call.
 
         Args:
-            shape_type: Shape type id (e.g. ``SHAPE_POINT``, ``SHAPE_BOX``).
-            params: Core shape parameters.
-            margin: Uniform inflation distance [m].
-            world: World index. Shapes in the same world collide.
-                ``-1`` = global (collides with all worlds).
-            transform: Initial transform as ``(px, py, pz, qx, qy, qz, qw)``.
-                Defaults to identity.
-
-        Returns:
-            Integer shape handle (index into SoA arrays).
+            model: A :class:`~xcol.model.Model` instance.
         """
-        idx = len(self._types_list)
-        self._types_list.append(int(shape_type))
-        self._params_list.append((float(params[0]), float(params[1]), float(params[2])))
-        self._margins_list.append(float(margin))
-        self._worlds_list.append(int(world))
-        if transform is None:
-            transform = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
-        self._transforms_list.append(transform)
-        self._dirty = True
-        return idx
-
-    def _flush(self) -> None:
-        """Rebuild Warp arrays from Python lists."""
-        if not self._dirty:
-            return
-        n = len(self._types_list)
-        if n == 0:
-            self._dirty = False
-            return
-
-        self._shape_types = wp.array(self._types_list, dtype=int)
-        self._shape_params = wp.array([wp.vec3(*p) for p in self._params_list], dtype=wp.vec3)
-        self._shape_margins = wp.array(self._margins_list, dtype=float)
-        self._shape_worlds = wp.array(self._worlds_list, dtype=int)
-        self._shape_transforms = wp.array([wp.transform(*t) for t in self._transforms_list], dtype=wp.transform)
-        self._dirty = False
-
-    # -- SoA array properties (user can read/write transforms) -----------
-
-    @property
-    def shape_types(self) -> wp.array:
-        self._flush()
-        return self._shape_types
-
-    @property
-    def shape_params(self) -> wp.array:
-        self._flush()
-        return self._shape_params
-
-    @property
-    def shape_margins(self) -> wp.array:
-        self._flush()
-        return self._shape_margins
-
-    @property
-    def shape_worlds(self) -> wp.array:
-        self._flush()
-        return self._shape_worlds
-
-    @property
-    def shape_transforms(self) -> wp.array:
-        self._flush()
-        return self._shape_transforms
-
-    def set_transforms(self, transforms: Any) -> None:
-        """Upload transforms to GPU.
-
-        Args:
-            transforms: ``(n, 7)`` numpy array or list of
-                ``(px, py, pz, qx, qy, qz, qw)`` tuples.
-        """
-        self._flush()
-        self._shape_transforms.assign(transforms)
-
-    # -- Collide ---------------------------------------------------------
-
-    def collide(self) -> Contacts:
-        """Run N*N broadphase + narrowphase on GPU and return contacts.
-
-        The user should update transforms via :meth:`set_transforms`
-        before calling this.  Everything runs in a single GPU kernel.
-
-        Returns:
-            :class:`Contacts` with flat SoA arrays — one entry per contact point.
-        """
-        self._flush()
-        n = self.shape_count
-
-        # Number of unique pairs = n*(n-1)/2
+        n = model.shape_count
         num_pairs = n * (n - 1) // 2
-        # Max contacts = num_pairs * 4
-        max_contacts = max(num_pairs * 4, 1)
+        if num_pairs == 0:
+            model.contact_count.zero_()
+            return
 
-        out_count = wp.zeros(1, dtype=int)
-        out_shape_a = wp.zeros(max_contacts, dtype=int)
-        out_shape_b = wp.zeros(max_contacts, dtype=int)
-        out_point = wp.zeros(max_contacts, dtype=wp.vec3)
-        out_normal = wp.zeros(max_contacts, dtype=wp.vec3)
-        out_depth = wp.zeros(max_contacts, dtype=float)
+        model.contact_count.zero_()
 
-        if num_pairs > 0:
-            wp.launch(
-                self.collide_nxn_kernel,
-                dim=num_pairs,
-                inputs=[
-                    n,
-                    self._shape_types,
-                    self._shape_params,
-                    self._shape_margins,
-                    self._shape_transforms,
-                    self._shape_worlds,
-                ],
-                outputs=[out_count, out_shape_a, out_shape_b, out_point, out_normal, out_depth],
-            )
-
-        return Contacts(
-            count=out_count,
-            shape_a=out_shape_a,
-            shape_b=out_shape_b,
-            point=out_point,
-            normal=out_normal,
-            depth=out_depth,
+        wp.launch(
+            self.collide_nxn_kernel,
+            dim=num_pairs,
+            inputs=[
+                n,
+                model.shape_types,
+                model.shape_params,
+                model.shape_margins,
+                model.shape_transforms,
+                model.shape_worlds,
+            ],
+            outputs=[
+                model.contact_count,
+                model.contact_shape_a,
+                model.contact_shape_b,
+                model.contact_point,
+                model.contact_normal,
+                model.contact_depth,
+            ],
         )

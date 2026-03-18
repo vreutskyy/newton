@@ -15,27 +15,30 @@
 
 """xcol — experimental extensible collision library.
 
-Public API:
+Example::
 
-.. code-block:: python
+    import newton._src.xcol as xc
 
-    from newton._src.xcol import (
-        # Pipeline
-        create_pipeline,
-        # Shape registration
-        register_shape,
-        SHAPE_POINT,
-        SHAPE_SEGMENT,
-        SHAPE_BOX,
-        # Types
-        ShapeData,
-        ContactResult,
-        ContactFaceResult,
-        GJKResult,
-    )
+    # Register custom shapes (optional — built-ins auto-registered)
+    # xc.register_shape("cone", support_fn=..., contact_face_fn=..., aabb_fn=...)
+
+    # Compile kernels
+    collider = xc.create_collider()
+
+    # Build scene
+    builder = xc.Builder()
+    builder.add_shape(xc.SHAPE_BOX, params=(10, 1, 10))
+    builder.add_shape(xc.SHAPE_POINT, margin=1.0, world=-1)
+    model = builder.finalize()
+
+    # Simulation loop
+    model.shape_transforms.assign(my_transforms)
+    collider.collide(model)
+    # model.contact_count, model.contact_point, etc. are now filled
 """
 
-from .pipeline import Contacts, Pipeline, create_pipeline
+from .model import Builder, Model
+from .pipeline import Collider, create_collider
 from .shapes import SHAPE_BOX, SHAPE_POINT, SHAPE_SEGMENT, ShapeEntry, register_shape
 from .types import ContactFaceResult, ContactResult, GJKResult, ShapeData
 
@@ -43,13 +46,14 @@ __all__ = [
     "SHAPE_BOX",
     "SHAPE_POINT",
     "SHAPE_SEGMENT",
+    "Builder",
+    "Collider",
     "ContactFaceResult",
     "ContactResult",
-    "Contacts",
     "GJKResult",
-    "Pipeline",
+    "Model",
     "ShapeData",
     "ShapeEntry",
-    "create_pipeline",
+    "create_collider",
     "register_shape",
 ]

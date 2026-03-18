@@ -26,7 +26,7 @@ import warp as wp
 
 import newton._src.xcol as xc
 
-_pipeline = xc.create_pipeline()
+_collider = xc.create_collider()
 
 
 def _make_shape(shape_type, pos, params, margin=0.0, rot=None):
@@ -43,7 +43,7 @@ def _run_support(shape, direction):
     shapes = wp.array([shape], dtype=xc.ShapeData)
     dirs = wp.array([wp.vec3(*direction)], dtype=wp.vec3)
     out = wp.zeros(1, dtype=wp.vec3)
-    wp.launch(_pipeline.support_kernel, dim=1, inputs=[shapes, dirs], outputs=[out])
+    wp.launch(_collider.support_kernel, dim=1, inputs=[shapes, dirs], outputs=[out])
     return out.numpy()[0]
 
 
@@ -53,7 +53,7 @@ def _run_contact_face(shape, direction):
     out_p0 = wp.zeros(1, dtype=wp.vec3)
     out_normal = wp.zeros(1, dtype=wp.vec3)
     out_count = wp.zeros(1, dtype=int)
-    wp.launch(_pipeline.contact_face_kernel, dim=1, inputs=[shapes, dirs], outputs=[out_p0, out_normal, out_count])
+    wp.launch(_collider.contact_face_kernel, dim=1, inputs=[shapes, dirs], outputs=[out_p0, out_normal, out_count])
     return out_p0.numpy()[0], out_normal.numpy()[0], out_count.numpy()[0]
 
 
@@ -61,7 +61,7 @@ def _run_aabb(shape):
     shapes = wp.array([shape], dtype=xc.ShapeData)
     out_min = wp.zeros(1, dtype=wp.vec3)
     out_max = wp.zeros(1, dtype=wp.vec3)
-    wp.launch(_pipeline.aabb_kernel, dim=1, inputs=[shapes], outputs=[out_min, out_max])
+    wp.launch(_collider.aabb_kernel, dim=1, inputs=[shapes], outputs=[out_min, out_max])
     return out_min.numpy()[0], out_max.numpy()[0]
 
 
