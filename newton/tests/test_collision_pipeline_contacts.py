@@ -24,20 +24,13 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.xcol import (
-    SHAPE_BOX,
-    SHAPE_POINT,
-    SHAPE_SEGMENT,
-    ContactResult,
-    ShapeData,
-    create_pipeline,
-)
+import newton._src.xcol as xc
 
-_pipeline = create_pipeline()
+_pipeline = xc.create_pipeline()
 
 
 def _make_shape(shape_type, pos, params, margin=0.0, rot=None):
-    s = ShapeData()
+    s = xc.ShapeData()
     s.shape_type = int(shape_type)
     s.pos = wp.vec3(*pos)
     s.params = wp.vec3(*params)
@@ -47,9 +40,9 @@ def _make_shape(shape_type, pos, params, margin=0.0, rot=None):
 
 
 def _run_generate_contacts(shape_a, shape_b):
-    sa = wp.array([shape_a], dtype=ShapeData)
-    sb = wp.array([shape_b], dtype=ShapeData)
-    out = wp.zeros(1, dtype=ContactResult)
+    sa = wp.array([shape_a], dtype=xc.ShapeData)
+    sb = wp.array([shape_b], dtype=xc.ShapeData)
+    out = wp.zeros(1, dtype=xc.ContactResult)
     wp.launch(_pipeline.generate_contacts_kernel, dim=1, inputs=[sa, sb], outputs=[out])
     r = out.numpy()[0]
     # Warp struct numpy returns named fields
@@ -75,22 +68,22 @@ def _run_generate_contacts(shape_a, shape_b):
 class TestContactSphereSphere(unittest.TestCase):
     def test_single_contact_point(self):
         """Overlapping spheres produce exactly 1 contact point."""
-        a = _make_shape(SHAPE_POINT, (-0.5, 0, 0), (0, 0, 0), margin=1.0)
-        b = _make_shape(SHAPE_POINT, (0.5, 0, 0), (0, 0, 0), margin=1.0)
+        a = _make_shape(xc.SHAPE_POINT, (-0.5, 0, 0), (0, 0, 0), margin=1.0)
+        b = _make_shape(xc.SHAPE_POINT, (0.5, 0, 0), (0, 0, 0), margin=1.0)
         r = _run_generate_contacts(a, b)
         self.assertEqual(r["count"], 1)
 
     def test_contact_depth(self):
         """Contact depth matches penetration."""
-        a = _make_shape(SHAPE_POINT, (-0.5, 0, 0), (0, 0, 0), margin=1.0)
-        b = _make_shape(SHAPE_POINT, (0.5, 0, 0), (0, 0, 0), margin=1.0)
+        a = _make_shape(xc.SHAPE_POINT, (-0.5, 0, 0), (0, 0, 0), margin=1.0)
+        b = _make_shape(xc.SHAPE_POINT, (0.5, 0, 0), (0, 0, 0), margin=1.0)
         r = _run_generate_contacts(a, b)
         self.assertAlmostEqual(r["d0"], 1.0, places=2)
 
     def test_separated_no_contacts(self):
         """Separated shapes produce 0 contacts."""
-        a = _make_shape(SHAPE_POINT, (-5, 0, 0), (0, 0, 0), margin=1.0)
-        b = _make_shape(SHAPE_POINT, (5, 0, 0), (0, 0, 0), margin=1.0)
+        a = _make_shape(xc.SHAPE_POINT, (-5, 0, 0), (0, 0, 0), margin=1.0)
+        b = _make_shape(xc.SHAPE_POINT, (5, 0, 0), (0, 0, 0), margin=1.0)
         r = _run_generate_contacts(a, b)
         self.assertEqual(r["count"], 0)
 
@@ -103,15 +96,15 @@ class TestContactSphereSphere(unittest.TestCase):
 class TestContactBoxBox(unittest.TestCase):
     def test_face_face_4_contacts(self):
         """Two boxes overlapping face-on produce 4 contact points."""
-        a = _make_shape(SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.0)
-        b = _make_shape(SHAPE_BOX, (1.5, 0, 0), (1, 1, 1), margin=0.0)
+        a = _make_shape(xc.SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.0)
+        b = _make_shape(xc.SHAPE_BOX, (1.5, 0, 0), (1, 1, 1), margin=0.0)
         r = _run_generate_contacts(a, b)
         self.assertEqual(r["count"], 4)
 
     def test_face_face_depth(self):
         """Face-face contacts have correct depth."""
-        a = _make_shape(SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.0)
-        b = _make_shape(SHAPE_BOX, (1.5, 0, 0), (1, 1, 1), margin=0.0)
+        a = _make_shape(xc.SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.0)
+        b = _make_shape(xc.SHAPE_BOX, (1.5, 0, 0), (1, 1, 1), margin=0.0)
         r = _run_generate_contacts(a, b)
         # Penetration = 0.5
         for i in range(r["count"]):
@@ -119,8 +112,8 @@ class TestContactBoxBox(unittest.TestCase):
 
     def test_face_face_contacts_on_surface(self):
         """Contact points lie on the penetrating face."""
-        a = _make_shape(SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.0)
-        b = _make_shape(SHAPE_BOX, (1.5, 0, 0), (1, 1, 1), margin=0.0)
+        a = _make_shape(xc.SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.0)
+        b = _make_shape(xc.SHAPE_BOX, (1.5, 0, 0), (1, 1, 1), margin=0.0)
         r = _run_generate_contacts(a, b)
         for i in range(r["count"]):
             pt = r[f"p{i}"]
@@ -136,8 +129,8 @@ class TestContactBoxBox(unittest.TestCase):
 
 class TestContactBoxSphere(unittest.TestCase):
     def test_single_contact(self):
-        box = _make_shape(SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.0)
-        sphere = _make_shape(SHAPE_POINT, (1.5, 0, 0), (0, 0, 0), margin=1.0)
+        box = _make_shape(xc.SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.0)
+        sphere = _make_shape(xc.SHAPE_POINT, (1.5, 0, 0), (0, 0, 0), margin=1.0)
         r = _run_generate_contacts(box, sphere)
         self.assertEqual(r["count"], 1)
 
@@ -150,8 +143,8 @@ class TestContactBoxSphere(unittest.TestCase):
 class TestContactCapsuleCapsule(unittest.TestCase):
     def test_parallel_2_contacts(self):
         """Two parallel capsules produce 2 contact points (line contact)."""
-        a = _make_shape(SHAPE_SEGMENT, (0, -0.5, 0), (1, 0, 0), margin=0.5)
-        b = _make_shape(SHAPE_SEGMENT, (0, 0.5, 0), (1, 0, 0), margin=0.5)
+        a = _make_shape(xc.SHAPE_SEGMENT, (0, -0.5, 0), (1, 0, 0), margin=0.5)
+        b = _make_shape(xc.SHAPE_SEGMENT, (0, 0.5, 0), (1, 0, 0), margin=0.5)
         r = _run_generate_contacts(a, b)
         self.assertEqual(r["count"], 2)
 

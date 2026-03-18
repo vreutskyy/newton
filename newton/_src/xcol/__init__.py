@@ -40,15 +40,15 @@ from .shapes import SHAPE_BOX, SHAPE_POINT, SHAPE_SEGMENT, ShapeEntry, register_
 from .types import ContactFaceResult, ContactResult, GJKResult, ShapeData
 
 __all__ = [
-    "Pipeline",
-    "create_pipeline",
-    "register_shape",
-    "ShapeEntry",
+    "SHAPE_BOX",
     "SHAPE_POINT",
     "SHAPE_SEGMENT",
-    "SHAPE_BOX",
-    "ShapeData",
-    "ContactResult",
     "ContactFaceResult",
+    "ContactResult",
     "GJKResult",
+    "Pipeline",
+    "ShapeData",
+    "ShapeEntry",
+    "create_pipeline",
+    "register_shape",
 ]

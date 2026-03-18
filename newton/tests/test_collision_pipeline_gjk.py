@@ -20,18 +20,13 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.xcol import (
-    SHAPE_BOX,
-    SHAPE_POINT,
-    ShapeData,
-    create_pipeline,
-)
+import newton._src.xcol as xc
 
-_pipeline = create_pipeline()
+_pipeline = xc.create_pipeline()
 
 
 def _make_shape(shape_type, pos, params, margin=0.0, rot=None):
-    s = ShapeData()
+    s = xc.ShapeData()
     s.shape_type = int(shape_type)
     s.pos = wp.vec3(*pos)
     s.params = wp.vec3(*params)
@@ -41,8 +36,8 @@ def _make_shape(shape_type, pos, params, margin=0.0, rot=None):
 
 
 def _run_gjk(shape_a, shape_b):
-    sa = wp.array([shape_a], dtype=ShapeData)
-    sb = wp.array([shape_b], dtype=ShapeData)
+    sa = wp.array([shape_a], dtype=xc.ShapeData)
+    sb = wp.array([shape_b], dtype=xc.ShapeData)
     dist = wp.zeros(1, dtype=float)
     pa = wp.zeros(1, dtype=wp.vec3)
     pb = wp.zeros(1, dtype=wp.vec3)
@@ -63,42 +58,42 @@ class TestGJKSphereSphere(unittest.TestCase):
 
     def test_separated(self):
         # Two spheres r=1 centered at ±2 → distance = 2
-        a = _make_shape(SHAPE_POINT, (-2, 0, 0), (0, 0, 0), margin=1.0)
-        b = _make_shape(SHAPE_POINT, (2, 0, 0), (0, 0, 0), margin=1.0)
+        a = _make_shape(xc.SHAPE_POINT, (-2, 0, 0), (0, 0, 0), margin=1.0)
+        b = _make_shape(xc.SHAPE_POINT, (2, 0, 0), (0, 0, 0), margin=1.0)
         r = _run_gjk(a, b)
         self.assertAlmostEqual(r["distance"], 2.0, places=3)
         self.assertEqual(r["overlap"], 0)
 
     def test_touching(self):
-        a = _make_shape(SHAPE_POINT, (-1, 0, 0), (0, 0, 0), margin=1.0)
-        b = _make_shape(SHAPE_POINT, (1, 0, 0), (0, 0, 0), margin=1.0)
+        a = _make_shape(xc.SHAPE_POINT, (-1, 0, 0), (0, 0, 0), margin=1.0)
+        b = _make_shape(xc.SHAPE_POINT, (1, 0, 0), (0, 0, 0), margin=1.0)
         r = _run_gjk(a, b)
         self.assertAlmostEqual(r["distance"], 0.0, places=2)
 
     def test_overlapping(self):
         # margin-only overlap: cores (points) separated but margins overlap
-        a = _make_shape(SHAPE_POINT, (-0.5, 0, 0), (0, 0, 0), margin=1.0)
-        b = _make_shape(SHAPE_POINT, (0.5, 0, 0), (0, 0, 0), margin=1.0)
+        a = _make_shape(xc.SHAPE_POINT, (-0.5, 0, 0), (0, 0, 0), margin=1.0)
+        b = _make_shape(xc.SHAPE_POINT, (0.5, 0, 0), (0, 0, 0), margin=1.0)
         r = _run_gjk(a, b)
         self.assertGreater(r["overlap"], 0)
         # Penetration = 2*margin - distance_between_cores = 2 - 1 = 1
         self.assertAlmostEqual(r["distance"], 1.0, places=2)
 
     def test_normal_direction(self):
-        a = _make_shape(SHAPE_POINT, (0, 0, 0), (0, 0, 0), margin=1.0)
-        b = _make_shape(SHAPE_POINT, (5, 0, 0), (0, 0, 0), margin=1.0)
+        a = _make_shape(xc.SHAPE_POINT, (0, 0, 0), (0, 0, 0), margin=1.0)
+        b = _make_shape(xc.SHAPE_POINT, (5, 0, 0), (0, 0, 0), margin=1.0)
         r = _run_gjk(a, b)
         np.testing.assert_allclose(r["normal"], [1, 0, 0], atol=0.05)
 
     def test_different_radii(self):
-        a = _make_shape(SHAPE_POINT, (0, 0, 0), (0, 0, 0), margin=2.0)
-        b = _make_shape(SHAPE_POINT, (5, 0, 0), (0, 0, 0), margin=0.5)
+        a = _make_shape(xc.SHAPE_POINT, (0, 0, 0), (0, 0, 0), margin=2.0)
+        b = _make_shape(xc.SHAPE_POINT, (5, 0, 0), (0, 0, 0), margin=0.5)
         r = _run_gjk(a, b)
         self.assertAlmostEqual(r["distance"], 2.5, places=3)
 
     def test_witness_points(self):
-        a = _make_shape(SHAPE_POINT, (-2, 0, 0), (0, 0, 0), margin=1.0)
-        b = _make_shape(SHAPE_POINT, (2, 0, 0), (0, 0, 0), margin=1.0)
+        a = _make_shape(xc.SHAPE_POINT, (-2, 0, 0), (0, 0, 0), margin=1.0)
+        b = _make_shape(xc.SHAPE_POINT, (2, 0, 0), (0, 0, 0), margin=1.0)
         r = _run_gjk(a, b)
         # Witness on A: center + margin along normal = (-2,0,0) + 1*(1,0,0) = (-1,0,0)
         np.testing.assert_allclose(r["point_a"], [-1, 0, 0], atol=0.05)
@@ -109,32 +104,32 @@ class TestGJKBoxSphere(unittest.TestCase):
     """Box core (no margin) vs point core (with margin = sphere)."""
 
     def test_separated(self):
-        box = _make_shape(SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.0)
-        sphere = _make_shape(SHAPE_POINT, (3, 0, 0), (0, 0, 0), margin=0.5)
+        box = _make_shape(xc.SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.0)
+        sphere = _make_shape(xc.SHAPE_POINT, (3, 0, 0), (0, 0, 0), margin=0.5)
         r = _run_gjk(box, sphere)
         # Box face at x=1, sphere at x=2.5 → distance = 1.5
         self.assertAlmostEqual(r["distance"], 1.5, places=2)
         self.assertEqual(r["overlap"], 0)
 
     def test_overlapping(self):
-        box = _make_shape(SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.0)
-        sphere = _make_shape(SHAPE_POINT, (1, 0, 0), (0, 0, 0), margin=0.5)
+        box = _make_shape(xc.SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.0)
+        sphere = _make_shape(xc.SHAPE_POINT, (1, 0, 0), (0, 0, 0), margin=0.5)
         r = _run_gjk(box, sphere)
         self.assertGreater(r["overlap"], 0)
 
 
 class TestGJKBoxBox(unittest.TestCase):
     def test_separated(self):
-        a = _make_shape(SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.0)
-        b = _make_shape(SHAPE_BOX, (4, 0, 0), (1, 1, 1), margin=0.0)
+        a = _make_shape(xc.SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.0)
+        b = _make_shape(xc.SHAPE_BOX, (4, 0, 0), (1, 1, 1), margin=0.0)
         r = _run_gjk(a, b)
         self.assertAlmostEqual(r["distance"], 2.0, places=2)
         self.assertEqual(r["overlap"], 0)
 
     def test_margin_overlap(self):
         """Boxes with margin: cores separated but margins overlap."""
-        a = _make_shape(SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.3)
-        b = _make_shape(SHAPE_BOX, (2.4, 0, 0), (1, 1, 1), margin=0.3)
+        a = _make_shape(xc.SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.3)
+        b = _make_shape(xc.SHAPE_BOX, (2.4, 0, 0), (1, 1, 1), margin=0.3)
         r = _run_gjk(a, b)
         # Core distance = 2.4 - 2 = 0.4, total margin = 0.6 → penetration = 0.2
         self.assertGreater(r["overlap"], 0)
@@ -145,8 +140,8 @@ class TestGJKZeroMargin(unittest.TestCase):
     """Zero margin should work like the old behavior."""
 
     def test_boxes_no_margin(self):
-        a = _make_shape(SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.0)
-        b = _make_shape(SHAPE_BOX, (4, 0, 0), (1, 1, 1), margin=0.0)
+        a = _make_shape(xc.SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.0)
+        b = _make_shape(xc.SHAPE_BOX, (4, 0, 0), (1, 1, 1), margin=0.0)
         r = _run_gjk(a, b)
         self.assertAlmostEqual(r["distance"], 2.0, places=2)
         self.assertEqual(r["overlap"], 0)
