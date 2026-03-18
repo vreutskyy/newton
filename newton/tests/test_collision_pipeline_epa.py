@@ -20,7 +20,7 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.geometry.collision_pipeline.core import (
+from newton._src.xcol import (
     SHAPE_BOX,
     SHAPE_POINT,
     ShapeData,
