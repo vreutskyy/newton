@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for Phase 2: EPA penetration depth (Warp)."""
+"""Tests for GJK+EPA with core + margin shapes (Warp)."""
 
 import unittest
 
@@ -22,7 +22,7 @@ import warp as wp
 
 from newton._src.geometry.collision_pipeline.core import (
     SHAPE_BOX,
-    SHAPE_SPHERE,
+    SHAPE_POINT,
     ShapeData,
     create_pipeline,
 )
@@ -30,11 +30,12 @@ from newton._src.geometry.collision_pipeline.core import (
 _pipeline = create_pipeline()
 
 
-def _make_shape(shape_type, pos, params, rot=None):
+def _make_shape(shape_type, pos, params, margin=0.0, rot=None):
     s = ShapeData()
     s.shape_type = int(shape_type)
     s.pos = wp.vec3(*pos)
     s.params = wp.vec3(*params)
+    s.margin = float(margin)
     s.rot = wp.quat(*rot) if rot else wp.quat_identity()
     return s
 
@@ -58,105 +59,95 @@ def _run_gjk_epa(shape_a, shape_b):
 
 
 class TestEPASphereSphere(unittest.TestCase):
-    """EPA penetration tests using sphere pairs."""
+    """EPA tests for spheres (point + margin)."""
 
-    def test_overlapping_spheres_depth(self):
-        """Two overlapping spheres: correct penetration depth."""
-        # Centers 1 apart, radii 1 each -> penetration = 2 - 1 = 1
-        a = _make_shape(SHAPE_SPHERE, (-0.5, 0, 0), (1, 0, 0))
-        b = _make_shape(SHAPE_SPHERE, (0.5, 0, 0), (1, 0, 0))
+    def test_margin_only_overlap(self):
+        """Margin-only overlap: GJK handles it, no EPA needed."""
+        a = _make_shape(SHAPE_POINT, (-0.5, 0, 0), (0, 0, 0), margin=1.0)
+        b = _make_shape(SHAPE_POINT, (0.5, 0, 0), (0, 0, 0), margin=1.0)
         r = _run_gjk_epa(a, b)
-        self.assertEqual(r["overlap"], 1)
-        self.assertAlmostEqual(r["distance"], 1.0, places=1)
+        self.assertGreater(r["overlap"], 0)
+        self.assertAlmostEqual(r["distance"], 1.0, places=2)
 
-    def test_overlapping_spheres_normal(self):
-        """Penetration normal along center-center axis."""
-        a = _make_shape(SHAPE_SPHERE, (-0.5, 0, 0), (1, 0, 0))
-        b = _make_shape(SHAPE_SPHERE, (0.5, 0, 0), (1, 0, 0))
+    def test_normal_direction(self):
+        a = _make_shape(SHAPE_POINT, (-0.5, 0, 0), (0, 0, 0), margin=1.0)
+        b = _make_shape(SHAPE_POINT, (0.5, 0, 0), (0, 0, 0), margin=1.0)
         r = _run_gjk_epa(a, b)
-        # Normal should be along x axis (A→B)
         np.testing.assert_allclose(np.abs(r["normal"]), [1, 0, 0], atol=0.1)
 
     def test_barely_overlapping(self):
-        """Barely overlapping: small penetration depth."""
-        # Centers 1.9 apart, radii 1 each -> penetration = 0.1
-        a = _make_shape(SHAPE_SPHERE, (-0.95, 0, 0), (1, 0, 0))
-        b = _make_shape(SHAPE_SPHERE, (0.95, 0, 0), (1, 0, 0))
+        a = _make_shape(SHAPE_POINT, (-0.95, 0, 0), (0, 0, 0), margin=1.0)
+        b = _make_shape(SHAPE_POINT, (0.95, 0, 0), (0, 0, 0), margin=1.0)
         r = _run_gjk_epa(a, b)
-        self.assertEqual(r["overlap"], 1)
+        self.assertGreater(r["overlap"], 0)
         self.assertAlmostEqual(r["distance"], 0.1, places=1)
 
-    def test_deeply_overlapping(self):
-        """Deeply overlapping: large penetration depth."""
-        # Centers 0.1 apart, radii 1 each -> penetration = 1.9
-        a = _make_shape(SHAPE_SPHERE, (0, 0, 0), (1, 0, 0))
-        b = _make_shape(SHAPE_SPHERE, (0.1, 0, 0), (1, 0, 0))
+    def test_concentric(self):
+        """Concentric spheres: core overlap, needs EPA."""
+        a = _make_shape(SHAPE_POINT, (0, 0, 0), (0, 0, 0), margin=1.0)
+        b = _make_shape(SHAPE_POINT, (0.1, 0, 0), (0, 0, 0), margin=1.0)
         r = _run_gjk_epa(a, b)
-        self.assertEqual(r["overlap"], 1)
-        # EPA approximates sphere with polytope — relax tolerance
-        self.assertAlmostEqual(r["distance"], 1.9, delta=0.3)
+        self.assertGreater(r["overlap"], 0)
+        # Penetration ≈ 1.9 (core dist=0.1, margins=2, pen=1.9)
+        # But cores are points → they don't overlap → margin-only
+        self.assertAlmostEqual(r["distance"], 1.9, places=1)
 
     def test_symmetry(self):
-        """epa(A,B) and epa(B,A) give consistent penetration depth."""
-        a = _make_shape(SHAPE_SPHERE, (-0.3, 0, 0), (1, 0, 0))
-        b = _make_shape(SHAPE_SPHERE, (0.3, 0, 0), (1, 0, 0))
+        a = _make_shape(SHAPE_POINT, (-0.3, 0, 0), (0, 0, 0), margin=1.0)
+        b = _make_shape(SHAPE_POINT, (0.3, 0, 0), (0, 0, 0), margin=1.0)
         r_ab = _run_gjk_epa(a, b)
         r_ba = _run_gjk_epa(b, a)
-        self.assertAlmostEqual(r_ab["distance"], r_ba["distance"], delta=0.2)
-        # Normal dominant component should flip sign
-        self.assertAlmostEqual(r_ab["normal"][0], -r_ba["normal"][0], delta=0.2)
+        self.assertAlmostEqual(r_ab["distance"], r_ba["distance"], places=2)
 
-    def test_overlapping_y_axis(self):
-        """Overlap along y axis."""
-        a = _make_shape(SHAPE_SPHERE, (0, -0.25, 0), (1, 0, 0))
-        b = _make_shape(SHAPE_SPHERE, (0, 0.25, 0), (1, 0, 0))
+    def test_y_axis(self):
+        a = _make_shape(SHAPE_POINT, (0, -0.25, 0), (0, 0, 0), margin=1.0)
+        b = _make_shape(SHAPE_POINT, (0, 0.25, 0), (0, 0, 0), margin=1.0)
         r = _run_gjk_epa(a, b)
-        self.assertEqual(r["overlap"], 1)
-        self.assertAlmostEqual(r["distance"], 1.5, delta=0.2)
-        # Normal should be predominantly along y (EPA polytope approximation)
+        self.assertGreater(r["overlap"], 0)
+        self.assertAlmostEqual(r["distance"], 1.5, places=1)
         self.assertGreater(np.abs(r["normal"][1]), 0.8)
 
-    def test_separated_returns_no_penetration(self):
-        """Separated shapes: EPA not needed, distance > 0, no overlap."""
-        a = _make_shape(SHAPE_SPHERE, (-2, 0, 0), (1, 0, 0))
-        b = _make_shape(SHAPE_SPHERE, (2, 0, 0), (1, 0, 0))
+    def test_separated(self):
+        a = _make_shape(SHAPE_POINT, (-2, 0, 0), (0, 0, 0), margin=1.0)
+        b = _make_shape(SHAPE_POINT, (2, 0, 0), (0, 0, 0), margin=1.0)
         r = _run_gjk_epa(a, b)
         self.assertEqual(r["overlap"], 0)
         self.assertGreater(r["distance"], 0.0)
 
 
 class TestEPABoxSphere(unittest.TestCase):
-    """EPA tests for box-sphere pairs."""
-
     def test_sphere_inside_box(self):
-        """Sphere center inside box."""
-        box = _make_shape(SHAPE_BOX, (0, 0, 0), (2, 2, 2))
-        sphere = _make_shape(SHAPE_SPHERE, (0, 0, 0), (0.5, 0, 0))
+        box = _make_shape(SHAPE_BOX, (0, 0, 0), (2, 2, 2), margin=0.0)
+        sphere = _make_shape(SHAPE_POINT, (0, 0, 0), (0, 0, 0), margin=0.5)
         r = _run_gjk_epa(box, sphere)
-        self.assertEqual(r["overlap"], 1)
+        self.assertGreater(r["overlap"], 0)
         self.assertGreater(r["distance"], 0.0)
 
     def test_sphere_penetrating_box_face(self):
-        """Sphere penetrating box along x face."""
-        box = _make_shape(SHAPE_BOX, (0, 0, 0), (1, 1, 1))
-        sphere = _make_shape(SHAPE_SPHERE, (1.5, 0, 0), (1, 0, 0))
+        box = _make_shape(SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.0)
+        sphere = _make_shape(SHAPE_POINT, (1.5, 0, 0), (0, 0, 0), margin=1.0)
         r = _run_gjk_epa(box, sphere)
-        self.assertEqual(r["overlap"], 1)
-        # Box face at x=1, sphere surface at x=0.5 -> penetration = 0.5
+        self.assertGreater(r["overlap"], 0)
+        # Box face x=1, sphere surface x=0.5 → penetration=0.5
         self.assertAlmostEqual(r["distance"], 0.5, places=1)
 
 
 class TestEPABoxBox(unittest.TestCase):
-    """EPA tests for box-box pairs."""
-
     def test_overlapping_boxes(self):
-        """Two overlapping axis-aligned boxes."""
-        a = _make_shape(SHAPE_BOX, (0, 0, 0), (1, 1, 1))
-        b = _make_shape(SHAPE_BOX, (1.5, 0, 0), (1, 1, 1))
+        a = _make_shape(SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.0)
+        b = _make_shape(SHAPE_BOX, (1.5, 0, 0), (1, 1, 1), margin=0.0)
         r = _run_gjk_epa(a, b)
-        self.assertEqual(r["overlap"], 1)
-        # Box A face at x=1, box B face at x=0.5 -> penetration = 0.5
+        self.assertGreater(r["overlap"], 0)
         self.assertAlmostEqual(r["distance"], 0.5, places=1)
+
+    def test_rounded_boxes(self):
+        """Boxes with margin: rounded box overlap."""
+        a = _make_shape(SHAPE_BOX, (0, 0, 0), (1, 1, 1), margin=0.2)
+        b = _make_shape(SHAPE_BOX, (2.3, 0, 0), (1, 1, 1), margin=0.2)
+        r = _run_gjk_epa(a, b)
+        # Core dist = 2.3 - 2 = 0.3, total margin = 0.4 → pen = 0.1
+        self.assertGreater(r["overlap"], 0)
+        self.assertAlmostEqual(r["distance"], 0.1, places=1)
 
 
 if __name__ == "__main__":

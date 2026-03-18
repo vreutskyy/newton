@@ -63,17 +63,27 @@ EPAFaces = wp.types.matrix(shape=(EPA_MAX_FACES, 3), dtype=wp.float32)
 class ShapeData:
     """Uniform shape descriptor for all primitive types.
 
+    Each shape is a *core* geometry inflated by a uniform *margin*.
+    The actual shape is the Minkowski sum: ``core ⊕ sphere(margin)``.
+    GJK/EPA operate on the core; the margin is subtracted from the
+    computed distance afterward.
+
     Fields:
         shape_type: Integer id assigned by :func:`register_shape`.
         pos: World-space position of the shape center [m].
         rot: World-space orientation quaternion.
-        params: Shape-specific parameters (meaning depends on shape type).
+        params: Core shape parameters (meaning depends on shape type):
+            - POINT: ``(0, 0, 0)``  — degenerate core (sphere = point + margin)
+            - SEGMENT: ``(half_height, 0, 0)``  — axis along local +Z (capsule = segment + margin)
+            - BOX: ``(half_x, half_y, half_z)``  — core box (rounded box = box + margin)
+        margin: Uniform inflation distance [m].
     """
 
     shape_type: int
     pos: wp.vec3
     rot: wp.quat
     params: wp.vec3
+    margin: float
 
 
 @wp.struct
@@ -137,7 +147,7 @@ class ShapeEntry:
 
 
 _shape_registry: dict[int, ShapeEntry] = {}
-_next_type_id: int = 0
+_next_type_id: list[int] = [0]  # mutable container to avoid global statement
 
 
 def register_shape(
@@ -161,9 +171,8 @@ def register_shape(
     Returns:
         Integer type id to use in :attr:`ShapeData.shape_type`.
     """
-    global _next_type_id
-    type_id = _next_type_id
-    _next_type_id += 1
+    type_id = _next_type_id[0]
+    _next_type_id[0] += 1
     _shape_registry[type_id] = ShapeEntry(
         type_id=type_id,
         name=name,
@@ -180,16 +189,31 @@ def register_shape(
 
 
 @wp.func
-def _support_sphere(params: wp.vec3, direction: wp.vec3) -> wp.vec3:
-    radius = params[0]
-    d_len = wp.length(direction)
-    if d_len > 1.0e-12:
-        return wp.normalize(direction) * radius
-    return wp.vec3(radius, 0.0, 0.0)
+def _support_point(params: wp.vec3, direction: wp.vec3) -> wp.vec3:
+    """Core support for a point shape — always returns the origin."""
+    return wp.vec3(0.0, 0.0, 0.0)
+
+
+@wp.func
+def _support_segment(params: wp.vec3, direction: wp.vec3) -> wp.vec3:
+    """Core support for a line segment along local +Z.
+
+    Args:
+        params: ``(half_height, 0, 0)``.
+    """
+    half_height = params[0]
+    if direction[2] >= 0.0:
+        return wp.vec3(0.0, 0.0, half_height)
+    return wp.vec3(0.0, 0.0, -half_height)
 
 
 @wp.func
 def _support_box(params: wp.vec3, direction: wp.vec3) -> wp.vec3:
+    """Core support for an axis-aligned box.
+
+    Args:
+        params: Half-extents ``(hx, hy, hz)``.
+    """
     sx = 1.0
     if direction[0] < 0.0:
         sx = -1.0
@@ -203,36 +227,18 @@ def _support_box(params: wp.vec3, direction: wp.vec3) -> wp.vec3:
 
 
 @wp.func
-def _support_capsule(params: wp.vec3, direction: wp.vec3) -> wp.vec3:
-    radius = params[0]
-    half_height = params[1]
-    d_len = wp.length(direction)
-    if d_len > 1.0e-12:
-        n = wp.normalize(direction)
-    else:
-        n = wp.vec3(1.0, 0.0, 0.0)
-    result = n * radius
-    if direction[2] >= 0.0:
-        result = result + wp.vec3(0.0, 0.0, half_height)
-    else:
-        result = result - wp.vec3(0.0, 0.0, half_height)
-    return result
-
-
-@wp.func
-def _contact_face_sphere(params: wp.vec3, direction: wp.vec3) -> ContactFaceResult:
-    radius = params[0]
+def _contact_face_point(params: wp.vec3, direction: wp.vec3) -> ContactFaceResult:
+    """Contact face for a point core — always 1 point at origin."""
     d_len = wp.length(direction)
     if d_len > 1.0e-12:
         n = wp.normalize(direction)
     else:
         n = wp.vec3(0.0, 0.0, 1.0)
-    pt = n * radius
     result = ContactFaceResult()
-    result.p0 = pt
-    result.p1 = pt
-    result.p2 = pt
-    result.p3 = pt
+    result.p0 = wp.vec3(0.0, 0.0, 0.0)
+    result.p1 = wp.vec3(0.0, 0.0, 0.0)
+    result.p2 = wp.vec3(0.0, 0.0, 0.0)
+    result.p3 = wp.vec3(0.0, 0.0, 0.0)
     result.normal = n
     result.count = 1
     return result
@@ -279,9 +285,13 @@ def _contact_face_box(params: wp.vec3, direction: wp.vec3) -> ContactFaceResult:
 
 
 @wp.func
-def _contact_face_capsule(params: wp.vec3, direction: wp.vec3) -> ContactFaceResult:
-    radius = params[0]
-    half_height = params[1]
+def _contact_face_segment(params: wp.vec3, direction: wp.vec3) -> ContactFaceResult:
+    """Contact face for a segment core along +Z.
+
+    Lateral: 2 endpoints.  End-on: 1 endpoint.
+    Margin is NOT included here — it is applied later by the pipeline.
+    """
+    half_height = params[0]
     d_len = wp.length(direction)
     if d_len > 1.0e-12:
         n = wp.normalize(direction)
@@ -290,59 +300,46 @@ def _contact_face_capsule(params: wp.vec3, direction: wp.vec3) -> ContactFaceRes
     az = wp.abs(n[2])
     result = ContactFaceResult()
     if az > 0.9:
+        # End-on: single endpoint
         s = 1.0
         if n[2] < 0.0:
             s = -1.0
-        result.p0 = wp.vec3(0.0, 0.0, s * (half_height + radius))
-        result.p1 = result.p0
-        result.p2 = result.p0
-        result.p3 = result.p0
+        pt = wp.vec3(0.0, 0.0, s * half_height)
+        result.p0 = pt
+        result.p1 = pt
+        result.p2 = pt
+        result.p3 = pt
         result.normal = wp.vec3(0.0, 0.0, s)
         result.count = 1
     else:
+        # Lateral: both endpoints
+        result.p0 = wp.vec3(0.0, 0.0, half_height)
+        result.p1 = wp.vec3(0.0, 0.0, -half_height)
+        result.p2 = result.p1
+        result.p3 = result.p1
         lateral = wp.vec3(n[0], n[1], 0.0)
         lat_len = wp.length(lateral)
         if lat_len > 1.0e-12:
-            lateral = lateral / lat_len
+            result.normal = lateral / lat_len
         else:
-            lateral = wp.vec3(1.0, 0.0, 0.0)
-        offset = lateral * radius
-        result.p0 = wp.vec3(0.0, 0.0, half_height) + offset
-        result.p1 = wp.vec3(0.0, 0.0, -half_height) + offset
-        result.p2 = result.p1
-        result.p3 = result.p1
-        result.normal = lateral
+            result.normal = wp.vec3(1.0, 0.0, 0.0)
         result.count = 2
     return result
 
 
 @wp.func
-def _aabb_sphere(shape: ShapeData) -> tuple[wp.vec3, wp.vec3]:
-    r = shape.params[0]
+def _aabb_point(shape: ShapeData) -> tuple[wp.vec3, wp.vec3]:
+    """AABB for a point core + margin = sphere."""
+    r = shape.margin
     rv = wp.vec3(r, r, r)
     return shape.pos - rv, shape.pos + rv
 
 
 @wp.func
-def _aabb_box(shape: ShapeData) -> tuple[wp.vec3, wp.vec3]:
-    hx = shape.params[0]
-    hy = shape.params[1]
-    hz = shape.params[2]
-    ax = wp.quat_rotate(shape.rot, wp.vec3(hx, 0.0, 0.0))
-    ay = wp.quat_rotate(shape.rot, wp.vec3(0.0, hy, 0.0))
-    aaz = wp.quat_rotate(shape.rot, wp.vec3(0.0, 0.0, hz))
-    extent = wp.vec3(
-        wp.abs(ax[0]) + wp.abs(ay[0]) + wp.abs(aaz[0]),
-        wp.abs(ax[1]) + wp.abs(ay[1]) + wp.abs(aaz[1]),
-        wp.abs(ax[2]) + wp.abs(ay[2]) + wp.abs(aaz[2]),
-    )
-    return shape.pos - extent, shape.pos + extent
-
-
-@wp.func
-def _aabb_capsule(shape: ShapeData) -> tuple[wp.vec3, wp.vec3]:
-    r = shape.params[0]
-    hh = shape.params[1]
+def _aabb_segment(shape: ShapeData) -> tuple[wp.vec3, wp.vec3]:
+    """AABB for a segment core + margin = capsule."""
+    r = shape.margin
+    hh = shape.params[0]
     top = wp.quat_rotate(shape.rot, wp.vec3(0.0, 0.0, hh))
     bot = wp.quat_rotate(shape.rot, wp.vec3(0.0, 0.0, -hh))
     mn = wp.vec3(
@@ -358,27 +355,45 @@ def _aabb_capsule(shape: ShapeData) -> tuple[wp.vec3, wp.vec3]:
     return shape.pos + mn, shape.pos + mx
 
 
+@wp.func
+def _aabb_box(shape: ShapeData) -> tuple[wp.vec3, wp.vec3]:
+    """AABB for a box core + margin = rounded box."""
+    hx = shape.params[0]
+    hy = shape.params[1]
+    hz = shape.params[2]
+    r = shape.margin
+    ax = wp.quat_rotate(shape.rot, wp.vec3(hx, 0.0, 0.0))
+    ay = wp.quat_rotate(shape.rot, wp.vec3(0.0, hy, 0.0))
+    aaz = wp.quat_rotate(shape.rot, wp.vec3(0.0, 0.0, hz))
+    extent = wp.vec3(
+        wp.abs(ax[0]) + wp.abs(ay[0]) + wp.abs(aaz[0]) + r,
+        wp.abs(ax[1]) + wp.abs(ay[1]) + wp.abs(aaz[1]) + r,
+        wp.abs(ax[2]) + wp.abs(ay[2]) + wp.abs(aaz[2]) + r,
+    )
+    return shape.pos - extent, shape.pos + extent
+
+
 # ===================================================================
 # Register built-in shapes (same path as custom shapes)
 # ===================================================================
 
-SHAPE_SPHERE = register_shape(
-    "sphere",
-    support_fn=_support_sphere,
-    contact_face_fn=_contact_face_sphere,
-    aabb_fn=_aabb_sphere,
+SHAPE_POINT = register_shape(
+    "point",
+    support_fn=_support_point,
+    contact_face_fn=_contact_face_point,
+    aabb_fn=_aabb_point,
+)
+SHAPE_SEGMENT = register_shape(
+    "segment",
+    support_fn=_support_segment,
+    contact_face_fn=_contact_face_segment,
+    aabb_fn=_aabb_segment,
 )
 SHAPE_BOX = register_shape(
     "box",
     support_fn=_support_box,
     contact_face_fn=_contact_face_box,
     aabb_fn=_aabb_box,
-)
-SHAPE_CAPSULE = register_shape(
-    "capsule",
-    support_fn=_support_capsule,
-    contact_face_fn=_contact_face_capsule,
-    aabb_fn=_aabb_capsule,
 )
 
 
@@ -523,10 +538,12 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
     def contact_face_world(shape: ShapeData, direction: wp.vec3, point: wp.vec3) -> ContactFaceResult:
         local_dir = wp.quat_rotate_inv(shape.rot, direction)
         result = contact_face_local(shape.shape_type, shape.params, local_dir)
-        result.p0 = wp.quat_rotate(shape.rot, result.p0) + shape.pos
-        result.p1 = wp.quat_rotate(shape.rot, result.p1) + shape.pos
-        result.p2 = wp.quat_rotate(shape.rot, result.p2) + shape.pos
-        result.p3 = wp.quat_rotate(shape.rot, result.p3) + shape.pos
+        # Inflate core points by margin along the face normal
+        margin_offset = result.normal * shape.margin
+        result.p0 = wp.quat_rotate(shape.rot, result.p0 + margin_offset) + shape.pos
+        result.p1 = wp.quat_rotate(shape.rot, result.p1 + margin_offset) + shape.pos
+        result.p2 = wp.quat_rotate(shape.rot, result.p2 + margin_offset) + shape.pos
+        result.p3 = wp.quat_rotate(shape.rot, result.p3 + margin_offset) + shape.pos
         result.normal = wp.quat_rotate(shape.rot, result.normal)
         return result
 
@@ -576,7 +593,7 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
 
         for _iter in range(GJK_MAX_ITERATIONS):
             if dist_sq < GJK_EPSILON * GJK_EPSILON:
-                result.overlap = 1
+                result.overlap = 2  # core overlap — needs EPA
                 result.distance = 0.0
                 result.point_a = pa0
                 result.point_b = pb0
@@ -688,7 +705,7 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
                         inside = int(1)
 
                 if inside == 1:
-                    result.overlap = 1
+                    result.overlap = 2  # core overlap — needs EPA
                     result.distance = 0.0
                     result.point_a = lam0 * pa0 + lam1 * pa1 + lam2 * pa2 + lam3 * pa3
                     result.point_b = lam0 * pb0 + lam1 * pb1 + lam2 * pb2 + lam3 * pb3
@@ -780,11 +797,22 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
             result.point_b = u * pb0 + bv * pb1 + bw * pb2
             v = pt
 
-        dist = wp.length(v)
-        result.distance = dist
-        if dist > GJK_EPSILON:
-            result.normal = -v / dist
-        result.overlap = 0
+        core_dist = wp.length(v)
+        total_margin = shape_a.margin + shape_b.margin
+        real_dist = core_dist - total_margin
+
+        if core_dist > GJK_EPSILON:
+            result.normal = -v / core_dist
+            # Move witness points from core surfaces to inflated surfaces
+            result.point_a = result.point_a + result.normal * shape_a.margin
+            result.point_b = result.point_b - result.normal * shape_b.margin
+
+        if real_dist <= 0.0:
+            result.overlap = 1  # margin-only overlap (GJK has valid answer)
+            result.distance = -real_dist  # penetration depth (positive)
+        else:
+            result.overlap = 0
+            result.distance = real_dist
         return result
 
     # -- EPA (Expanding Polytope Algorithm) ------------------------------
@@ -1093,6 +1121,13 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
         gjk_result = gjk_distance(shape_a, shape_b)
         if gjk_result.overlap == 0:
             return gjk_result
+        if gjk_result.overlap == 1:
+            # Margin-only overlap — GJK already has correct answer
+            gjk_result.overlap = 1
+            return gjk_result
+
+        # Core overlap (overlap == 2) — need EPA
+        total_margin = shape_a.margin + shape_b.margin
 
         # Check if GJK gave us a valid tetrahedron (non-zero volume)
         d0 = gjk_result.sw1 - gjk_result.sw0
@@ -1104,7 +1139,7 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
             # GJK exited early without a full tetrahedron — build one
             gjk_result = build_initial_tetrahedron(shape_a, shape_b)
 
-        return epa(
+        epa_result = epa(
             shape_a,
             shape_b,
             gjk_result.sw0,
@@ -1120,6 +1155,13 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
             gjk_result.spb2,
             gjk_result.spb3,
         )
+
+        # EPA returns core penetration depth; add margins
+        epa_result.distance = epa_result.distance + total_margin
+        # Move witness points from core to inflated surfaces
+        epa_result.point_a = epa_result.point_a + epa_result.normal * shape_a.margin
+        epa_result.point_b = epa_result.point_b - epa_result.normal * shape_b.margin
+        return epa_result
 
     # -- Kernels --------------------------------------------------------
 
