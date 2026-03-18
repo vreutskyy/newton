@@ -1042,23 +1042,36 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
 class Contacts:
     """Contact query results from :meth:`Pipeline.collide`.
 
+    All arrays are Warp arrays.  Use ``.numpy()`` to read on CPU.
+    Each element corresponds to a candidate pair from the broadphase.
+    Pairs with ``results.numpy()[i]["count"] == 0`` had no contact.
+
     Attributes:
-        count: Number of contacting pairs.
-        pair_shape_a: Shape index of first shape in each pair, length *count*.
-        pair_shape_b: Shape index of second shape in each pair, length *count*.
-        normal: Contact normal (A->B) for each pair, length *count*.
-        point_count: Number of contact points (1-4) for each pair, length *count*.
-        points: Contact point positions, shape ``(count, 4, 3)``.
-        depths: Penetration depth per point, shape ``(count, 4)``.
+        pair_count: Number of candidate pairs tested.
+        pair_shape_a: Shape index of first shape, ``wp.array(dtype=int)``, length *pair_count*.
+        pair_shape_b: Shape index of second shape, ``wp.array(dtype=int)``, length *pair_count*.
+        results: Per-pair contact results, ``wp.array(dtype=ContactResult)``, length *pair_count*.
     """
 
-    count: int
-    pair_shape_a: np.ndarray
-    pair_shape_b: np.ndarray
-    normal: np.ndarray
-    point_count: np.ndarray
-    points: np.ndarray
-    depths: np.ndarray
+    pair_count: int
+    pair_shape_a: wp.array
+    pair_shape_b: wp.array
+    results: wp.array
+
+    @property
+    def count(self) -> int:
+        """Number of pairs with at least one contact point."""
+        if self.pair_count == 0:
+            return 0
+        r = self.results.numpy()
+        return int(np.sum(r["count"] > 0))
+
+    @property
+    def point_count(self) -> np.ndarray:
+        """Per-pair contact point count as numpy array (for test convenience)."""
+        if self.pair_count == 0:
+            return np.empty(0, dtype=np.int32)
+        return self.results.numpy()["count"]
 
 
 class Pipeline:
@@ -1178,60 +1191,50 @@ class Pipeline:
         """Run broadphase + narrowphase and return contacts.
 
         The user should update :attr:`shape_transforms` before calling this.
-        Currently uses brute-force N*N broadphase.
+        Currently uses brute-force N*N broadphase on CPU; narrowphase runs
+        on GPU via Warp kernels.  All result arrays are Warp arrays.
         """
         self._flush()
         n = self.shape_count
+        empty = Contacts(
+            pair_count=0,
+            pair_shape_a=wp.empty(0, dtype=int),
+            pair_shape_b=wp.empty(0, dtype=int),
+            results=wp.empty(0, dtype=ContactResult),
+        )
         if n < 2:
-            return Contacts(
-                count=0,
-                pair_shape_a=np.empty(0, dtype=np.int32),
-                pair_shape_b=np.empty(0, dtype=np.int32),
-                normal=np.empty((0, 3), dtype=np.float32),
-                point_count=np.empty(0, dtype=np.int32),
-                points=np.empty((0, 4, 3), dtype=np.float32),
-                depths=np.empty((0, 4), dtype=np.float32),
-            )
+            return empty
 
-        # Read arrays to numpy for broadphase (CPU for now)
-        types_np = self._shape_types_wp.numpy()
-        params_np = self._shape_params_wp.numpy()
-        margins_np = self._shape_margins_wp.numpy()
+        # Read arrays to numpy for broadphase (CPU N×N for now)
         worlds_np = self._shape_worlds_wp.numpy()
-        transforms_np = self._shape_transforms_wp.numpy()
 
-        # Brute-force N×N broadphase: collect candidate pairs
-        pairs = []
+        pairs_a = []
+        pairs_b = []
         for i in range(n):
             for j in range(i + 1, n):
                 wi = worlds_np[i]
                 wj = worlds_np[j]
-                # Same world or either is global (-1)
                 if wi == wj or wi == -1 or wj == -1:
-                    pairs.append((i, j))
+                    pairs_a.append(i)
+                    pairs_b.append(j)
 
-        if len(pairs) == 0:
-            return Contacts(
-                count=0,
-                pair_shape_a=np.empty(0, dtype=np.int32),
-                pair_shape_b=np.empty(0, dtype=np.int32),
-                normal=np.empty((0, 3), dtype=np.float32),
-                point_count=np.empty(0, dtype=np.int32),
-                points=np.empty((0, 4, 3), dtype=np.float32),
-                depths=np.empty((0, 4), dtype=np.float32),
-            )
+        num_pairs = len(pairs_a)
+        if num_pairs == 0:
+            return empty
 
-        # Build ShapeData arrays for each side of the pairs
-        num_pairs = len(pairs)
-        shapes_a = wp.zeros(num_pairs, dtype=ShapeData)
-        shapes_b = wp.zeros(num_pairs, dtype=ShapeData)
-        shapes_a_np = shapes_a.numpy()
-        shapes_b_np = shapes_b.numpy()
+        # Build ShapeData arrays for narrowphase
+        types_np = self._shape_types_wp.numpy()
+        params_np = self._shape_params_wp.numpy()
+        margins_np = self._shape_margins_wp.numpy()
+        transforms_np = self._shape_transforms_wp.numpy()
 
-        for pi, (i, j) in enumerate(pairs):
-            ti = transforms_np[i]
-            tj = transforms_np[j]
-            # ShapeData fields: shape_type, pos(3), rot(4), params(3), margin
+        shapes_a_np = np.zeros(num_pairs, dtype=wp.zeros(1, dtype=ShapeData).numpy().dtype)
+        shapes_b_np = np.zeros(num_pairs, dtype=shapes_a_np.dtype)
+
+        for pi in range(num_pairs):
+            i, j = pairs_a[pi], pairs_b[pi]
+            ti, tj = transforms_np[i], transforms_np[j]
+
             shapes_a_np[pi]["shape_type"] = types_np[i]
             shapes_a_np[pi]["pos"] = ti[:3]
             shapes_a_np[pi]["rot"] = ti[3:]
@@ -1247,60 +1250,18 @@ class Pipeline:
         shapes_a = wp.array(shapes_a_np, dtype=ShapeData)
         shapes_b = wp.array(shapes_b_np, dtype=ShapeData)
 
-        # Run narrowphase
-        out = wp.zeros(num_pairs, dtype=ContactResult)
+        # Run narrowphase on GPU
+        results = wp.zeros(num_pairs, dtype=ContactResult)
         wp.launch(
             self.generate_contacts_kernel,
             dim=num_pairs,
             inputs=[shapes_a, shapes_b],
-            outputs=[out],
+            outputs=[results],
         )
-        results_np = out.numpy()
-
-        # Collect results — filter out pairs with count == 0
-        pair_a_list = []
-        pair_b_list = []
-        normal_list = []
-        point_count_list = []
-        points_list = []
-        depths_list = []
-
-        for pi in range(num_pairs):
-            r = results_np[pi]
-            cnt = int(r["count"])
-            if cnt == 0:
-                continue
-            i, j = pairs[pi]
-            pair_a_list.append(i)
-            pair_b_list.append(j)
-            normal_list.append(r["normal"])
-            point_count_list.append(cnt)
-            pts = np.zeros((4, 3), dtype=np.float32)
-            dps = np.zeros(4, dtype=np.float32)
-            for k in range(cnt):
-                pts[k] = r[f"p{k}"]
-                dps[k] = r[f"d{k}"]
-            points_list.append(pts)
-            depths_list.append(dps)
-
-        count = len(pair_a_list)
-        if count == 0:
-            return Contacts(
-                count=0,
-                pair_shape_a=np.empty(0, dtype=np.int32),
-                pair_shape_b=np.empty(0, dtype=np.int32),
-                normal=np.empty((0, 3), dtype=np.float32),
-                point_count=np.empty(0, dtype=np.int32),
-                points=np.empty((0, 4, 3), dtype=np.float32),
-                depths=np.empty((0, 4), dtype=np.float32),
-            )
 
         return Contacts(
-            count=count,
-            pair_shape_a=np.array(pair_a_list, dtype=np.int32),
-            pair_shape_b=np.array(pair_b_list, dtype=np.int32),
-            normal=np.array(normal_list, dtype=np.float32),
-            point_count=np.array(point_count_list, dtype=np.int32),
-            points=np.array(points_list, dtype=np.float32),
-            depths=np.array(depths_list, dtype=np.float32),
+            pair_count=num_pairs,
+            pair_shape_a=wp.array(pairs_a, dtype=int),
+            pair_shape_b=wp.array(pairs_b, dtype=int),
+            results=results,
         )
