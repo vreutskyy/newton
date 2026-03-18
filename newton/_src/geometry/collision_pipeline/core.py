@@ -1319,71 +1319,86 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
         poly: ClipPoly,
         num_pts: int,
         normal: wp.vec3,
+        ref_offset: float,
     ) -> tuple[ClipPoly, int]:
-        """Reduce a polygon to at most 4 points forming the largest quad.
+        """Reduce a polygon to at most 4 points.
 
-        Strategy:
-        1. Find the two most distant points (diameter).
-        2. Find the point most distant from this line on each side.
+        Strategy (depth-first):
+        1. Pick the deepest point (maximum penetration).
+        2. Pick the point farthest from the first.
+        3-4. Pick points farthest from the plane formed by points 1-2
+             and the normal, one on each side.
+
+        Args:
+            ref_offset: Reference face plane offset along *normal*.
+                Depth of point p = ``ref_offset - dot(normal, p)``.
         """
         if num_pts <= 4:
             return poly, num_pts
 
-        # Step 1: find two most distant points
-        best_dist = float(-1.0)
-        best_i = int(0)
-        best_j = int(1)
+        # Step 1: deepest point (largest ref_offset - dot(normal, p))
+        best_depth = float(-1.0e30)
+        idx0 = int(0)
         for i in range(CLIP_MAX_POINTS):
             if i >= num_pts:
                 break
             pi = wp.vec3(poly[i][0], poly[i][1], poly[i][2])
-            for j in range(CLIP_MAX_POINTS):
-                if j >= num_pts:
-                    break
-                if j <= i:
-                    continue
-                pj = wp.vec3(poly[j][0], poly[j][1], poly[j][2])
-                d = wp.length_sq(pj - pi)
-                if d > best_dist:
-                    best_dist = d
-                    best_i = i
-                    best_j = j
+            d = ref_offset - wp.dot(normal, pi)
+            if d > best_depth:
+                best_depth = d
+                idx0 = i
 
-        p0 = wp.vec3(poly[best_i][0], poly[best_i][1], poly[best_i][2])
-        p1 = wp.vec3(poly[best_j][0], poly[best_j][1], poly[best_j][2])
+        p0 = wp.vec3(poly[idx0][0], poly[idx0][1], poly[idx0][2])
 
-        # Step 2: find point most distant from line p0-p1 on each side
+        # Step 2: farthest from p0
+        best_dist = float(-1.0)
+        idx1 = int(0)
+        for i in range(CLIP_MAX_POINTS):
+            if i >= num_pts:
+                break
+            if i == idx0:
+                continue
+            pi = wp.vec3(poly[i][0], poly[i][1], poly[i][2])
+            d = wp.length_sq(pi - p0)
+            if d > best_dist:
+                best_dist = d
+                idx1 = i
+
+        p1 = wp.vec3(poly[idx1][0], poly[idx1][1], poly[idx1][2])
+
+        # Step 3-4: farthest from the plane (p0, p1, normal)
+        # Plane perpendicular = cross(normal, p1 - p0)
         line = p1 - p0
         perp = wp.cross(normal, line)
 
         best_pos = float(-1.0e30)
         best_neg = float(1.0e30)
-        idx_pos = int(-1)
-        idx_neg = int(-1)
+        idx2 = int(-1)
+        idx3 = int(-1)
 
         for k in range(CLIP_MAX_POINTS):
             if k >= num_pts:
                 break
-            if k == best_i or k == best_j:
+            if k == idx0 or k == idx1:
                 continue
             pk = wp.vec3(poly[k][0], poly[k][1], poly[k][2])
             d = wp.dot(pk - p0, perp)
             if d > best_pos:
                 best_pos = d
-                idx_pos = k
+                idx2 = k
             if d < best_neg:
                 best_neg = d
-                idx_neg = k
+                idx3 = k
 
         out = ClipPoly()
         out_count = int(2)
         out[0] = p0
         out[1] = p1
-        if idx_pos >= 0:
-            out[out_count] = wp.vec3(poly[idx_pos][0], poly[idx_pos][1], poly[idx_pos][2])
+        if idx2 >= 0:
+            out[out_count] = wp.vec3(poly[idx2][0], poly[idx2][1], poly[idx2][2])
             out_count = out_count + 1
-        if idx_neg >= 0 and idx_neg != idx_pos:
-            out[out_count] = wp.vec3(poly[idx_neg][0], poly[idx_neg][1], poly[idx_neg][2])
+        if idx3 >= 0 and idx3 != idx2:
+            out[out_count] = wp.vec3(poly[idx3][0], poly[idx3][1], poly[idx3][2])
             out_count = out_count + 1
 
         return out, out_count
@@ -1419,12 +1434,15 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
         # The contact normal n points A→B. For the reference face on A,
         # clip planes use n directly. For reference face on B, we negate
         # because the face normal of B points toward A (opposite to n).
+        # ref_offset = signed distance of reference face along n.
         if face_b.count > face_a.count:
             # Reference = B, incident = A
             clipped, num_clipped = clip_face_against_face(face_a, face_b, -n)
+            ref_offset = wp.dot(face_a.p0, n)
         else:
             # Reference = A, incident = B
             clipped, num_clipped = clip_face_against_face(face_b, face_a, n)
+            ref_offset = wp.dot(face_a.p0, n)
 
         if num_clipped == 0:
             # Clipping produced no points — fall back to single contact
@@ -1434,8 +1452,8 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
             result.count = 1
             return result
 
-        # Step 4: Reduce to max 4 points
-        clipped, num_clipped = reduce_polygon(clipped, num_clipped, n)
+        # Step 4: Reduce to max 4 points (deepest first)
+        clipped, num_clipped = reduce_polygon(clipped, num_clipped, n, ref_offset)
 
         # Step 5: Compute per-point depths and store
         count = int(0)
@@ -1445,8 +1463,9 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
             if count >= 4:
                 break
             pt = wp.vec3(clipped[ci][0], clipped[ci][1], clipped[ci][2])
-            # Depth = how far below the reference face this point is
-            pt_depth = depth  # approximate: use overall penetration depth
+            pt_depth = ref_offset - wp.dot(n, pt)
+            if pt_depth < 0.0:
+                pt_depth = depth  # fallback to overall depth
             if count == 0:
                 result.p0 = pt
                 result.d0 = pt_depth
