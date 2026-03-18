@@ -21,8 +21,6 @@ from dataclasses import dataclass
 
 import warp as wp
 
-from .types import ContactResult
-
 
 class Builder:
     """Accumulates shapes on the Python side, then finalizes into a :class:`Model`.
@@ -94,9 +92,7 @@ class Builder:
         shape_params = wp.array([wp.vec3(*p) for p in self._params], dtype=wp.vec3)
         shape_margins = wp.array(self._margins, dtype=float)
         shape_worlds = wp.array(self._worlds, dtype=int)
-        shape_transforms = wp.array(
-            [wp.transform(*t) for t in self._transforms], dtype=wp.transform
-        )
+        shape_transforms = wp.array([wp.transform(*t) for t in self._transforms], dtype=wp.transform)
 
         if max_contacts is None:
             max_contacts = max(n * (n - 1) * 2, 1)
