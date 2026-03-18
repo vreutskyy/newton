@@ -25,6 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import warp as wp
 
 from .gjk import closest_segment, closest_triangle
@@ -1038,24 +1039,268 @@ def create_pipeline(shape_entries: list[ShapeEntry] | None = None):
 
 
 @dataclass
+class Contacts:
+    """Contact query results from :meth:`Pipeline.collide`.
+
+    Attributes:
+        count: Number of contacting pairs.
+        pair_shape_a: Shape index of first shape in each pair, length *count*.
+        pair_shape_b: Shape index of second shape in each pair, length *count*.
+        normal: Contact normal (A->B) for each pair, length *count*.
+        point_count: Number of contact points (1-4) for each pair, length *count*.
+        points: Contact point positions, shape ``(count, 4, 3)``.
+        depths: Penetration depth per point, shape ``(count, 4)``.
+    """
+
+    count: int
+    pair_shape_a: np.ndarray
+    pair_shape_b: np.ndarray
+    normal: np.ndarray
+    point_count: np.ndarray
+    points: np.ndarray
+    depths: np.ndarray
+
+
 class Pipeline:
     """Compiled collision pipeline with dispatch for all registered shapes.
 
-    Created by :func:`create_pipeline`.
+    Created by :func:`create_pipeline`.  Use :meth:`add_shape` to populate,
+    then :meth:`collide` to run broadphase + narrowphase.
     """
 
-    support_local: Any
-    support_world: Any
-    contact_face_local: Any
-    contact_face_world: Any
-    get_aabb: Any
-    gjk_distance: Any
-    gjk_epa: Any
-    epa: Any
-    generate_contacts: Any
-    support_kernel: Any
-    contact_face_kernel: Any
-    aabb_kernel: Any
-    gjk_kernel: Any
-    gjk_epa_kernel: Any
-    generate_contacts_kernel: Any
+    def __init__(self, **funcs: Any) -> None:
+        # Store compiled Warp functions/kernels
+        for k, v in funcs.items():
+            setattr(self, k, v)
+
+        # SoA shape storage (Python lists, flushed to Warp arrays on collide)
+        self._types: list[int] = []
+        self._params: list[tuple[float, float, float]] = []
+        self._margins: list[float] = []
+        self._worlds: list[int] = []
+        self._transforms: list[tuple[float, ...]] = []
+
+        # Warp arrays (lazily built)
+        self._shape_types_wp: wp.array | None = None
+        self._shape_params_wp: wp.array | None = None
+        self._shape_margins_wp: wp.array | None = None
+        self._shape_worlds_wp: wp.array | None = None
+        self._shape_transforms_wp: wp.array | None = None
+        self._dirty = True
+
+    @property
+    def shape_count(self) -> int:
+        return len(self._types)
+
+    def add_shape(
+        self,
+        shape_type: int,
+        params: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        margin: float = 0.0,
+        world: int = 0,
+        transform: tuple[float, ...] | None = None,
+    ) -> int:
+        """Add a shape to the pipeline.
+
+        Args:
+            shape_type: Shape type id (e.g. ``SHAPE_POINT``, ``SHAPE_BOX``).
+            params: Core shape parameters.
+            margin: Uniform inflation distance [m].
+            world: World index. Shapes in the same world collide.
+                ``-1`` = global (collides with all worlds).
+            transform: Initial transform as ``(px, py, pz, qx, qy, qz, qw)``.
+                Defaults to identity.
+
+        Returns:
+            Integer shape handle (index into SoA arrays).
+        """
+        idx = len(self._types)
+        self._types.append(int(shape_type))
+        self._params.append((float(params[0]), float(params[1]), float(params[2])))
+        self._margins.append(float(margin))
+        self._worlds.append(int(world))
+        if transform is None:
+            transform = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+        self._transforms.append(transform)
+        self._dirty = True
+        return idx
+
+    def _flush(self) -> None:
+        """Rebuild Warp arrays from Python lists."""
+        if not self._dirty:
+            return
+        n = len(self._types)
+        if n == 0:
+            self._dirty = False
+            return
+
+        # Use CPU device so numpy() returns writable views
+        device = "cpu"
+        self._shape_types_wp = wp.array(self._types, dtype=int, device=device)
+        self._shape_params_wp = wp.array([wp.vec3(*p) for p in self._params], dtype=wp.vec3, device=device)
+        self._shape_margins_wp = wp.array(self._margins, dtype=float, device=device)
+        self._shape_worlds_wp = wp.array(self._worlds, dtype=int, device=device)
+        self._shape_transforms_wp = wp.array(
+            [wp.transform(*t) for t in self._transforms], dtype=wp.transform, device=device
+        )
+        self._dirty = False
+
+    # -- SoA array properties (user can read/write transforms) -----------
+
+    @property
+    def shape_types(self) -> wp.array:
+        self._flush()
+        return self._shape_types_wp
+
+    @property
+    def shape_params(self) -> wp.array:
+        self._flush()
+        return self._shape_params_wp
+
+    @property
+    def shape_margins(self) -> wp.array:
+        self._flush()
+        return self._shape_margins_wp
+
+    @property
+    def shape_worlds(self) -> wp.array:
+        self._flush()
+        return self._shape_worlds_wp
+
+    @property
+    def shape_transforms(self) -> wp.array:
+        self._flush()
+        return self._shape_transforms_wp
+
+    # -- Collide ---------------------------------------------------------
+
+    def collide(self) -> Contacts:
+        """Run broadphase + narrowphase and return contacts.
+
+        The user should update :attr:`shape_transforms` before calling this.
+        Currently uses brute-force N*N broadphase.
+        """
+        self._flush()
+        n = self.shape_count
+        if n < 2:
+            return Contacts(
+                count=0,
+                pair_shape_a=np.empty(0, dtype=np.int32),
+                pair_shape_b=np.empty(0, dtype=np.int32),
+                normal=np.empty((0, 3), dtype=np.float32),
+                point_count=np.empty(0, dtype=np.int32),
+                points=np.empty((0, 4, 3), dtype=np.float32),
+                depths=np.empty((0, 4), dtype=np.float32),
+            )
+
+        # Read arrays to numpy for broadphase (CPU for now)
+        types_np = self._shape_types_wp.numpy()
+        params_np = self._shape_params_wp.numpy()
+        margins_np = self._shape_margins_wp.numpy()
+        worlds_np = self._shape_worlds_wp.numpy()
+        transforms_np = self._shape_transforms_wp.numpy()
+
+        # Brute-force N×N broadphase: collect candidate pairs
+        pairs = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                wi = worlds_np[i]
+                wj = worlds_np[j]
+                # Same world or either is global (-1)
+                if wi == wj or wi == -1 or wj == -1:
+                    pairs.append((i, j))
+
+        if len(pairs) == 0:
+            return Contacts(
+                count=0,
+                pair_shape_a=np.empty(0, dtype=np.int32),
+                pair_shape_b=np.empty(0, dtype=np.int32),
+                normal=np.empty((0, 3), dtype=np.float32),
+                point_count=np.empty(0, dtype=np.int32),
+                points=np.empty((0, 4, 3), dtype=np.float32),
+                depths=np.empty((0, 4), dtype=np.float32),
+            )
+
+        # Build ShapeData arrays for each side of the pairs
+        num_pairs = len(pairs)
+        shapes_a = wp.zeros(num_pairs, dtype=ShapeData)
+        shapes_b = wp.zeros(num_pairs, dtype=ShapeData)
+        shapes_a_np = shapes_a.numpy()
+        shapes_b_np = shapes_b.numpy()
+
+        for pi, (i, j) in enumerate(pairs):
+            ti = transforms_np[i]
+            tj = transforms_np[j]
+            # ShapeData fields: shape_type, pos(3), rot(4), params(3), margin
+            shapes_a_np[pi]["shape_type"] = types_np[i]
+            shapes_a_np[pi]["pos"] = ti[:3]
+            shapes_a_np[pi]["rot"] = ti[3:]
+            shapes_a_np[pi]["params"] = params_np[i]
+            shapes_a_np[pi]["margin"] = margins_np[i]
+
+            shapes_b_np[pi]["shape_type"] = types_np[j]
+            shapes_b_np[pi]["pos"] = tj[:3]
+            shapes_b_np[pi]["rot"] = tj[3:]
+            shapes_b_np[pi]["params"] = params_np[j]
+            shapes_b_np[pi]["margin"] = margins_np[j]
+
+        shapes_a = wp.array(shapes_a_np, dtype=ShapeData)
+        shapes_b = wp.array(shapes_b_np, dtype=ShapeData)
+
+        # Run narrowphase
+        out = wp.zeros(num_pairs, dtype=ContactResult)
+        wp.launch(
+            self.generate_contacts_kernel,
+            dim=num_pairs,
+            inputs=[shapes_a, shapes_b],
+            outputs=[out],
+        )
+        results_np = out.numpy()
+
+        # Collect results — filter out pairs with count == 0
+        pair_a_list = []
+        pair_b_list = []
+        normal_list = []
+        point_count_list = []
+        points_list = []
+        depths_list = []
+
+        for pi in range(num_pairs):
+            r = results_np[pi]
+            cnt = int(r["count"])
+            if cnt == 0:
+                continue
+            i, j = pairs[pi]
+            pair_a_list.append(i)
+            pair_b_list.append(j)
+            normal_list.append(r["normal"])
+            point_count_list.append(cnt)
+            pts = np.zeros((4, 3), dtype=np.float32)
+            dps = np.zeros(4, dtype=np.float32)
+            for k in range(cnt):
+                pts[k] = r[f"p{k}"]
+                dps[k] = r[f"d{k}"]
+            points_list.append(pts)
+            depths_list.append(dps)
+
+        count = len(pair_a_list)
+        if count == 0:
+            return Contacts(
+                count=0,
+                pair_shape_a=np.empty(0, dtype=np.int32),
+                pair_shape_b=np.empty(0, dtype=np.int32),
+                normal=np.empty((0, 3), dtype=np.float32),
+                point_count=np.empty(0, dtype=np.int32),
+                points=np.empty((0, 4, 3), dtype=np.float32),
+                depths=np.empty((0, 4), dtype=np.float32),
+            )
+
+        return Contacts(
+            count=count,
+            pair_shape_a=np.array(pair_a_list, dtype=np.int32),
+            pair_shape_b=np.array(pair_b_list, dtype=np.int32),
+            normal=np.array(normal_list, dtype=np.float32),
+            point_count=np.array(point_count_list, dtype=np.int32),
+            points=np.array(points_list, dtype=np.float32),
+            depths=np.array(depths_list, dtype=np.float32),
+        )

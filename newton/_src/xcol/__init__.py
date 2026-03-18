@@ -35,7 +35,7 @@ Public API:
     )
 """
 
-from .pipeline import Pipeline, create_pipeline
+from .pipeline import Contacts, Pipeline, create_pipeline
 from .shapes import SHAPE_BOX, SHAPE_POINT, SHAPE_SEGMENT, ShapeEntry, register_shape
 from .types import ContactFaceResult, ContactResult, GJKResult, ShapeData
 
@@ -45,6 +45,7 @@ __all__ = [
     "SHAPE_SEGMENT",
     "ContactFaceResult",
     "ContactResult",
+    "Contacts",
     "GJKResult",
     "Pipeline",
     "ShapeData",
