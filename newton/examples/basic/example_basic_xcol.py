@@ -111,9 +111,9 @@ def _convert_contacts(
     if body1 >= 0:
         X_bw_b = wp.transform_inverse(body_q[body1])
 
-    # Contact point halfway between shape surfaces.
-    # penetration = -depth (positive when overlapping).
-    # Solver: d = dot(n, bx_b - bx_a) - thickness = depth (signed distance).
+    # contact_world is the clipped polygon point (near B's surface).
+    # Place p0 on A's surface, p1 at the contact point (B's surface).
+    # Solver: d = dot(n, bx_b - bx_a) = dot(n, contact - (contact + n*pen)) = -pen = depth.
     pen = -depth  # positive = overlap, negative = gap
     half_pen = pen * 0.5
     point_a_world = contact_world + normal * half_pen
@@ -125,11 +125,8 @@ def _convert_contacts(
     out_offset1[idx] = wp.vec3(0.0, 0.0, 0.0)
     out_normal[idx] = normal
 
-    # Small margin provides a "cushion" for approaching contacts.
-    # The solver sees d = -depth - 2*margin.  For separated contacts
-    # within 2*margin, d < 0, giving gentle deceleration before impact.
-    out_margin0[idx] = 0.01
-    out_margin1[idx] = 0.01
+    out_margin0[idx] = 0.0
+    out_margin1[idx] = 0.0
 
 
 # -----------------------------------------------------------------------
@@ -141,13 +138,6 @@ class XColPipeline:
     Maps Newton shapes to xcol shapes, runs xcol collision detection,
     and converts the results back to Newton's contact format.
     """
-
-    # Newton GeoType → xcol shape type mapping
-    SHAPE_MAP = {
-        int(GeoType.BOX): xc.SHAPE_BOX,
-        int(GeoType.SPHERE): xc.SHAPE_POINT,
-        int(GeoType.CAPSULE): xc.SHAPE_SEGMENT,
-    }
 
     def __init__(self, newton_model: newton.Model) -> None:
         self._newton_model = newton_model
@@ -165,23 +155,19 @@ class XColPipeline:
 
         for ni in range(newton_model.shape_count):
             geo_type = int(newton_shape_types[ni])
-            if geo_type not in self.SHAPE_MAP:
-                continue
-
-            xcol_type = self.SHAPE_MAP[geo_type]
             scale = newton_shape_scales[ni]
 
             if geo_type == int(GeoType.BOX):
+                xcol_type = xc.SHAPE_BOX
                 params = (float(scale[0]), float(scale[1]), float(scale[2]))
                 margin = 0.0
             elif geo_type == int(GeoType.SPHERE):
-                # Sphere: core is point, margin is radius
+                xcol_type = xc.SHAPE_POINT
                 params = (0.0, 0.0, 0.0)
                 margin = float(scale[0])
             elif geo_type == int(GeoType.CAPSULE):
-                # Capsule: core is segment along Z, margin is radius
-                # Newton capsule: scale = (radius, half_height, 0)
-                params = (0.0, 0.0, float(scale[1]))  # segment half-length along Z
+                xcol_type = xc.SHAPE_SEGMENT
+                params = (0.0, 0.0, float(scale[1]))
                 margin = float(scale[0])
             else:
                 continue

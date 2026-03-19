@@ -270,25 +270,25 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
                 face_best_dist = float(1.0e30)
                 face_best_v = wp.vec3(0.0, 0.0, 0.0)
                 face_best = int(0)
-                pt, u_, bv_, bw_ = closest_triangle(w1, w2, w3)
+                pt, _u, _bv, _bw = closest_triangle(w1, w2, w3)
                 fd = wp.length_sq(pt)
                 if fd < face_best_dist:
                     face_best_dist = fd
                     face_best_v = pt
                     face_best = int(0)
-                pt, u_, bv_, bw_ = closest_triangle(w0, w2, w3)
+                pt, _u, _bv, _bw = closest_triangle(w0, w2, w3)
                 fd = wp.length_sq(pt)
                 if fd < face_best_dist:
                     face_best_dist = fd
                     face_best_v = pt
                     face_best = int(1)
-                pt, u_, bv_, bw_ = closest_triangle(w0, w1, w3)
+                pt, _u, _bv, _bw = closest_triangle(w0, w1, w3)
                 fd = wp.length_sq(pt)
                 if fd < face_best_dist:
                     face_best_dist = fd
                     face_best_v = pt
                     face_best = int(2)
-                pt, u_, bv_, bw_ = closest_triangle(w0, w1, w2)
+                pt, _u, _bv, _bw = closest_triangle(w0, w1, w2)
                 fd = wp.length_sq(pt)
                 if fd < face_best_dist:
                     face_best_dist = fd
@@ -937,7 +937,7 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
         result.count = 0
 
         n = gjk_result.normal
-        depth = -gjk_result.distance  # positive penetration depth
+        depth = gjk_result.distance  # negative when penetrating
         result.normal = n
 
         face_a = contact_face_world(shape_a, n, gjk_result.point_a)
@@ -969,9 +969,9 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
             if count >= 4:
                 break
             pt = wp.vec3(clipped[ci][0], clipped[ci][1], clipped[ci][2])
-            pt_depth = ref_offset - wp.dot(n, pt)
-            if pt_depth < 0.0:
-                pt_depth = depth
+            pt_depth = wp.dot(n, pt) - ref_offset  # negative = penetrating
+            if pt_depth > 0.0:
+                pt_depth = depth  # fallback to GJK distance
             if count == 0:
                 result.p0 = pt
                 result.d0 = pt_depth
@@ -1133,15 +1133,18 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
                     out_shape_a[idx] = i
                     out_shape_b[idx] = j
                     out_normal[idx] = r.normal
-                    out_depth[idx] = gjk_result.distance  # signed: +gap, -depth
                     if ci == 0:
                         out_point[idx] = r.p0
+                        out_depth[idx] = r.d0
                     elif ci == 1:
                         out_point[idx] = r.p1
+                        out_depth[idx] = r.d1
                     elif ci == 2:
                         out_point[idx] = r.p2
+                        out_depth[idx] = r.d2
                     elif ci == 3:
                         out_point[idx] = r.p3
+                        out_depth[idx] = r.d3
 
     return Collider(
         support_local=support_local,
