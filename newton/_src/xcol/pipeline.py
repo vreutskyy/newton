@@ -165,12 +165,20 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
         v = w0
         dist_sq = wp.length_sq(v)
 
+        # Track best result across iterations (PhysX pattern).
+        # Even if GJK exits early on a degenerate case, we have a valid normal.
+        best_dist_sq = dist_sq
+        best_normal = wp.vec3(0.0, 0.0, 1.0)
+        if dist_sq > GJK_EPSILON * GJK_EPSILON:
+            best_normal = -v / wp.sqrt(dist_sq)
+
         for _iter in range(GJK_MAX_ITERATIONS):
             if dist_sq < GJK_EPSILON * GJK_EPSILON:
                 result.overlap = 2  # core overlap — needs EPA
                 result.distance = 0.0
                 result.point_a = pa0
                 result.point_b = pb0
+                result.normal = best_normal
                 return result
 
             direction = -v
@@ -202,6 +210,9 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
                 pt, la, lb = closest_segment(w0, w1)
                 v = pt
                 dist_sq = wp.length_sq(v)
+                if dist_sq < best_dist_sq and dist_sq > GJK_EPSILON * GJK_EPSILON:
+                    best_dist_sq = dist_sq
+                    best_normal = -v / wp.sqrt(dist_sq)
                 if la < GJK_EPSILON:
                     w0 = w1
                     pa0 = pa1
@@ -219,6 +230,9 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
                 pt, u, bv, bw = closest_triangle(w0, w1, w2)
                 v = pt
                 dist_sq = wp.length_sq(v)
+                if dist_sq < best_dist_sq and dist_sq > GJK_EPSILON * GJK_EPSILON:
+                    best_dist_sq = dist_sq
+                    best_normal = -v / wp.sqrt(dist_sq)
 
                 keep0 = u >= GJK_EPSILON
                 keep1 = bv >= GJK_EPSILON
@@ -331,6 +345,9 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
 
                 v = best_v
                 dist_sq = best_dist
+                if dist_sq < best_dist_sq and dist_sq > GJK_EPSILON * GJK_EPSILON:
+                    best_dist_sq = dist_sq
+                    best_normal = -v / wp.sqrt(dist_sq)
 
                 if best_face == 0:
                     w0 = w1
@@ -376,8 +393,10 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
 
         if core_dist > GJK_EPSILON:
             result.normal = -v / core_dist
-            result.point_a = result.point_a + result.normal * shape_a.margin
-            result.point_b = result.point_b - result.normal * shape_b.margin
+        else:
+            result.normal = best_normal
+        result.point_a = result.point_a + result.normal * shape_a.margin
+        result.point_b = result.point_b - result.normal * shape_b.margin
 
         if real_dist <= 0.0:
             result.overlap = 1  # margin-only overlap
@@ -406,7 +425,12 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
         pb2_in: wp.vec3,
         pb3_in: wp.vec3,
     ) -> GJKResult:
-        """Expand polytope from GJK tetrahedron to find penetration depth."""
+        """Expand polytope to find penetration depth.
+
+        Starts from the GJK simplex points. Builds a triangle (2 faces)
+        from the first 3 distinct points, then iteratively expands.
+        Does NOT require the origin to be inside the initial polytope.
+        """
         result = GJKResult()
         result.distance = 0.0
         result.point_a = wp.vec3(0.0, 0.0, 0.0)
@@ -417,38 +441,63 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
         verts = EPAVerts()
         verts_a = EPAVertsA()
         verts_b = EPAVertsB()
-        verts[0] = s0
-        verts[1] = s1
-        verts[2] = s2
-        verts[3] = s3
-        verts_a[0] = pa0_in
-        verts_a[1] = pa1_in
-        verts_a[2] = pa2_in
-        verts_a[3] = pa3_in
-        verts_b[0] = pb0_in
-        verts_b[1] = pb1_in
-        verts_b[2] = pb2_in
-        verts_b[3] = pb3_in
-        num_verts = int(4)
 
+        # Build initial triangle from GJK simplex.
+        # Use s0, s1, s2 if they form a valid triangle; if degenerate,
+        # get fresh support points.
+        verts[0] = s0
+        verts_a[0] = pa0_in
+        verts_b[0] = pb0_in
+
+        # Ensure s1 is distinct from s0
+        v1 = s1
+        va1 = pa1_in
+        vb1 = pb1_in
+        if wp.length_sq(v1 - s0) < GJK_EPSILON * GJK_EPSILON:
+            init_dir = shape_b.pos - shape_a.pos
+            if wp.length_sq(init_dir) < GJK_EPSILON:
+                init_dir = wp.vec3(1.0, 0.0, 0.0)
+            init_dir = wp.normalize(init_dir)
+            va1 = support_world(shape_a, init_dir)
+            vb1 = support_world(shape_b, -init_dir)
+            v1 = va1 - vb1
+        verts[1] = v1
+        verts_a[1] = va1
+        verts_b[1] = vb1
+
+        # Ensure s2 is not collinear with s0-s1
+        v2 = s2
+        va2 = pa2_in
+        vb2 = pb2_in
+        line = v1 - s0
+        line_len = wp.length(line)
+        tri_n = wp.cross(v1 - s0, v2 - s0)
+        if wp.length(tri_n) < GJK_EPSILON * line_len:
+            # Collinear — find perpendicular direction
+            perp = wp.cross(line, wp.vec3(1.0, 0.0, 0.0))
+            if wp.length(perp) < GJK_EPSILON:
+                perp = wp.cross(line, wp.vec3(0.0, 1.0, 0.0))
+            perp = wp.normalize(perp)
+            va2 = support_world(shape_a, perp)
+            vb2 = support_world(shape_b, -perp)
+            v2 = va2 - vb2
+        verts[2] = v2
+        verts_a[2] = va2
+        verts_b[2] = vb2
+        num_verts = int(3)
+
+        # Start with 2 faces (front and back of triangle)
         faces = EPAFaces()
-        n012 = wp.cross(s1 - s0, s2 - s0)
-        if wp.dot(n012, s3 - s0) > 0.0:
-            faces[0] = wp.vec3(0.0, 2.0, 1.0)
-            faces[1] = wp.vec3(0.0, 1.0, 3.0)
-            faces[2] = wp.vec3(1.0, 2.0, 3.0)
-            faces[3] = wp.vec3(0.0, 3.0, 2.0)
-        else:
-            faces[0] = wp.vec3(0.0, 1.0, 2.0)
-            faces[1] = wp.vec3(0.0, 3.0, 1.0)
-            faces[2] = wp.vec3(1.0, 3.0, 2.0)
-            faces[3] = wp.vec3(0.0, 2.0, 3.0)
-        num_faces = int(4)
+        faces[0] = wp.vec3(0.0, 1.0, 2.0)
+        faces[1] = wp.vec3(0.0, 2.0, 1.0)
+        num_faces = int(2)
 
         for _epa_iter in range(EPA_MAX_ITERATIONS):
-            best_face = int(0)
-            best_dist = float(1.0e30)
-            best_normal = wp.vec3(0.0, 0.0, 0.0)
+            # Find face with smallest distance to origin (min |d|)
+            closest_face = int(0)
+            closest_abs_dist = float(1.0e30)
+            closest_normal = wp.vec3(0.0, 0.0, 0.0)
+            closest_dist = float(0.0)
 
             for fi in range(EPA_MAX_FACES):
                 if fi >= num_faces:
@@ -464,57 +513,23 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
                 if n_len < EPA_EPSILON:
                     continue
                 n = n / n_len
-                d = wp.dot(n, va)
-                if d < 0.0:
-                    n = -n
-                    d = -d
-                if d < best_dist:
-                    best_dist = d
-                    best_normal = n
-                    best_face = fi
+                d = wp.dot(n, va)  # signed distance
+                ad = wp.abs(d)
+                if ad < closest_abs_dist:
+                    closest_abs_dist = ad
+                    closest_dist = d
+                    closest_normal = n
+                    closest_face = fi
 
-            sa = support_world(shape_a, best_normal)
-            sb = support_world(shape_b, -best_normal)
+            # Always search in the face normal direction (expands convex hull)
+            sa = support_world(shape_a, closest_normal)
+            sb = support_world(shape_b, -closest_normal)
             w_new = sa - sb
 
-            new_dist = wp.dot(w_new, best_normal)
-            if new_dist - best_dist < EPA_EPSILON:
-                result.distance = best_dist
-                result.normal = best_normal
+            new_dist = wp.dot(w_new, closest_normal)
 
-                bi0 = int(faces[best_face][0])
-                bi1 = int(faces[best_face][1])
-                bi2 = int(faces[best_face][2])
-                fa = wp.vec3(verts[bi0][0], verts[bi0][1], verts[bi0][2])
-                fb = wp.vec3(verts[bi1][0], verts[bi1][1], verts[bi1][2])
-                fc = wp.vec3(verts[bi2][0], verts[bi2][1], verts[bi2][2])
-
-                proj = best_normal * best_dist
-                v0 = fb - fa
-                v1 = fc - fa
-                v2 = proj - fa
-                d00 = wp.dot(v0, v0)
-                d01 = wp.dot(v0, v1)
-                d11 = wp.dot(v1, v1)
-                d20 = wp.dot(v2, v0)
-                d21 = wp.dot(v2, v1)
-                denom = d00 * d11 - d01 * d01
-                if wp.abs(denom) < EPA_EPSILON:
-                    denom = EPA_EPSILON
-                bv = (d11 * d20 - d01 * d21) / denom
-                bw = (d00 * d21 - d01 * d20) / denom
-                bu = 1.0 - bv - bw
-
-                pa_a = wp.vec3(verts_a[bi0][0], verts_a[bi0][1], verts_a[bi0][2])
-                pa_b = wp.vec3(verts_a[bi1][0], verts_a[bi1][1], verts_a[bi1][2])
-                pa_c = wp.vec3(verts_a[bi2][0], verts_a[bi2][1], verts_a[bi2][2])
-                pb_a = wp.vec3(verts_b[bi0][0], verts_b[bi0][1], verts_b[bi0][2])
-                pb_b = wp.vec3(verts_b[bi1][0], verts_b[bi1][1], verts_b[bi1][2])
-                pb_c = wp.vec3(verts_b[bi2][0], verts_b[bi2][1], verts_b[bi2][2])
-
-                result.point_a = bu * pa_a + bv * pa_b + bw * pa_c
-                result.point_b = bu * pb_a + bv * pb_b + bw * pb_c
-                return result
+            if new_dist - closest_dist < EPA_EPSILON:
+                break
 
             if num_verts >= EPA_MAX_VERTS:
                 break
@@ -525,6 +540,7 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
             verts_b[new_vi] = sb
             num_verts = num_verts + 1
 
+            # Remove faces visible from new point, collect boundary edges
             edges = EPAFaces()
             num_edges = int(0)
             new_num_faces = int(0)
@@ -540,13 +556,11 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
                 vc = wp.vec3(verts[i2][0], verts[i2][1], verts[i2][2])
                 fn = wp.cross(vb - va, vc - va)
                 fn_len = wp.length(fn)
-                if fn_len > EPA_EPSILON:
-                    fn = fn / fn_len
-                    if wp.dot(fn, va) < 0.0:
-                        fn = -fn
 
+                # Face is visible if new point is on outward side
                 visible = int(0)
                 if fn_len > EPA_EPSILON:
+                    fn = fn / fn_len
                     if wp.dot(fn, w_new - va) > EPA_EPSILON:
                         visible = int(1)
 
@@ -587,69 +601,62 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
                 if ei >= num_edges:
                     break
                 if num_faces < EPA_MAX_FACES:
-                    faces[num_faces] = wp.vec3(edges[ei][0], edges[ei][1], float(new_vi))
+                    ea = int(edges[ei][0])
+                    eb = int(edges[ei][1])
+                    va_e = wp.vec3(verts[ea][0], verts[ea][1], verts[ea][2])
+                    vb_e = wp.vec3(verts[eb][0], verts[eb][1], verts[eb][2])
+                    vc_e = wp.vec3(verts[new_vi][0], verts[new_vi][1], verts[new_vi][2])
+                    fn_new = wp.cross(vb_e - va_e, vc_e - va_e)
+                    # Ensure outward normal: dot(fn, va) > 0
+                    if wp.dot(fn_new, va_e) >= 0.0:
+                        faces[num_faces] = wp.vec3(float(ea), float(eb), float(new_vi))
+                    else:
+                        faces[num_faces] = wp.vec3(float(eb), float(ea), float(new_vi))
                     num_faces = num_faces + 1
 
-        result.distance = best_dist
-        result.normal = best_normal
+        # Extract contact points from closest face via barycentric interpolation
+        # Normal points from origin toward closest face
+        result_normal = closest_normal
+        if closest_dist < 0.0:
+            result_normal = -closest_normal
+        result.distance = closest_abs_dist
+        result.normal = result_normal
+
+        bi0 = int(faces[closest_face][0])
+        bi1 = int(faces[closest_face][1])
+        bi2 = int(faces[closest_face][2])
+        fa = wp.vec3(verts[bi0][0], verts[bi0][1], verts[bi0][2])
+        fb = wp.vec3(verts[bi1][0], verts[bi1][1], verts[bi1][2])
+        fc = wp.vec3(verts[bi2][0], verts[bi2][1], verts[bi2][2])
+
+        proj = result_normal * closest_abs_dist
+        v0 = fb - fa
+        v1 = fc - fa
+        v2 = proj - fa
+        d00 = wp.dot(v0, v0)
+        d01 = wp.dot(v0, v1)
+        d11 = wp.dot(v1, v1)
+        d20 = wp.dot(v2, v0)
+        d21 = wp.dot(v2, v1)
+        denom = d00 * d11 - d01 * d01
+        if wp.abs(denom) < EPA_EPSILON:
+            denom = EPA_EPSILON
+        bv = (d11 * d20 - d01 * d21) / denom
+        bw = (d00 * d21 - d01 * d20) / denom
+        bu = 1.0 - bv - bw
+
+        pa_a = wp.vec3(verts_a[bi0][0], verts_a[bi0][1], verts_a[bi0][2])
+        pa_b = wp.vec3(verts_a[bi1][0], verts_a[bi1][1], verts_a[bi1][2])
+        pa_c = wp.vec3(verts_a[bi2][0], verts_a[bi2][1], verts_a[bi2][2])
+        pb_a = wp.vec3(verts_b[bi0][0], verts_b[bi0][1], verts_b[bi0][2])
+        pb_b = wp.vec3(verts_b[bi1][0], verts_b[bi1][1], verts_b[bi1][2])
+        pb_c = wp.vec3(verts_b[bi2][0], verts_b[bi2][1], verts_b[bi2][2])
+
+        result.point_a = bu * pa_a + bv * pa_b + bw * pa_c
+        result.point_b = bu * pb_a + bv * pb_b + bw * pb_c
         return result
 
     # -- Combined GJK + EPA ---------------------------------------------
-
-    @wp.func
-    def build_initial_tetrahedron(shape_a: ShapeData, shape_b: ShapeData) -> GJKResult:
-        """Build an initial tetrahedron enclosing the origin for EPA."""
-        result = GJKResult()
-        result.overlap = 1
-        result.distance = 0.0
-
-        d0 = shape_b.pos - shape_a.pos
-        if wp.length(d0) < GJK_EPSILON:
-            d0 = wp.vec3(1.0, 0.0, 0.0)
-        d0 = wp.normalize(d0)
-        sa = support_world(shape_a, d0)
-        sb = support_world(shape_b, -d0)
-        result.sw0 = sa - sb
-        result.spa0 = sa
-        result.spb0 = sb
-
-        d1 = -d0
-        sa = support_world(shape_a, d1)
-        sb = support_world(shape_b, -d1)
-        result.sw1 = sa - sb
-        result.spa1 = sa
-        result.spb1 = sb
-
-        line = result.sw1 - result.sw0
-        t = -wp.dot(result.sw0, line) / wp.max(wp.dot(line, line), GJK_EPSILON)
-        closest_pt = result.sw0 + t * line
-        d2 = -closest_pt
-        if wp.length(d2) < GJK_EPSILON:
-            d2 = wp.cross(line, wp.vec3(1.0, 0.0, 0.0))
-            if wp.length(d2) < GJK_EPSILON:
-                d2 = wp.cross(line, wp.vec3(0.0, 1.0, 0.0))
-        d2 = wp.normalize(d2)
-        sa = support_world(shape_a, d2)
-        sb = support_world(shape_b, -d2)
-        result.sw2 = sa - sb
-        result.spa2 = sa
-        result.spb2 = sb
-
-        tri_n = wp.cross(result.sw1 - result.sw0, result.sw2 - result.sw0)
-        tri_n_len = wp.length(tri_n)
-        if tri_n_len < GJK_EPSILON:
-            tri_n = wp.vec3(0.0, 0.0, 1.0)
-        else:
-            tri_n = tri_n / tri_n_len
-        if wp.dot(tri_n, -result.sw0) < 0.0:
-            tri_n = -tri_n
-        sa = support_world(shape_a, tri_n)
-        sb = support_world(shape_b, -tri_n)
-        result.sw3 = sa - sb
-        result.spa3 = sa
-        result.spb3 = sb
-
-        return result
 
     @wp.func
     def gjk_epa(shape_a: ShapeData, shape_b: ShapeData) -> GJKResult:
@@ -657,18 +664,14 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
         gjk_result = gjk_distance(shape_a, shape_b)
         if gjk_result.overlap == 0:
             return gjk_result
+
+        # overlap == 1: margin-only overlap — GJK already computed depth
         if gjk_result.overlap == 1:
-            return gjk_result
+            if wp.length(gjk_result.normal) > GJK_EPSILON:
+                return gjk_result
 
+        # overlap == 2: core overlap — need EPA for penetration depth
         total_margin = shape_a.margin + shape_b.margin
-
-        d0 = gjk_result.sw1 - gjk_result.sw0
-        d1 = gjk_result.sw2 - gjk_result.sw0
-        d2 = gjk_result.sw3 - gjk_result.sw0
-        vol = wp.abs(wp.dot(d0, wp.cross(d1, d2)))
-
-        if vol < GJK_EPSILON:
-            gjk_result = build_initial_tetrahedron(shape_a, shape_b)
 
         epa_result = epa(
             shape_a,
@@ -877,13 +880,19 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
 
     @wp.func
     def generate_contacts(shape_a: ShapeData, shape_b: ShapeData) -> ContactResult:
-        """Generate contact patch between two shapes."""
-        result = ContactResult()
-        result.count = 0
-
+        """Generate contact patch between two shapes (runs GJK/EPA internally)."""
         gjk_result = gjk_epa(shape_a, shape_b)
         if gjk_result.overlap == 0:
+            result = ContactResult()
+            result.count = 0
             return result
+        return generate_contacts_from_gjk(shape_a, shape_b, gjk_result)
+
+    @wp.func
+    def generate_contacts_from_gjk(shape_a: ShapeData, shape_b: ShapeData, gjk_result: GJKResult) -> ContactResult:
+        """Generate contact patch from a pre-computed GJK/EPA result."""
+        result = ContactResult()
+        result.count = 0
 
         n = gjk_result.normal
         depth = gjk_result.distance
@@ -892,12 +901,23 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
         face_a = contact_face_world(shape_a, n, gjk_result.point_a)
         face_b = contact_face_world(shape_b, -n, gjk_result.point_b)
 
+        # ref_offset: projection of shape A's surface onto the contact normal.
+        # Use the face CENTER — for planar faces with slightly off-axis
+        # normals, opposite corners' off-axis projections cancel at the center.
+        face_center = face_a.p0
+        if face_a.count >= 2:
+            face_center = face_center + face_a.p1
+        if face_a.count >= 3:
+            face_center = face_center + face_a.p2
+        if face_a.count >= 4:
+            face_center = face_center + face_a.p3
+        face_center = face_center / float(face_a.count)
+        ref_offset = wp.dot(face_center, n)
+
         if face_b.count > face_a.count:
             clipped, num_clipped = clip_face_against_face(face_a, face_b, -n)
-            ref_offset = wp.dot(face_a.p0, n)
         else:
             clipped, num_clipped = clip_face_against_face(face_b, face_a, n)
-            ref_offset = wp.dot(face_a.p0, n)
 
         if num_clipped == 0:
             mid = (gjk_result.point_a + gjk_result.point_b) * 0.5
@@ -1019,6 +1039,7 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
     @wp.kernel(enable_backward=False)
     def collide_nxn_kernel(
         num_shapes: int,
+        contact_distance: float,
         shape_types: wp.array(dtype=int),
         shape_params: wp.array(dtype=wp.vec3),
         shape_margins: wp.array(dtype=float),
@@ -1068,30 +1089,45 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
         sb.params = shape_params[j]
         sb.margin = shape_margins[j]
 
-        # Narrowphase
-        r = generate_contacts(sa, sb)
+        # Narrowphase: first try GJK to check distance
+        gjk_result = gjk_epa(sa, sb)
 
-        # Flatten contacts into SoA output
-        for ci in range(4):
-            if ci >= r.count:
-                break
-            idx = wp.atomic_add(out_count, 0, 1)
-            if idx < out_shape_a.shape[0]:
-                out_shape_a[idx] = i
-                out_shape_b[idx] = j
-                out_normal[idx] = r.normal
-                if ci == 0:
-                    out_point[idx] = r.p0
-                    out_depth[idx] = r.d0
-                elif ci == 1:
-                    out_point[idx] = r.p1
-                    out_depth[idx] = r.d1
-                elif ci == 2:
-                    out_point[idx] = r.p2
-                    out_depth[idx] = r.d2
-                elif ci == 3:
-                    out_point[idx] = r.p3
-                    out_depth[idx] = r.d3
+        if gjk_result.overlap == 0:
+            # Separated — report single contact if within contact_distance
+            if gjk_result.distance < contact_distance:
+                idx = wp.atomic_add(out_count, 0, 1)
+                if idx < out_shape_a.shape[0]:
+                    out_shape_a[idx] = i
+                    out_shape_b[idx] = j
+                    out_normal[idx] = gjk_result.normal
+                    mid = (gjk_result.point_a + gjk_result.point_b) * 0.5
+                    out_point[idx] = mid
+                    out_depth[idx] = -gjk_result.distance  # negative = separated
+        else:
+            # Overlapping — generate full contact patch
+            r = generate_contacts_from_gjk(sa, sb, gjk_result)
+
+            # Flatten contacts into SoA output
+            for ci in range(4):
+                if ci >= r.count:
+                    break
+                idx = wp.atomic_add(out_count, 0, 1)
+                if idx < out_shape_a.shape[0]:
+                    out_shape_a[idx] = i
+                    out_shape_b[idx] = j
+                    out_normal[idx] = r.normal
+                    if ci == 0:
+                        out_point[idx] = r.p0
+                        out_depth[idx] = r.d0
+                    elif ci == 1:
+                        out_point[idx] = r.p1
+                        out_depth[idx] = r.d1
+                    elif ci == 2:
+                        out_point[idx] = r.p2
+                        out_depth[idx] = r.d2
+                    elif ci == 3:
+                        out_point[idx] = r.p3
+                        out_depth[idx] = r.d3
 
     return Collider(
         support_local=support_local,
@@ -1125,7 +1161,7 @@ class Collider:
         for k, v in funcs.items():
             setattr(self, k, v)
 
-    def collide(self, model: Any) -> None:
+    def collide(self, model: Any, contact_distance: float = 0.0) -> None:
         """Run N*N broadphase + narrowphase and write contacts into *model*.
 
         The user should update ``model.shape_transforms`` before calling this.
@@ -1134,6 +1170,8 @@ class Collider:
 
         Args:
             model: A :class:`~xcol.model.Model` instance.
+            contact_distance: Report contacts for shapes separated by less
+                than this distance [m]. Separated contacts have negative depth.
         """
         n = model.shape_count
         num_pairs = n * (n - 1) // 2
@@ -1148,6 +1186,7 @@ class Collider:
             dim=num_pairs,
             inputs=[
                 n,
+                contact_distance,
                 model.shape_types,
                 model.shape_params,
                 model.shape_margins,
