@@ -26,10 +26,9 @@
 import warp as wp
 
 import newton
+import newton._src.xcol as xc
 import newton.examples
 from newton._src.geometry.types import GeoType
-
-import newton._src.xcol as xc
 
 
 # -----------------------------------------------------------------------
@@ -99,7 +98,7 @@ def _convert_contacts(
 
     contact_world = xcol_point[i]
     normal = xcol_normal[i]
-    depth = xcol_depth[i]  # positive=overlap, negative=separated
+    depth = xcol_depth[i]  # signed: positive=gap, negative=penetration
 
     # Transform contact point to body-local frames
     body0 = shape_body[ns0]
@@ -112,12 +111,13 @@ def _convert_contacts(
     if body1 >= 0:
         X_bw_b = wp.transform_inverse(body_q[body1])
 
-    # Split contact into two points separated by depth along normal.
-    # Solver computes d = dot(n, bx_b - bx_a) - thickness = -depth.
-    # Works for both overlap (depth > 0) and separation (depth < 0).
-    half_d = depth * 0.5
-    point_a_world = contact_world + normal * half_d
-    point_b_world = contact_world - normal * half_d
+    # Contact point halfway between shape surfaces.
+    # penetration = -depth (positive when overlapping).
+    # Solver: d = dot(n, bx_b - bx_a) - thickness = depth (signed distance).
+    pen = -depth  # positive = overlap, negative = gap
+    half_pen = pen * 0.5
+    point_a_world = contact_world + normal * half_pen
+    point_b_world = contact_world - normal * half_pen
 
     out_point0[idx] = wp.transform_point(X_bw_a, point_a_world)
     out_point1[idx] = wp.transform_point(X_bw_b, point_b_world)

@@ -110,7 +110,7 @@ class TestCollide(unittest.TestCase):
         self.assertEqual(n, 1)
         self.assertEqual(model.contact_shape_a.numpy()[0], 0)
         self.assertEqual(model.contact_shape_b.numpy()[0], 1)
-        self.assertGreater(model.contact_depth.numpy()[0], 0.0)
+        self.assertLess(model.contact_depth.numpy()[0], 0.0)  # negative = penetrating
         self.assertAlmostEqual(np.linalg.norm(model.contact_normal.numpy()[0]), 1.0, places=3)
 
     def test_contacts_reset_between_calls(self):

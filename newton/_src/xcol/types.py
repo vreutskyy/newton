@@ -116,23 +116,17 @@ class ContactResult:
 
 @wp.struct
 class GJKResult:
-    """Result of a GJK distance query."""
+    """Result of GJK distance / EPA depth query.
+
+    Attributes:
+        distance: Signed distance [m].  Positive = separated (gap),
+            negative = penetrating (depth).  Zero = touching.
+        point_a: Witness point on shape A surface [m].
+        point_b: Witness point on shape B surface [m].
+        normal: Direction from A toward B (unit length).
+    """
 
     distance: float
     point_a: wp.vec3
     point_b: wp.vec3
     normal: wp.vec3
-    overlap: int  # 0 = separated, 1 = margin overlap, 2 = core overlap
-    # Terminal simplex (valid when overlap==2, used by EPA)
-    sw0: wp.vec3
-    sw1: wp.vec3
-    sw2: wp.vec3
-    sw3: wp.vec3
-    spa0: wp.vec3
-    spa1: wp.vec3
-    spa2: wp.vec3
-    spa3: wp.vec3
-    spb0: wp.vec3
-    spb1: wp.vec3
-    spb2: wp.vec3
-    spb3: wp.vec3
