@@ -35,6 +35,7 @@ from .types import (
     EPA_MAX_VERTS,
     GJK_EPSILON,
     GJK_MAX_ITERATIONS,
+    ClipPlanes,
     ClipPoly,
     ContactFaceResult,
     ContactResult,
@@ -757,39 +758,44 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
             if j >= num_pts:
                 j = int(0)
 
-            pi = wp.vec3(poly[i][0], poly[i][1], poly[i][2])
-            pj = wp.vec3(poly[j][0], poly[j][1], poly[j][2])
-            di = wp.dot(plane_n, pi) - plane_d
-            dj = wp.dot(plane_n, pj) - plane_d
+            pi_xyz = wp.vec3(poly[i][0], poly[i][1], poly[i][2])
+            pj_xyz = wp.vec3(poly[j][0], poly[j][1], poly[j][2])
+            di = wp.dot(plane_n, pi_xyz) - plane_d
+            dj = wp.dot(plane_n, pj_xyz) - plane_d
 
             if di <= 0.0:
                 if out_count < CLIP_MAX_POINTS:
-                    out[out_count] = pi
+                    out[out_count] = poly[i]
                     out_count = out_count + 1
                 if dj > 0.0:
                     denom = di - dj
                     if wp.abs(denom) < 1.0e-10:
                         denom = 1.0e-10
                     t = di / denom
-                    intersection = pi + t * (pj - pi)
+                    ix = pi_xyz[0] + t * (pj_xyz[0] - pi_xyz[0])
+                    iy = pi_xyz[1] + t * (pj_xyz[1] - pi_xyz[1])
+                    iz = pi_xyz[2] + t * (pj_xyz[2] - pi_xyz[2])
+                    iw = poly[i][3] + t * (poly[j][3] - poly[i][3])
                     if out_count < CLIP_MAX_POINTS:
-                        out[out_count] = intersection
+                        out[out_count] = wp.vec4(ix, iy, iz, iw)
                         out_count = out_count + 1
             elif dj <= 0.0:
                 denom = di - dj
                 if wp.abs(denom) < 1.0e-10:
                     denom = 1.0e-10
                 t = di / denom
-                intersection = pi + t * (pj - pi)
+                ix = pi_xyz[0] + t * (pj_xyz[0] - pi_xyz[0])
+                iy = pi_xyz[1] + t * (pj_xyz[1] - pi_xyz[1])
+                iz = pi_xyz[2] + t * (pj_xyz[2] - pi_xyz[2])
+                iw = poly[i][3] + t * (poly[j][3] - poly[i][3])
                 if out_count < CLIP_MAX_POINTS:
-                    out[out_count] = intersection
+                    out[out_count] = wp.vec4(ix, iy, iz, iw)
                     out_count = out_count + 1
 
         return out, out_count
 
     @wp.func
     def get_face_point(face: ContactFaceResult, idx: int) -> wp.vec3:
-        """Helper to index into a ContactFaceResult by integer index."""
         if idx == 0:
             return face.p0
         elif idx == 1:
@@ -799,389 +805,72 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
         return face.p3
 
     @wp.func
-    def make_clip_planes(
+    def make_face_clip_planes(
         face: ContactFaceResult,
         axis: wp.vec3,
-        planes_n: ClipPoly,
-        planes_d: ClipPoly,
+        planes: ClipPlanes,
         num_planes: int,
-    ) -> tuple[ClipPoly, ClipPoly, int]:
-        """Build clip planes from a face's edges, extending along the axis.
-
-        Each edge (s, e) generates a plane with normal = cross(e-s, axis).
-        The plane is oriented so all other face points are on the negative side.
-        Caps at face.count planes to avoid spurious planes from degenerate faces.
-        """
+    ) -> tuple[ClipPlanes, int]:
+        """Build clip planes from a face's edges extending along the axis."""
         fc = face.count
-        out_n = planes_n
-        out_d = planes_d
-        count = num_planes
         eps = 1.0e-6
-
         for ei in range(4):
             if ei >= fc:
                 continue
-            if count >= CLIP_MAX_POINTS:
+            if num_planes >= CLIP_MAX_POINTS:
                 continue
             ej = ei + 1
             if ej >= fc:
                 ej = int(0)
             s = get_face_point(face, ei)
             e = get_face_point(face, ej)
-
             n = wp.cross(e - s, axis)
             n_len = wp.length(n)
             if n_len < eps:
                 continue
             n = n / n_len
-
-            # Verify: all other face points should be on one side
             pos_count = int(0)
             neg_count = int(0)
             for ki in range(4):
                 if ki >= fc:
                     continue
-                pk = get_face_point(face, ki)
-                dd = wp.dot(pk - s, n)
+                dd = wp.dot(get_face_point(face, ki) - s, n)
                 if dd > eps:
                     pos_count = pos_count + 1
                 elif dd < -eps:
                     neg_count = neg_count + 1
-
-            # Skip if points are on both sides (not a boundary edge)
             if pos_count > 0 and neg_count > 0:
                 continue
-
-            # Orient: other points should be on negative side
             if pos_count > 0:
                 n = -n
-
-            d = wp.dot(n, s)
-            out_n[count] = n
-            out_d[count] = wp.vec3(d, 0.0, 0.0)
-            count = count + 1
-
-        return out_n, out_d, count
+            planes[num_planes] = wp.vec4(n[0], n[1], n[2], wp.dot(n, s))
+            num_planes = num_planes + 1
+        return planes, num_planes
 
     @wp.func
-    def clip_edge_edge(
-        face_a: ContactFaceResult,
-        face_b: ContactFaceResult,
-        axis: wp.vec3,
-    ) -> tuple[ClipPoly, int]:
-        """Edge-vs-edge clipping (PhysX clip2x2 pattern).
+    def generate_contact_patch(
+        shape_a: ShapeData,
+        shape_b: ShapeData,
+        gjk_result: GJKResult,
+    ) -> ContactResult:
+        """Generate contact patch — single function, all clip paths.
 
-        Projects each segment's endpoints onto the other segment.
-        Returns up to 4 contact points (midpoints of projections).
-        """
-        a0 = face_a.p0
-        a1 = face_a.p1
-        b0 = face_b.p0
-        b1 = face_b.p1
-        eps = 1.0e-5
-        poly = ClipPoly()
-        num = int(0)
-
-        # For each of the 4 endpoints, check if it projects inside the
-        # other segment.  If so, compute the projection and store the
-        # midpoint + depth as a contact.
-        seg_ab = a1 - a0
-        seg_cd = b1 - b0
-        len_ab_sq = wp.dot(seg_ab, seg_ab)
-        len_cd_sq = wp.dot(seg_cd, seg_cd)
-
-        # Project b0 onto segment a0-a1
-        t = wp.dot(b0 - a0, seg_ab)
-        if t > -eps * len_ab_sq and t < len_ab_sq + eps * len_ab_sq and len_ab_sq > eps:
-            proj = a0 + seg_ab * (t / len_ab_sq)
-            mid = (b0 + proj) * 0.5
-            poly[num] = mid
-            num = num + 1
-
-        # Project b1 onto segment a0-a1
-        t = wp.dot(b1 - a0, seg_ab)
-        if t > -eps * len_ab_sq and t < len_ab_sq + eps * len_ab_sq and len_ab_sq > eps:
-            proj = a0 + seg_ab * (t / len_ab_sq)
-            mid = (b1 + proj) * 0.5
-            poly[num] = mid
-            num = num + 1
-
-        # Project a0 onto segment b0-b1
-        t = wp.dot(a0 - b0, seg_cd)
-        if t > -eps * len_cd_sq and t < len_cd_sq + eps * len_cd_sq and len_cd_sq > eps:
-            proj = b0 + seg_cd * (t / len_cd_sq)
-            mid = (a0 + proj) * 0.5
-            # Avoid duplicates
-            is_dup = int(0)
-            for di in range(CLIP_MAX_POINTS):
-                if di >= num:
-                    continue
-                if wp.length_sq(mid - wp.vec3(poly[di][0], poly[di][1], poly[di][2])) < eps:
-                    is_dup = int(1)
-            if is_dup == 0:
-                poly[num] = mid
-                num = num + 1
-
-        # Project a1 onto segment b0-b1
-        t = wp.dot(a1 - b0, seg_cd)
-        if t > -eps * len_cd_sq and t < len_cd_sq + eps * len_cd_sq and len_cd_sq > eps:
-            proj = b0 + seg_cd * (t / len_cd_sq)
-            mid = (a1 + proj) * 0.5
-            is_dup = int(0)
-            for di in range(CLIP_MAX_POINTS):
-                if di >= num:
-                    continue
-                if wp.length_sq(mid - wp.vec3(poly[di][0], poly[di][1], poly[di][2])) < eps:
-                    is_dup = int(1)
-            if is_dup == 0:
-                poly[num] = mid
-                num = num + 1
-
-        return poly, num
-
-    @wp.func
-    def clip_edge_face(
-        edge: ContactFaceResult,
-        face: ContactFaceResult,
-        axis: wp.vec3,
-    ) -> tuple[ClipPoly, int]:
-        """Clip a 2-point edge against the clip planes of an N-point face."""
-        # Initial polygon = the edge (2 points)
-        poly = ClipPoly()
-        poly[0] = edge.p0
-        poly[1] = edge.p1
-        num_pts = int(2)
-
-        # Build clip planes from the face's edges
-        planes_n = ClipPoly()
-        planes_d = ClipPoly()
-        num_planes = int(0)
-        planes_n, planes_d, num_planes = make_clip_planes(face, axis, planes_n, planes_d, num_planes)
-
-        # Clip the edge against the face's planes
-        for pi in range(CLIP_MAX_POINTS):
-            if pi >= num_planes:
-                continue
-            pn = wp.vec3(planes_n[pi][0], planes_n[pi][1], planes_n[pi][2])
-            pd = planes_d[pi][0]
-            poly, num_pts = clip_poly_against_plane(poly, num_pts, pn, pd)
-
-        return poly, num_pts
-
-    @wp.func
-    def clip_face_face(
-        face_a: ContactFaceResult,
-        face_b: ContactFaceResult,
-        axis: wp.vec3,
-    ) -> tuple[ClipPoly, int]:
-        """Clip contact faces following PhysX FaceClipper pattern.
-
-        Builds clip planes from edges of BOTH faces (extending along the
-        separating axis), creates a large initial quad perpendicular to the
-        axis, and clips it against all planes.
-        """
-        # Build clip planes from both faces
-        planes_n = ClipPoly()
-        planes_d = ClipPoly()
-        num_planes = int(0)
-
-        planes_n, planes_d, num_planes = make_clip_planes(face_a, axis, planes_n, planes_d, num_planes)
-        planes_n, planes_d, num_planes = make_clip_planes(face_b, axis, planes_n, planes_d, num_planes)
-
-        if num_planes == 0:
-            poly = ClipPoly()
-            return poly, int(0)
-
-        # Create initial quad: large rectangle perpendicular to axis,
-        # centered at midpoint of the two faces
-        mid_a = face_a.p0
-        if face_a.count >= 2:
-            mid_a = mid_a + face_a.p1
-        if face_a.count >= 3:
-            mid_a = mid_a + face_a.p2
-        if face_a.count >= 4:
-            mid_a = mid_a + face_a.p3
-        mid_a = mid_a / float(face_a.count)
-
-        mid_b = face_b.p0
-        if face_b.count >= 2:
-            mid_b = mid_b + face_b.p1
-        if face_b.count >= 3:
-            mid_b = mid_b + face_b.p2
-        if face_b.count >= 4:
-            mid_b = mid_b + face_b.p3
-        mid_b = mid_b / float(face_b.count)
-
-        center = (mid_a + mid_b) * 0.5
-
-        # Build two orthogonal vectors in the plane perpendicular to axis
-        u = wp.cross(axis, wp.vec3(0.0, 0.0, 1.0))
-        if wp.length(u) < 1.0e-6:
-            u = wp.cross(axis, wp.vec3(0.0, 1.0, 0.0))
-        u = wp.normalize(u)
-        v = wp.cross(axis, u)
-
-        # Large quad (10x shape extent should be enough)
-        extent = 10.0
-        poly = ClipPoly()
-        poly[0] = center - u * extent - v * extent
-        poly[1] = center + u * extent - v * extent
-        poly[2] = center + u * extent + v * extent
-        poly[3] = center - u * extent + v * extent
-        num_pts = int(4)
-
-        # Clip against all planes
-        for pi in range(CLIP_MAX_POINTS):
-            if pi >= num_planes:
-                continue
-            pn = wp.vec3(planes_n[pi][0], planes_n[pi][1], planes_n[pi][2])
-            pd = planes_d[pi][0]
-            poly, num_pts = clip_poly_against_plane(poly, num_pts, pn, pd)
-
-        return poly, num_pts
-
-    # -- Polygon reduction -----------------------------------------------
-
-    @wp.func
-    def reduce_polygon(
-        poly: ClipPoly,
-        num_pts: int,
-        normal: wp.vec3,
-        ref_offset: float,
-    ) -> tuple[ClipPoly, int]:
-        """Reduce a polygon to at most 4 points (deepest first)."""
-        if num_pts <= 4:
-            return poly, num_pts
-
-        best_depth = float(-1.0e30)
-        idx0 = int(0)
-        for i in range(CLIP_MAX_POINTS):
-            if i >= num_pts:
-                break
-            pi = wp.vec3(poly[i][0], poly[i][1], poly[i][2])
-            d = ref_offset - wp.dot(normal, pi)
-            if d > best_depth:
-                best_depth = d
-                idx0 = i
-
-        p0 = wp.vec3(poly[idx0][0], poly[idx0][1], poly[idx0][2])
-
-        best_dist = float(-1.0)
-        idx1 = int(0)
-        for i in range(CLIP_MAX_POINTS):
-            if i >= num_pts:
-                break
-            if i == idx0:
-                continue
-            pi = wp.vec3(poly[i][0], poly[i][1], poly[i][2])
-            d = wp.length_sq(pi - p0)
-            if d > best_dist:
-                best_dist = d
-                idx1 = i
-
-        p1 = wp.vec3(poly[idx1][0], poly[idx1][1], poly[idx1][2])
-
-        line = p1 - p0
-        perp = wp.cross(normal, line)
-
-        best_pos = float(-1.0e30)
-        best_neg = float(1.0e30)
-        idx2 = int(-1)
-        idx3 = int(-1)
-
-        for k in range(CLIP_MAX_POINTS):
-            if k >= num_pts:
-                break
-            if k == idx0 or k == idx1:
-                continue
-            pk = wp.vec3(poly[k][0], poly[k][1], poly[k][2])
-            d = wp.dot(pk - p0, perp)
-            if d > best_pos:
-                best_pos = d
-                idx2 = k
-            if d < best_neg:
-                best_neg = d
-                idx3 = k
-
-        out = ClipPoly()
-        out_count = int(2)
-        out[0] = p0
-        out[1] = p1
-        if idx2 >= 0:
-            out[out_count] = wp.vec3(poly[idx2][0], poly[idx2][1], poly[idx2][2])
-            out_count = out_count + 1
-        if idx3 >= 0 and idx3 != idx2:
-            out[out_count] = wp.vec3(poly[idx3][0], poly[idx3][1], poly[idx3][2])
-            out_count = out_count + 1
-
-        return out, out_count
-
-    # -- Full contact generation -----------------------------------------
-
-    @wp.func
-    def generate_contacts(shape_a: ShapeData, shape_b: ShapeData) -> ContactResult:
-        """Generate contact patch between two shapes (runs GJK/EPA internally)."""
-        gjk_result = gjk_epa(shape_a, shape_b)
-        if gjk_result.distance >= 0.0:
-            result = ContactResult()
-            result.count = 0
-            return result
-        return generate_contacts_from_gjk(shape_a, shape_b, gjk_result)
-
-    @wp.func
-    def generate_contacts_from_gjk(shape_a: ShapeData, shape_b: ShapeData, gjk_result: GJKResult) -> ContactResult:
-        """Generate contact patch from a pre-computed GJK/EPA result.
-
-        Following PhysX GuConvexSupport: clip face polygons, then project
-        each clipped point onto both face planes along the separating axis
-        to compute per-point depth and midpoint contact position.
+        PhysX FaceClipper pattern: clipNone / clip2x2 / clipNxN.
+        All paths produce (midpoint, depth) via face plane projection.
+        ClipPoly stores (x, y, z, depth) per point.
         """
         result = ContactResult()
         result.count = 0
-
-        axis = gjk_result.normal  # separating axis A→B
+        axis = gjk_result.normal
         result.normal = axis
 
         face_a = contact_face_world(shape_a, axis, gjk_result.point_a)
         face_b = contact_face_world(shape_b, -axis, gjk_result.point_b)
 
-        # Dispatch clipping strategy (PhysX pattern):
-        # 0 points on either face → single GJK/EPA point (vertex contact)
-        # 2 + 2 → edge-edge special case (clip_edge_edge)
-        # Otherwise → general polygon clipping (clip_face_face)
-        if face_a.count < 2 or face_b.count < 2:
-            mid = (gjk_result.point_a + gjk_result.point_b) * 0.5
-            result.p0 = mid
-            result.d0 = gjk_result.distance
-            result.count = 1
-            return result
-
-        if face_a.count == 2 and face_b.count == 2:
-            clipped, num_clipped = clip_edge_edge(face_a, face_b, axis)
-        elif face_a.count == 2:
-            # Edge A clipped against face B's planes
-            clipped, num_clipped = clip_edge_face(face_a, face_b, axis)
-        elif face_b.count == 2:
-            # Edge B clipped against face A's planes
-            clipped, num_clipped = clip_edge_face(face_b, face_a, axis)
-        else:
-            clipped, num_clipped = clip_face_face(face_a, face_b, axis)
-
-        if num_clipped == 0:
-            mid = (gjk_result.point_a + gjk_result.point_b) * 0.5
-            result.p0 = mid
-            result.d0 = gjk_result.distance
-            result.count = 1
-            return result
-
-        # Face plane equations for projection:
-        # plane_a: dot(face_a.normal, x) = dot(face_a.normal, face_a.p0)
-        # plane_b: dot(face_b.normal, x) = dot(face_b.normal, face_b.p0)
         na = face_a.normal
         nb = face_b.normal
-        da = wp.dot(na, face_a.p0)
-        db = wp.dot(nb, face_b.p0)
-        # Denominators for ray-plane intersection along axis
+        da_val = wp.dot(na, face_a.p0)
+        db_val = wp.dot(nb, face_b.p0)
         denom_a = wp.dot(na, axis)
         denom_b = wp.dot(nb, axis)
         if wp.abs(denom_a) < 1.0e-10:
@@ -1189,44 +878,251 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
         if wp.abs(denom_b) < 1.0e-10:
             denom_b = 1.0e-10
 
-        # Compute ref_offset from face_a plane for reduce_polygon
-        ref_offset = wp.dot(gjk_result.point_a, axis)
+        poly = ClipPoly()
+        num_pts = int(0)
 
-        clipped, num_clipped = reduce_polygon(clipped, num_clipped, axis, ref_offset)
+        # === clipNone ===
+        if face_a.count < 2 or face_b.count < 2:
+            mid = (gjk_result.point_a + gjk_result.point_b) * 0.5
+            result.p0 = mid
+            result.d0 = gjk_result.distance
+            result.count = 1
+            return result
 
+        # === clip2x2 (edge-edge) ===
+        if face_a.count == 2 and face_b.count == 2:
+            a0 = face_a.p0
+            a1 = face_a.p1
+            b0 = face_b.p0
+            b1 = face_b.p1
+            seg_ab = a1 - a0
+            seg_cd = b1 - b0
+            len_ab_sq = wp.dot(seg_ab, seg_ab)
+            len_cd_sq = wp.dot(seg_cd, seg_cd)
+            eps = 1.0e-5
+            # Project each endpoint onto the other segment
+            t_val = wp.dot(b0 - a0, seg_ab)
+            if t_val > -eps * len_ab_sq and t_val < len_ab_sq * (1.0 + eps) and len_ab_sq > eps:
+                proj = a0 + seg_ab * (t_val / len_ab_sq)
+                mid = (b0 + proj) * 0.5
+                d = wp.dot(axis, proj - b0)
+                poly[num_pts] = wp.vec4(mid[0], mid[1], mid[2], d)
+                num_pts = num_pts + 1
+            t_val = wp.dot(b1 - a0, seg_ab)
+            if t_val > -eps * len_ab_sq and t_val < len_ab_sq * (1.0 + eps) and len_ab_sq > eps:
+                proj = a0 + seg_ab * (t_val / len_ab_sq)
+                mid = (b1 + proj) * 0.5
+                d = wp.dot(axis, proj - b1)
+                poly[num_pts] = wp.vec4(mid[0], mid[1], mid[2], d)
+                num_pts = num_pts + 1
+            t_val = wp.dot(a0 - b0, seg_cd)
+            if t_val > -eps * len_cd_sq and t_val < len_cd_sq * (1.0 + eps) and len_cd_sq > eps:
+                proj = b0 + seg_cd * (t_val / len_cd_sq)
+                mid = (a0 + proj) * 0.5
+                d = wp.dot(axis, proj - a0)
+                is_dup = int(0)
+                for di_idx in range(CLIP_MAX_POINTS):
+                    if di_idx >= num_pts:
+                        continue
+                    pv = wp.vec3(poly[di_idx][0], poly[di_idx][1], poly[di_idx][2])
+                    if wp.length_sq(mid - pv) < eps:
+                        is_dup = int(1)
+                if is_dup == 0:
+                    poly[num_pts] = wp.vec4(mid[0], mid[1], mid[2], d)
+                    num_pts = num_pts + 1
+            t_val = wp.dot(a1 - b0, seg_cd)
+            if t_val > -eps * len_cd_sq and t_val < len_cd_sq * (1.0 + eps) and len_cd_sq > eps:
+                proj = b0 + seg_cd * (t_val / len_cd_sq)
+                mid = (a1 + proj) * 0.5
+                d = wp.dot(axis, proj - a1)
+                is_dup = int(0)
+                for di_idx in range(CLIP_MAX_POINTS):
+                    if di_idx >= num_pts:
+                        continue
+                    pv = wp.vec3(poly[di_idx][0], poly[di_idx][1], poly[di_idx][2])
+                    if wp.length_sq(mid - pv) < eps:
+                        is_dup = int(1)
+                if is_dup == 0:
+                    poly[num_pts] = wp.vec4(mid[0], mid[1], mid[2], d)
+                    num_pts = num_pts + 1
+        else:
+            # === clipNxN (2xN, Nx2, NxN) ===
+            planes = ClipPlanes()
+            num_planes = int(0)
+            planes, num_planes = make_face_clip_planes(face_a, axis, planes, num_planes)
+            planes, num_planes = make_face_clip_planes(face_b, axis, planes, num_planes)
+
+            # Initial polygon
+            if face_a.count == 2:
+                poly[0] = wp.vec4(face_a.p0[0], face_a.p0[1], face_a.p0[2], 0.0)
+                poly[1] = wp.vec4(face_a.p1[0], face_a.p1[1], face_a.p1[2], 0.0)
+                num_pts = int(2)
+            elif face_b.count == 2:
+                poly[0] = wp.vec4(face_b.p0[0], face_b.p0[1], face_b.p0[2], 0.0)
+                poly[1] = wp.vec4(face_b.p1[0], face_b.p1[1], face_b.p1[2], 0.0)
+                num_pts = int(2)
+            else:
+                # Bounding quad (PhysX makePolygon)
+                u = wp.cross(axis, wp.vec3(0.0, 0.0, 1.0))
+                if wp.length(u) < 1.0e-6:
+                    u = wp.cross(axis, wp.vec3(0.0, 1.0, 0.0))
+                u = wp.normalize(u)
+                v = wp.cross(axis, u)
+                min_u = float(1.0e30)
+                max_u = float(-1.0e30)
+                min_v = float(1.0e30)
+                max_v = float(-1.0e30)
+                for fi in range(4):
+                    if fi < face_a.count:
+                        pa = get_face_point(face_a, fi)
+                        pu = wp.dot(pa, u)
+                        pv_val = wp.dot(pa, v)
+                        min_u = wp.min(min_u, pu)
+                        max_u = wp.max(max_u, pu)
+                        min_v = wp.min(min_v, pv_val)
+                        max_v = wp.max(max_v, pv_val)
+                    if fi < face_b.count:
+                        pb = get_face_point(face_b, fi)
+                        pu = wp.dot(pb, u)
+                        pv_val = wp.dot(pb, v)
+                        min_u = wp.min(min_u, pu)
+                        max_u = wp.max(max_u, pu)
+                        min_v = wp.min(min_v, pv_val)
+                        max_v = wp.max(max_v, pv_val)
+                ref = (gjk_result.point_a + gjk_result.point_b) * 0.5
+                ref_u = wp.dot(ref, u)
+                ref_v = wp.dot(ref, v)
+                c0 = ref + u * (min_u - ref_u) + v * (min_v - ref_v)
+                c1 = ref + u * (max_u - ref_u) + v * (min_v - ref_v)
+                c2 = ref + u * (max_u - ref_u) + v * (max_v - ref_v)
+                c3 = ref + u * (min_u - ref_u) + v * (max_v - ref_v)
+                poly[0] = wp.vec4(c0[0], c0[1], c0[2], 0.0)
+                poly[1] = wp.vec4(c1[0], c1[1], c1[2], 0.0)
+                poly[2] = wp.vec4(c2[0], c2[1], c2[2], 0.0)
+                poly[3] = wp.vec4(c3[0], c3[1], c3[2], 0.0)
+                num_pts = int(4)
+
+            # Clip
+            for pl_i in range(CLIP_MAX_POINTS):
+                if pl_i >= num_planes:
+                    continue
+                pn = wp.vec3(planes[pl_i][0], planes[pl_i][1], planes[pl_i][2])
+                pd = planes[pl_i][3]
+                poly, num_pts = clip_poly_against_plane(poly, num_pts, pn, pd)
+
+            # Project onto face planes → midpoint + depth
+            for ci in range(CLIP_MAX_POINTS):
+                if ci >= num_pts:
+                    continue
+                pt = wp.vec3(poly[ci][0], poly[ci][1], poly[ci][2])
+                t_a = (da_val - wp.dot(na, pt)) / denom_a
+                t_b = (db_val - wp.dot(nb, pt)) / denom_b
+                p_on_a = pt + axis * t_a
+                p_on_b = pt + axis * t_b
+                mid = (p_on_a + p_on_b) * 0.5
+                depth = wp.dot(axis, p_on_b - p_on_a)
+                poly[ci] = wp.vec4(mid[0], mid[1], mid[2], depth)
+
+        # Fallback
+        if num_pts == 0:
+            mid = (gjk_result.point_a + gjk_result.point_b) * 0.5
+            result.p0 = mid
+            result.d0 = gjk_result.distance
+            result.count = 1
+            return result
+
+        # Reduce to 4 (deepest first, then largest quad)
+        if num_pts > 4:
+            best_w = float(1.0e30)
+            idx0 = int(0)
+            for i in range(CLIP_MAX_POINTS):
+                if i >= num_pts:
+                    continue
+                if poly[i][3] < best_w:
+                    best_w = poly[i][3]
+                    idx0 = i
+            p0 = wp.vec3(poly[idx0][0], poly[idx0][1], poly[idx0][2])
+            best_dist = float(-1.0)
+            idx1 = int(0)
+            for i in range(CLIP_MAX_POINTS):
+                if i >= num_pts:
+                    continue
+                if i == idx0:
+                    continue
+                pi = wp.vec3(poly[i][0], poly[i][1], poly[i][2])
+                dd = wp.length_sq(pi - p0)
+                if dd > best_dist:
+                    best_dist = dd
+                    idx1 = i
+            p1 = wp.vec3(poly[idx1][0], poly[idx1][1], poly[idx1][2])
+            perp = wp.cross(axis, p1 - p0)
+            best_pos = float(-1.0e30)
+            best_neg = float(1.0e30)
+            idx2 = int(-1)
+            idx3 = int(-1)
+            for k in range(CLIP_MAX_POINTS):
+                if k >= num_pts:
+                    continue
+                if k == idx0 or k == idx1:
+                    continue
+                pk = wp.vec3(poly[k][0], poly[k][1], poly[k][2])
+                dd = wp.dot(pk - p0, perp)
+                if dd > best_pos:
+                    best_pos = dd
+                    idx2 = k
+                if dd < best_neg:
+                    best_neg = dd
+                    idx3 = k
+            out = ClipPoly()
+            out[0] = poly[idx0]
+            out[1] = poly[idx1]
+            out_count = int(2)
+            if idx2 >= 0:
+                out[out_count] = poly[idx2]
+                out_count = out_count + 1
+            if idx3 >= 0 and idx3 != idx2:
+                out[out_count] = poly[idx3]
+                out_count = out_count + 1
+            poly = out
+            num_pts = out_count
+
+        # Store in ContactResult
         count = int(0)
         for ci in range(CLIP_MAX_POINTS):
-            if ci >= num_clipped:
+            if ci >= num_pts:
                 break
             if count >= 4:
                 break
-            pt = wp.vec3(clipped[ci][0], clipped[ci][1], clipped[ci][2])
-
-            # Project pt onto both face planes along axis (PhysX pattern)
-            t_a = (da - wp.dot(na, pt)) / denom_a
-            t_b = (db - wp.dot(nb, pt)) / denom_b
-            p_on_a = pt + axis * t_a  # projection onto face_a plane
-            p_on_b = pt + axis * t_b  # projection onto face_b plane
-
-            # Contact = midpoint, depth = signed distance between projections
-            contact_pt = (p_on_a + p_on_b) * 0.5
-            pt_depth = wp.dot(axis, p_on_b - p_on_a)  # negative = penetrating
             if count == 0:
-                result.p0 = contact_pt
-                result.d0 = pt_depth
+                result.p0 = wp.vec3(poly[ci][0], poly[ci][1], poly[ci][2])
+                result.d0 = poly[ci][3]
             elif count == 1:
-                result.p1 = contact_pt
-                result.d1 = pt_depth
+                result.p1 = wp.vec3(poly[ci][0], poly[ci][1], poly[ci][2])
+                result.d1 = poly[ci][3]
             elif count == 2:
-                result.p2 = contact_pt
-                result.d2 = pt_depth
+                result.p2 = wp.vec3(poly[ci][0], poly[ci][1], poly[ci][2])
+                result.d2 = poly[ci][3]
             elif count == 3:
-                result.p3 = contact_pt
-                result.d3 = pt_depth
+                result.p3 = wp.vec3(poly[ci][0], poly[ci][1], poly[ci][2])
+                result.d3 = poly[ci][3]
             count = count + 1
-
         result.count = count
         return result
+
+    @wp.func
+    def generate_contacts(shape_a: ShapeData, shape_b: ShapeData) -> ContactResult:
+        """Generate contact patch (runs GJK/EPA internally)."""
+        gjk_result = gjk_epa(shape_a, shape_b)
+        if gjk_result.distance >= 0.0:
+            result = ContactResult()
+            result.count = 0
+            return result
+        return generate_contact_patch(shape_a, shape_b, gjk_result)
+
+    @wp.func
+    def generate_contacts_from_gjk(shape_a: ShapeData, shape_b: ShapeData, gjk_result: GJKResult) -> ContactResult:
+        """Backward-compat wrapper."""
+        return generate_contact_patch(shape_a, shape_b, gjk_result)
 
     # -- Kernels --------------------------------------------------------
 

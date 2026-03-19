@@ -30,8 +30,9 @@ EPA_MAX_FACES = 64
 EPA_MAX_VERTS = 32
 EPA_EPSILON = 1.0e-4
 
-# Maximum intermediate polygon size during Sutherland-Hodgman clipping
-CLIP_MAX_POINTS = 8
+# Maximum intermediate polygon size during Sutherland-Hodgman clipping.
+# Starting polygon (4 pts) clipped by up to 8 planes can produce up to 12 vertices.
+CLIP_MAX_POINTS = 16
 
 # ---------------------------------------------------------------------------
 # Fixed-size matrix types
@@ -43,8 +44,11 @@ EPAVertsA = wp.types.matrix(shape=(EPA_MAX_VERTS, 3), dtype=wp.float32)
 EPAVertsB = wp.types.matrix(shape=(EPA_MAX_VERTS, 3), dtype=wp.float32)
 EPAFaces = wp.types.matrix(shape=(EPA_MAX_FACES, 3), dtype=wp.float32)
 
-# Clipped polygon storage
-ClipPoly = wp.types.matrix(shape=(CLIP_MAX_POINTS, 3), dtype=wp.float32)
+# Clipped polygon storage: (x, y, z, depth) per point
+ClipPoly = wp.types.matrix(shape=(CLIP_MAX_POINTS, 4), dtype=wp.float32)
+
+# Clip planes: (nx, ny, nz, d) per plane
+ClipPlanes = wp.types.matrix(shape=(CLIP_MAX_POINTS, 4), dtype=wp.float32)
 
 
 # ---------------------------------------------------------------------------

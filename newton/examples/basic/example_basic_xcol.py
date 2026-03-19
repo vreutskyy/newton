@@ -78,8 +78,6 @@ def _convert_contacts(
     out_offset0: wp.array(dtype=wp.vec3),
     out_offset1: wp.array(dtype=wp.vec3),
     out_normal: wp.array(dtype=wp.vec3),
-    out_margin0: wp.array(dtype=float),
-    out_margin1: wp.array(dtype=float),
 ):
     i = wp.tid()
     if i >= xcol_count[0]:
@@ -124,9 +122,6 @@ def _convert_contacts(
     out_offset0[idx] = wp.vec3(0.0, 0.0, 0.0)
     out_offset1[idx] = wp.vec3(0.0, 0.0, 0.0)
     out_normal[idx] = normal
-
-    out_margin0[idx] = 0.0
-    out_margin1[idx] = 0.0
 
 
 # -----------------------------------------------------------------------
@@ -228,8 +223,6 @@ class XColPipeline:
                 contacts.rigid_contact_offset0,
                 contacts.rigid_contact_offset1,
                 contacts.rigid_contact_normal,
-                contacts.rigid_contact_margin0,
-                contacts.rigid_contact_margin1,
             ],
         )
 
