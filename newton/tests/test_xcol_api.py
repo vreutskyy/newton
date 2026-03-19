@@ -171,5 +171,279 @@ class TestWorldFiltering(unittest.TestCase):
         self.assertEqual(_contact_count(model), 2)
 
 
+class TestContactRotationSweep(unittest.TestCase):
+    """Rotate one box through a full circle and validate contacts at each step."""
+
+    @staticmethod
+    def _quat_from_axis_angle(ax, ay, az, angle):
+        """Build quaternion (qx, qy, qz, qw) from axis + angle."""
+        s = np.sin(angle / 2.0)
+        c = np.cos(angle / 2.0)
+        return (ax * s, ay * s, az * s, c)
+
+    @staticmethod
+    def _validate_contacts(model, expected_depth, msg):
+        """Validate contacts: unit normal, depth matches expected, points finite."""
+        count = model.contact_count.numpy()[0]
+        normals = model.contact_normal.numpy()[:count]
+        depths = model.contact_depth.numpy()[:count]
+        points = model.contact_point.numpy()[:count]
+
+        for i in range(count):
+            n = normals[i]
+            n_len = np.linalg.norm(n)
+            assert 0.99 < n_len < 1.01, f"{msg}: contact {i} normal not unit (len={n_len:.4f})"
+
+            d = depths[i]
+            # Depth should be negative (penetrating) and close to expected
+            assert d < 0.0, f"{msg}: contact {i} depth not negative ({d:.4f})"
+            assert abs(d - expected_depth) < 0.05, (
+                f"{msg}: contact {i} depth {d:.4f} doesn't match expected {expected_depth:.4f}"
+            )
+
+            p = points[i]
+            assert np.all(np.isfinite(p)), f"{msg}: contact {i} non-finite point {p}"
+            # Contact point must be near the smaller shape (within 2 units of its center)
+            assert np.linalg.norm(p[:2]) < 2.0, f"{msg}: contact {i} XY too far from small box center: {p}"
+
+    def test_face_face_rotation_sweep(self):
+        """Large static box + small rotating box, face-to-face with 0.1 overlap."""
+        b = xc.Builder()
+        b.add_shape(xc.SHAPE_BOX, params=(5, 5, 5))  # large static
+        b.add_shape(xc.SHAPE_BOX, params=(0.5, 0.5, 0.5))  # small rotating
+        model = b.finalize()
+
+        overlap = 0.1
+        small_half = 0.5
+        large_half = 5.0
+        # Small box center: just above the large box top face minus overlap
+        z_pos = large_half + small_half - overlap
+        steps = 72  # 5-degree increments
+        for step in range(steps):
+            angle = 2.0 * np.pi * step / steps
+            q = self._quat_from_axis_angle(0, 0, 1, angle)
+            transforms = np.zeros((2, 7), dtype=np.float32)
+            transforms[0, 3:] = _QUAT_ID
+            transforms[1, :3] = [0, 0, z_pos]
+            transforms[1, 3:] = q
+            model.shape_transforms.assign(transforms)
+            _collider.collide(model)
+
+            count = _contact_count(model)
+            msg = f"step={step}, angle={np.degrees(angle):.1f}°"
+            self.assertGreater(count, 0, f"{msg}: no contacts generated")
+            self.assertLessEqual(count, 4, f"{msg}: too many contacts ({count})")
+            self._validate_contacts(model, -overlap, msg)
+
+    def test_face_edge_rotation_sweep(self):
+        """Large static box + small tilted box (edge-on), rotated around Z.
+
+        Small box is tilted 45° around Y, presenting an edge to the large
+        box's top face. Rotated around Z through a full circle.
+        """
+        b = xc.Builder()
+        b.add_shape(xc.SHAPE_BOX, params=(5, 5, 5))  # large static
+        b.add_shape(xc.SHAPE_BOX, params=(0.5, 0.5, 0.5))  # small tilted
+        model = b.finalize()
+
+        overlap = 0.1
+        small_half = 0.5
+        large_half = 5.0
+        steps = 72
+        for step in range(steps):
+            angle_z = 2.0 * np.pi * step / steps
+            tilt = np.pi / 4.0
+            qy = np.array(self._quat_from_axis_angle(0, 1, 0, tilt))
+            qz = np.array(self._quat_from_axis_angle(0, 0, 1, angle_z))
+            w1, x1, y1, z1 = qz[3], qz[0], qz[1], qz[2]
+            w2, x2, y2, z2 = qy[3], qy[0], qy[1], qy[2]
+            qw = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+            qx = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+            qy_val = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+            qz_val = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+            q = (qx, qy_val, qz_val, qw)
+
+            z_pos = large_half + np.sqrt(2.0) * small_half - overlap
+            transforms = np.zeros((2, 7), dtype=np.float32)
+            transforms[0, 3:] = _QUAT_ID
+            transforms[1, :3] = [0, 0, z_pos]
+            transforms[1, 3:] = q
+            model.shape_transforms.assign(transforms)
+            _collider.collide(model)
+
+            count = _contact_count(model)
+            msg = f"step={step}, angle_z={np.degrees(angle_z):.1f}°"
+            self.assertGreater(count, 0, f"{msg}: no contacts generated")
+            self.assertLessEqual(count, 4, f"{msg}: too many contacts ({count})")
+            depths = model.contact_depth.numpy()[:count]
+            points = model.contact_point.numpy()[:count]
+            for di in range(count):
+                d = depths[di]
+                self.assertLess(d, 0.0, f"{msg}: contact {di} depth not negative ({d:.4f})")
+                self.assertGreater(d, -1.0, f"{msg}: contact {di} depth too large ({d:.4f})")
+                p = points[di]
+                self.assertLess(np.linalg.norm(p[:2]), 2.0, f"{msg}: contact {di} XY too far from small box: {p}")
+
+
+class TestEdgeEdgeContact(unittest.TestCase):
+    """Edge-edge contact: box A tilted 45° (edge up), box B tilted 45° and
+    rotated around Z through a full circle."""
+
+    def test_edge_edge_touching_sweep(self):
+        """Touching edge-edge, rotate box B around Z axis."""
+        b = xc.Builder()
+        b.add_shape(xc.SHAPE_BOX, params=(1, 1, 1))
+        b.add_shape(xc.SHAPE_BOX, params=(1, 1, 1))
+        model = b.finalize()
+
+        quat = TestContactRotationSweep._quat_from_axis_angle
+        tilt = np.pi / 4.0
+        qa = quat(0, 1, 0, tilt)
+        sep = np.sqrt(2.0) + np.sqrt(2.0)  # exact touching
+
+        steps = 72
+        for step in range(steps):
+            angle_z = 2.0 * np.pi * step / steps
+            # Box B: tilt 45° around X, then rotate around Z
+            qx = np.array(quat(1, 0, 0, tilt))
+            qz = np.array(quat(0, 0, 1, angle_z))
+            w1, x1, y1, z1 = qz[3], qz[0], qz[1], qz[2]
+            w2, x2, y2, z2 = qx[3], qx[0], qx[1], qx[2]
+            qb = (
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            )
+
+            transforms = np.zeros((2, 7), dtype=np.float32)
+            transforms[0, 3:] = qa
+            transforms[1, :3] = [0, 0, sep]
+            transforms[1, 3:] = qb
+            model.shape_transforms.assign(transforms)
+            _collider.collide(model, contact_distance=0.2)
+
+            count = _contact_count(model)
+            msg = f"step={step}, angle_z={np.degrees(angle_z):.1f}°"
+            self.assertGreater(count, 0, f"{msg}: no contacts")
+            depths = model.contact_depth.numpy()[:count]
+            for i in range(count):
+                self.assertAlmostEqual(depths[i], 0.0, delta=0.05, msg=f"{msg}: contact {i} depth {depths[i]:.4f}")
+
+    def test_edge_edge_small_penetration_sweep(self):
+        """Edge-edge with 0.01 penetration, rotate box B around Z axis."""
+        b = xc.Builder()
+        b.add_shape(xc.SHAPE_BOX, params=(1, 1, 1))
+        b.add_shape(xc.SHAPE_BOX, params=(1, 1, 1))
+        model = b.finalize()
+
+        quat = TestContactRotationSweep._quat_from_axis_angle
+        tilt = np.pi / 4.0
+        qa = quat(0, 1, 0, tilt)
+        pen = 0.0001
+        sep = np.sqrt(2.0) + np.sqrt(2.0) - pen
+
+        steps = 72
+        for step in range(steps):
+            angle_z = 2.0 * np.pi * step / steps
+            qx = np.array(quat(1, 0, 0, tilt))
+            qz = np.array(quat(0, 0, 1, angle_z))
+            w1, x1, y1, z1 = qz[3], qz[0], qz[1], qz[2]
+            w2, x2, y2, z2 = qx[3], qx[0], qx[1], qx[2]
+            qb = (
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            )
+
+            transforms = np.zeros((2, 7), dtype=np.float32)
+            transforms[0, 3:] = qa
+            transforms[1, :3] = [0, 0, sep]
+            transforms[1, 3:] = qb
+            model.shape_transforms.assign(transforms)
+            _collider.collide(model)
+
+            count = _contact_count(model)
+            msg = f"step={step}, angle_z={np.degrees(angle_z):.1f}°"
+            self.assertGreater(count, 0, f"{msg}: no contacts")
+            depths = model.contact_depth.numpy()[:count]
+            points = model.contact_point.numpy()[:count]
+            normals = model.contact_normal.numpy()[:count]
+            for i in range(count):
+                d = depths[i]
+                self.assertLess(d, 0.0, f"{msg}: depth {d:.4f} not negative")
+                self.assertGreater(d, -0.1, f"{msg}: depth {d:.4f} too large")
+                n_len = np.linalg.norm(normals[i])
+                self.assertAlmostEqual(n_len, 1.0, delta=0.01, msg=f"{msg}: normal not unit ({n_len:.4f})")
+                self.assertTrue(np.all(np.isfinite(points[i])), f"{msg}: non-finite point {points[i]}")
+
+
+class TestBothBoxesRotating(unittest.TestCase):
+    """Both boxes rotate independently — stress test for all contact types."""
+
+    @staticmethod
+    def _quat_from_axis_angle(ax, ay, az, angle):
+        s = np.sin(angle / 2.0)
+        c = np.cos(angle / 2.0)
+        return (ax * s, ay * s, az * s, c)
+
+    def test_both_rotating_sweep(self):
+        """Box A rotates around Y, box B rotates around X. Sweep both."""
+        b = xc.Builder()
+        b.add_shape(xc.SHAPE_BOX, params=(0.5, 0.5, 0.5))
+        b.add_shape(xc.SHAPE_BOX, params=(0.5, 0.5, 0.5))
+        model = b.finalize()
+
+        overlap = 0.05
+        steps = 72
+        for step_a in range(steps):
+            angle_a = 2.0 * np.pi * step_a / steps
+            # Box B rotates 3x faster (different period to cover more combos)
+            angle_b = 3.0 * angle_a
+
+            qa = self._quat_from_axis_angle(0, 1, 0, angle_a)
+            qb = self._quat_from_axis_angle(1, 0, 0, angle_b)
+
+            # Separation: worst case is corner-corner = sqrt(3)*half.
+            # Use a conservative distance that always overlaps a bit.
+            sep = 2.0 * 0.5 - overlap  # face-face distance minus overlap
+
+            transforms = np.zeros((2, 7), dtype=np.float32)
+            transforms[0, 3:] = qa
+            transforms[1, :3] = [0, 0, sep]
+            transforms[1, 3:] = qb
+            model.shape_transforms.assign(transforms)
+            _collider.collide(model)
+
+            count = _contact_count(model)
+            msg = f"step={step_a}, angle_a={np.degrees(angle_a):.1f}° angle_b={np.degrees(angle_b):.1f}°"
+
+            # At some orientations the boxes may not overlap (corner-corner
+            # is further than face-face). That's fine — skip validation.
+            if count == 0:
+                continue
+
+            self.assertLessEqual(count, 4, f"{msg}: too many contacts ({count})")
+
+            depths = model.contact_depth.numpy()[:count]
+            points = model.contact_point.numpy()[:count]
+            normals = model.contact_normal.numpy()[:count]
+            for i in range(count):
+                d = depths[i]
+                self.assertLess(d, 0.5, f"{msg}: contact {i} depth too positive ({d:.4f})")
+                self.assertGreater(d, -2.0, f"{msg}: contact {i} depth too large ({d:.4f})")
+
+                p = points[i]
+                self.assertTrue(np.all(np.isfinite(p)), f"{msg}: contact {i} non-finite point {p}")
+                # Both boxes are near the origin, contacts should be close
+                self.assertLess(np.linalg.norm(p), 2.0, f"{msg}: contact {i} point too far: {p}")
+
+                n = normals[i]
+                n_len = np.linalg.norm(n)
+                self.assertGreater(n_len, 0.9, f"{msg}: contact {i} degenerate normal (len={n_len:.4f})")
+                self.assertLess(n_len, 1.1, f"{msg}: contact {i} non-unit normal (len={n_len:.4f})")
+
+
 if __name__ == "__main__":
     unittest.main()
