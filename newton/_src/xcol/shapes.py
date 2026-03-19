@@ -172,8 +172,8 @@ def _contact_face_box(params: wp.vec3, direction: wp.vec3) -> ContactFaceResult:
     az = wp.abs(direction[2])
     result = ContactFaceResult()
 
-    dEps = 0.99  # face threshold (~8°)
-    eEps = 0.01  # edge threshold: one component is near zero
+    dEps1 = 0.99  # ~cos(8°): face threshold
+    dEps2 = 0.14  # ~cos(82°): edge threshold (component near zero → edge along that axis)
 
     sx = 1.0
     if direction[0] < 0.0:
@@ -190,7 +190,7 @@ def _contact_face_box(params: wp.vec3, direction: wp.vec3) -> ContactFaceResult:
     # Edge: one component is near zero (< eEps), other two are significant
     # Vertex: all three are significant (no component near 0 or near 1)
 
-    if ax > dEps:
+    if ax > dEps1:
         # X face
         result.normal = wp.vec3(sx, 0.0, 0.0)
         result.p0 = wp.vec3(sx * hx, -hy, -hz)
@@ -198,7 +198,7 @@ def _contact_face_box(params: wp.vec3, direction: wp.vec3) -> ContactFaceResult:
         result.p2 = wp.vec3(sx * hx, hy, hz)
         result.p3 = wp.vec3(sx * hx, -hy, hz)
         result.count = 4
-    elif ay > dEps:
+    elif ay > dEps1:
         # Y face
         result.normal = wp.vec3(0.0, sy, 0.0)
         result.p0 = wp.vec3(-hx, sy * hy, -hz)
@@ -206,7 +206,7 @@ def _contact_face_box(params: wp.vec3, direction: wp.vec3) -> ContactFaceResult:
         result.p2 = wp.vec3(hx, sy * hy, hz)
         result.p3 = wp.vec3(-hx, sy * hy, hz)
         result.count = 4
-    elif az > dEps:
+    elif az > dEps1:
         # Z face
         result.normal = wp.vec3(0.0, 0.0, sz)
         result.p0 = wp.vec3(-hx, -hy, sz * hz)
@@ -214,19 +214,19 @@ def _contact_face_box(params: wp.vec3, direction: wp.vec3) -> ContactFaceResult:
         result.p2 = wp.vec3(hx, hy, sz * hz)
         result.p3 = wp.vec3(-hx, hy, sz * hz)
         result.count = 4
-    elif ax < eEps:
+    elif ax < dEps2:
         # Edge parallel to X axis (Y-Z direction)
         result.normal = wp.normalize(wp.vec3(0.0, sy, sz))
         result.p0 = wp.vec3(-hx, sy * hy, sz * hz)
         result.p1 = wp.vec3(hx, sy * hy, sz * hz)
         result.count = 2
-    elif ay < eEps:
+    elif ay < dEps2:
         # Edge parallel to Y axis (X-Z direction)
         result.normal = wp.normalize(wp.vec3(sx, 0.0, sz))
         result.p0 = wp.vec3(sx * hx, -hy, sz * hz)
         result.p1 = wp.vec3(sx * hx, hy, sz * hz)
         result.count = 2
-    elif az < eEps:
+    elif az < dEps2:
         # Edge parallel to Z axis (X-Y direction)
         result.normal = wp.normalize(wp.vec3(sx, sy, 0.0))
         result.p0 = wp.vec3(sx * hx, sy * hy, -hz)
