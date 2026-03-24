@@ -26,24 +26,32 @@ from typing import Any
 
 import warp as wp
 
-from .gjk import closest_segment, closest_triangle
+from .gjk import (
+    closest_segment as gjk_closest_segment,
+)
+from .gjk import (
+    closest_tetrahedron as gjk_closest_tetrahedron,
+)
+from .gjk import (
+    closest_triangle as gjk_closest_triangle,
+)
+from .gjk import (
+    simplex_get_closest,
+)
 from .shapes import ShapeEntry, get_registered_shapes
 from .types import (
     CLIP_MAX_POINTS,
-    EPA_MAX_FACES,
-    EPA_MAX_ITERATIONS,
-    EPA_MAX_VERTS,
+    GJK_COLLIDE_EPSILON,
     GJK_EPSILON,
     GJK_MAX_ITERATIONS,
+    MPR_COLLIDE_EPSILON,
+    MPR_MAX_ITERATIONS,
     ClipPlanes,
     ClipPoly,
     ContactFaceResult,
     ContactResult,
-    EPAFaces,
-    EPAVerts,
-    EPAVertsA,
-    EPAVertsB,
     GJKResult,
+    Mat83f,
     ShapeData,
 )
 
@@ -131,610 +139,473 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
         return shape.pos, shape.pos
 
     # ===================================================================
-    # GJK distance (PhysX RefGjkEpa pattern)
+    # GJK distance (Jitter Physics 2 / Newton pattern)
     # ===================================================================
+
+    @wp.func
+    def minkowski_support(shape_a: ShapeData, shape_b: ShapeData, direction: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
+        """Support point on Minkowski difference (A - B) in A-local frame.
+
+        Returns (B_point, BtoA_vector) both in A-local frame.
+        """
+        # Support on A in local frame (A is at origin, no rotation)
+        a_pt = support_local(shape_a.shape_type, shape_a.params, direction)
+        # Support on B in A-local frame
+        local_dir_b = wp.quat_rotate_inv(shape_b.rot, -direction)
+        b_local = support_local(shape_b.shape_type, shape_b.params, local_dir_b)
+        b_pt = wp.quat_rotate(shape_b.rot, b_local) + shape_b.pos
+        return b_pt, a_pt - b_pt
 
     @wp.func
     def gjk_distance(shape_a: ShapeData, shape_b: ShapeData) -> GJKResult:
         """Compute distance between two core shapes using GJK.
 
+        All computation in shape A's local frame (A at origin, unrotated).
+        Shape B is pre-transformed to this frame by the caller.
+
         Returns core-to-core distance (0 if overlapping).
-        Witness points are on core surfaces (before margin adjustment).
+        Witness points are in A-local frame.
         """
         result = GJKResult()
         result.normal = wp.vec3(0.0, 0.0, 1.0)
 
-        # Accuracy threshold scaled to shape size (PhysX pattern)
-        accuracy = wp.max(wp.length(shape_a.params) + shape_a.margin, wp.length(shape_b.params) + shape_b.margin) * 0.01
-        accuracy = wp.max(accuracy, GJK_EPSILON)
-        dist_eps = accuracy * 0.01
+        # Transform shape B into A-local frame
+        inv_rot_a = wp.quat_inverse(shape_a.rot)
+        shape_b_local = ShapeData()
+        shape_b_local.shape_type = shape_b.shape_type
+        shape_b_local.params = shape_b.params
+        shape_b_local.margin = shape_b.margin
+        shape_b_local.pos = wp.quat_rotate(inv_rot_a, shape_b.pos - shape_a.pos)
+        shape_b_local.rot = inv_rot_a * shape_b.rot
 
-        # Simplex vertices (Minkowski diff + individual shape points)
-        w0 = wp.vec3(0.0, 0.0, 0.0)
-        w1 = wp.vec3(0.0, 0.0, 0.0)
-        w2 = wp.vec3(0.0, 0.0, 0.0)
-        w3 = wp.vec3(0.0, 0.0, 0.0)
-        pa0 = wp.vec3(0.0, 0.0, 0.0)
-        pa1 = wp.vec3(0.0, 0.0, 0.0)
-        pa2 = wp.vec3(0.0, 0.0, 0.0)
-        pa3 = wp.vec3(0.0, 0.0, 0.0)
-        pb0 = wp.vec3(0.0, 0.0, 0.0)
-        pb1 = wp.vec3(0.0, 0.0, 0.0)
-        pb2 = wp.vec3(0.0, 0.0, 0.0)
-        pb3 = wp.vec3(0.0, 0.0, 0.0)
-        num_verts = int(0)
+        shape_a_local = ShapeData()
+        shape_a_local.shape_type = shape_a.shape_type
+        shape_a_local.params = shape_a.params
+        shape_a_local.margin = shape_a.margin
+        shape_a_local.pos = wp.vec3(0.0, 0.0, 0.0)
+        shape_a_local.rot = wp.quat_identity()
 
-        # Best simplex snapshot (PhysX mClosest pattern)
-        best_v = wp.vec3(1.0e30, 0.0, 0.0)
-        best_w0 = wp.vec3(0.0, 0.0, 0.0)
-        best_w1 = wp.vec3(0.0, 0.0, 0.0)
-        best_w2 = wp.vec3(0.0, 0.0, 0.0)
-        best_pa0 = wp.vec3(0.0, 0.0, 0.0)
-        best_pa1 = wp.vec3(0.0, 0.0, 0.0)
-        best_pa2 = wp.vec3(0.0, 0.0, 0.0)
-        best_pb0 = wp.vec3(0.0, 0.0, 0.0)
-        best_pb1 = wp.vec3(0.0, 0.0, 0.0)
-        best_pb2 = wp.vec3(0.0, 0.0, 0.0)
-        best_num_verts = int(0)
+        # GJK with Nesterov acceleration (Jitter Physics 2 / Newton pattern)
+        simplex_v = Mat83f()
+        simplex_bc = wp.vec4(0.0, 0.0, 0.0, 0.0)
+        simplex_mask = wp.uint32(0)
 
-        # Add first support point
-        direction = shape_b.pos - shape_a.pos
-        if wp.length_sq(direction) < GJK_EPSILON:
-            direction = wp.vec3(1.0, 0.0, 0.0)
-        direction = wp.normalize(direction)
-        sa = support_world(shape_a, direction)
-        sb = support_world(shape_b, -direction)
-        w0 = sa - sb
-        pa0 = sa
-        pb0 = sb
-        num_verts = int(1)
+        # Initial direction: B center - A center in A-local frame
+        v = shape_b_local.pos
+        if wp.length_sq(v) < GJK_EPSILON:
+            v = wp.vec3(1.0, 0.0, 0.0)
+        dist_sq = wp.length_sq(v)
 
-        for _iter in range(GJK_MAX_ITERATIONS):
-            # === computeClosest: reduce simplex, compute closest point ===
-            v = w0  # default for num_verts==1
+        last_search_dir = wp.vec3(1.0, 0.0, 0.0)
 
-            if num_verts == 1:
-                pass  # v = w0, nothing to reduce
-            elif num_verts == 2:
-                pt, la, lb = closest_segment(w0, w1)
-                v = pt
-                if la < GJK_EPSILON:
-                    w0 = w1
-                    pa0 = pa1
-                    pb0 = pb1
-                    num_verts = int(1)
-                elif lb < GJK_EPSILON:
-                    num_verts = int(1)
-                # else: keep 2 verts
-            elif num_verts == 3:
-                pt, u, bv, bw = closest_triangle(w0, w1, w2)
-                v = pt
-                keep0 = u >= GJK_EPSILON
-                keep1 = bv >= GJK_EPSILON
-                keep2 = bw >= GJK_EPSILON
-                alive = int(0)
-                if keep0:
-                    alive = alive + 1
-                if keep1:
-                    alive = alive + 1
-                if keep2:
-                    alive = alive + 1
-                if alive <= 1:
-                    if keep1:
-                        w0 = w1
-                        pa0 = pa1
-                        pb0 = pb1
-                    elif keep2:
-                        w0 = w2
-                        pa0 = pa2
-                        pb0 = pb2
-                    num_verts = int(1)
-                elif alive == 2:
-                    if not keep0:
-                        w0 = w1
-                        pa0 = pa1
-                        pb0 = pb1
-                        w1 = w2
-                        pa1 = pa2
-                        pb1 = pb2
-                    elif not keep1:
-                        w1 = w2
-                        pa1 = pa2
-                        pb1 = pb2
-                    num_verts = int(2)
-                # else: keep 3 verts
-            elif num_verts == 4:
-                # Tetrahedron: check if origin is inside
-                d0 = w1 - w0
-                d1 = w2 - w0
-                d2 = w3 - w0
-                det = wp.dot(d0, wp.cross(d1, d2))
-                inside = int(0)
-                if wp.abs(det) > GJK_EPSILON:
-                    inv = 1.0 / det
-                    ao = -w0
-                    lam1 = wp.dot(ao, wp.cross(d1, d2)) * inv
-                    lam2 = wp.dot(d0, wp.cross(ao, d2)) * inv
-                    lam3 = wp.dot(d0, wp.cross(d1, ao)) * inv
-                    lam0 = 1.0 - lam1 - lam2 - lam3
-                    if lam0 >= 0.0 and lam1 >= 0.0 and lam2 >= 0.0 and lam3 >= 0.0:
-                        inside = int(1)
-                if inside == 1:
-                    # Core overlap — return 0 distance
-                    result.distance = 0.0
-                    result.point_a = lam0 * pa0 + lam1 * pa1 + lam2 * pa2 + lam3 * pa3
-                    result.point_b = lam0 * pb0 + lam1 * pb1 + lam2 * pb2 + lam3 * pb3
-                    if wp.length(best_v) > GJK_EPSILON:
-                        result.normal = -wp.normalize(best_v)
-                    return result
-                # Not inside: find closest face and reduce to triangle
-                face_best_dist = float(1.0e30)
-                face_best_v = wp.vec3(0.0, 0.0, 0.0)
-                face_best = int(0)
-                pt, _u, _bv, _bw = closest_triangle(w1, w2, w3)
-                fd = wp.length_sq(pt)
-                if fd < face_best_dist:
-                    face_best_dist = fd
-                    face_best_v = pt
-                    face_best = int(0)
-                pt, _u, _bv, _bw = closest_triangle(w0, w2, w3)
-                fd = wp.length_sq(pt)
-                if fd < face_best_dist:
-                    face_best_dist = fd
-                    face_best_v = pt
-                    face_best = int(1)
-                pt, _u, _bv, _bw = closest_triangle(w0, w1, w3)
-                fd = wp.length_sq(pt)
-                if fd < face_best_dist:
-                    face_best_dist = fd
-                    face_best_v = pt
-                    face_best = int(2)
-                pt, _u, _bv, _bw = closest_triangle(w0, w1, w2)
-                fd = wp.length_sq(pt)
-                if fd < face_best_dist:
-                    face_best_dist = fd
-                    face_best_v = pt
-                    face_best = int(3)
-                v = face_best_v
-                if face_best == 0:
-                    w0 = w1
-                    pa0 = pa1
-                    pb0 = pb1
-                    w1 = w2
-                    pa1 = pa2
-                    pb1 = pb2
-                    w2 = w3
-                    pa2 = pa3
-                    pb2 = pb3
-                elif face_best == 1:
-                    w1 = w2
-                    pa1 = pa2
-                    pb1 = pb2
-                    w2 = w3
-                    pa2 = pa3
-                    pb2 = pb3
-                elif face_best == 2:
-                    w2 = w3
-                    pa2 = pa3
-                    pb2 = pb3
-                num_verts = int(3)
+        # Nesterov acceleration state
+        nesterov_dir = v
+        w_prev = v
+        use_nesterov = bool(False)  # TODO: investigate Nesterov for asymmetric shapes
+        iteration = int(0)
+        iter_count = int(GJK_MAX_ITERATIONS)
 
-            # === Best-result gate (PhysX mClosest pattern) ===
-            v_mag = wp.length(v)
-            best_mag = wp.length(best_v)
-            if v_mag < best_mag - GJK_EPSILON:
-                # Improved — snapshot simplex
-                best_v = v
-                best_w0 = w0
-                best_w1 = w1
-                best_w2 = w2
-                best_pa0 = pa0
-                best_pa1 = pa1
-                best_pa2 = pa2
-                best_pb0 = pb0
-                best_pb1 = pb1
-                best_pb2 = pb2
-                best_num_verts = num_verts
-            else:
-                # No improvement — discard last point
-                num_verts = num_verts - 1
+        while iter_count > 0:
+            iter_count -= 1
 
-            # === Convergence check ===
-            closest_dist = wp.length(best_v)
-            if closest_dist < dist_eps:
+            if dist_sq < GJK_COLLIDE_EPSILON * GJK_COLLIDE_EPSILON:
+                # Core overlap
                 result.distance = 0.0
-                result.point_a = best_pa0
-                result.point_b = best_pb0
-                if closest_dist > GJK_EPSILON:
-                    result.normal = -best_v / closest_dist
+                result.normal = wp.vec3(0.0, 0.0, 0.0)
+                pa, pb = simplex_get_closest(simplex_v, simplex_bc, simplex_mask)
+                result.point_a = wp.quat_rotate(shape_a.rot, pa) + shape_a.pos
+                result.point_b = wp.quat_rotate(shape_a.rot, pb) + shape_a.pos
                 return result
 
-            # === Add new support point ===
-            search_dir = -best_v / closest_dist
-            sa = support_world(shape_a, search_dir)
-            sb = support_world(shape_b, -search_dir)
-            w_new = sa - sb
-            proj = wp.dot(w_new, -search_dir)  # PhysX: p.dot(-dir)
+            # Search direction with Nesterov acceleration
+            used_fallback = bool(False)
+            if use_nesterov and iteration >= 3:
+                momentum = float(iteration + 2) / float(iteration + 3)
+                y = momentum * v + (1.0 - momentum) * w_prev
+                y_len = wp.length(y)
+                ndir_len = wp.length(nesterov_dir)
+                if y_len > GJK_EPSILON and ndir_len > GJK_EPSILON:
+                    nesterov_dir = momentum * (nesterov_dir / ndir_len) + (1.0 - momentum) * (y / y_len)
+                    search_dir = -nesterov_dir
+                else:
+                    search_dir = -v
+            else:
+                nesterov_dir = v
+                search_dir = -v
+            if wp.length_sq(search_dir) < 1.0e-12:
+                search_dir = wp.vec3(1.0, 0.0, 0.0)
+                used_fallback = bool(True)
+            last_search_dir = search_dir
 
-            if proj >= closest_dist - dist_eps:
-                break  # Converged — no improvement possible
+            # Get support point
+            b_pt, w_btoa = minkowski_support(shape_a_local, shape_b_local, search_dir)
+            w_v = w_btoa
 
-            # Restore best simplex and add new point
-            w0 = best_w0
-            w1 = best_w1
-            w2 = best_w2
-            pa0 = best_pa0
-            pa1 = best_pa1
-            pa2 = best_pa2
-            pb0 = best_pb0
-            pb1 = best_pb1
-            pb2 = best_pb2
-            num_verts = best_num_verts
+            # Nesterov deactivation
+            if use_nesterov and iteration >= 3:
+                duality_gap = 2.0 * wp.dot(v, v - w_v)
+                if duality_gap <= GJK_COLLIDE_EPSILON * wp.sqrt(dist_sq):
+                    use_nesterov = bool(False)
 
-            if num_verts == 1:
-                w1 = w_new
-                pa1 = sa
-                pb1 = sb
-            elif num_verts == 2:
-                w2 = w_new
-                pa2 = sa
-                pb2 = sb
-            elif num_verts == 3:
-                w3 = w_new
-                pa3 = sa
-                pb3 = sb
-            num_verts = num_verts + 1
+            # Frank-Wolfe convergence check
+            if not used_fallback:
+                delta_dist = wp.dot(v, v - w_v)
+                if delta_dist < GJK_COLLIDE_EPSILON * wp.sqrt(dist_sq):
+                    iteration = -1  # signal: converged
 
-        # === Final: compute witness points from best simplex ===
-        if best_num_verts == 1:
-            result.point_a = best_pa0
-            result.point_b = best_pb0
-        elif best_num_verts == 2:
-            pt, la, lb = closest_segment(best_w0, best_w1)
-            result.point_a = la * best_pa0 + lb * best_pa1
-            result.point_b = la * best_pb0 + lb * best_pb1
+            # Duplicate vertex check
+            if iteration >= 0:
+                is_duplicate = bool(False)
+                for i in range(4):
+                    if (simplex_mask & (wp.uint32(1) << wp.uint32(i))) != wp.uint32(0):
+                        if wp.length_sq(simplex_v[2 * i + 1] - w_v) < GJK_COLLIDE_EPSILON * GJK_COLLIDE_EPSILON:
+                            is_duplicate = bool(True)
+                if is_duplicate:
+                    iteration = -1  # signal: stalled
+
+            if iteration < 0:
+                # Converged or stalled — break
+                iteration = GJK_MAX_ITERATIONS  # prevent further iterations
+                iter_count = 0
+            else:
+                # Add vertex to simplex
+                use_count = int(0)
+                free_slot = int(0)
+                for i in range(4):
+                    if (simplex_mask & (wp.uint32(1) << wp.uint32(i))) != wp.uint32(0):
+                        use_count += 1
+                    else:
+                        free_slot = i
+                use_count += 1
+                simplex_v[2 * free_slot] = b_pt
+                simplex_v[2 * free_slot + 1] = w_btoa
+
+                closest = wp.vec3(0.0, 0.0, 0.0)
+                success = bool(True)
+
+                if use_count == 1:
+                    closest = simplex_v[2 * free_slot + 1]
+                    simplex_mask = wp.uint32(1) << wp.uint32(free_slot)
+                    simplex_bc[free_slot] = 1.0
+                elif use_count == 2:
+                    i0 = int(0)
+                    i1 = int(0)
+                    ci = int(0)
+                    for i in range(4):
+                        if (simplex_mask & (wp.uint32(1) << wp.uint32(i))) != wp.uint32(0) or i == free_slot:
+                            if ci == 0:
+                                i0 = i
+                            else:
+                                i1 = i
+                            ci += 1
+                    closest, bc, mask = gjk_closest_segment(simplex_v, i0, i1)
+                    simplex_bc = bc
+                    simplex_mask = mask
+                elif use_count == 3:
+                    i0 = int(0)
+                    i1 = int(0)
+                    i2 = int(0)
+                    ci = int(0)
+                    for i in range(4):
+                        if (simplex_mask & (wp.uint32(1) << wp.uint32(i))) != wp.uint32(0) or i == free_slot:
+                            if ci == 0:
+                                i0 = i
+                            elif ci == 1:
+                                i1 = i
+                            else:
+                                i2 = i
+                            ci += 1
+                    closest, bc, mask = gjk_closest_triangle(simplex_v, i0, i1, i2)
+                    simplex_bc = bc
+                    simplex_mask = mask
+                elif use_count == 4:
+                    closest, bc, mask = gjk_closest_tetrahedron(simplex_v)
+                    simplex_bc = bc
+                    simplex_mask = mask
+                    inside_tetrahedron = mask == wp.uint32(15)
+                    success = not inside_tetrahedron
+                else:
+                    success = bool(False)
+
+                if not success:
+                    # Core overlap
+                    result.distance = 0.0
+                    result.normal = wp.vec3(0.0, 0.0, 0.0)
+                    pa, pb = simplex_get_closest(simplex_v, simplex_bc, simplex_mask)
+                    result.point_a = wp.quat_rotate(shape_a.rot, pa) + shape_a.pos
+                    result.point_b = wp.quat_rotate(shape_a.rot, pb) + shape_a.pos
+                    return result
+
+                v = closest
+                dist_sq = wp.length_sq(v)
+                w_prev = w_v
+                iteration += 1
+
+        # Converged: compute final result
+        distance = wp.sqrt(dist_sq)
+        pa, pb = simplex_get_closest(simplex_v, simplex_bc, simplex_mask)
+
+        # Normal: prefer A→B vector, fallback to -v, then last_search_dir
+        delta = pb - pa
+        delta_len_sq = wp.length_sq(delta)
+        if delta_len_sq > GJK_EPSILON * GJK_EPSILON:
+            result.normal = delta * (1.0 / wp.sqrt(delta_len_sq))
+        elif distance > GJK_COLLIDE_EPSILON:
+            result.normal = v * (-1.0 / distance)
         else:
-            pt, u, bv, bw = closest_triangle(best_w0, best_w1, best_w2)
-            result.point_a = u * best_pa0 + bv * best_pa1 + bw * best_pa2
-            result.point_b = u * best_pb0 + bv * best_pb1 + bw * best_pb2
+            nsq = wp.length_sq(last_search_dir)
+            if nsq > 0.0:
+                result.normal = last_search_dir * (1.0 / wp.sqrt(nsq))
+            else:
+                result.normal = wp.vec3(1.0, 0.0, 0.0)
 
-        core_dist = wp.length(best_v)
-        if core_dist > GJK_EPSILON:
-            result.normal = -best_v / core_dist
-        result.distance = core_dist
+        result.distance = distance
+        # Transform witness points back to world frame
+        result.point_a = wp.quat_rotate(shape_a.rot, pa) + shape_a.pos
+        result.point_b = wp.quat_rotate(shape_a.rot, pb) + shape_a.pos
+        # Normal to world frame
+        result.normal = wp.quat_rotate(shape_a.rot, result.normal)
         return result
 
     # ===================================================================
-    # EPA depth (PhysX RefGjkEpa pattern)
+    # MPR penetration depth (Jitter Physics 2 / XenoCollide pattern)
     # ===================================================================
 
     @wp.func
-    def epa_depth(shape_a: ShapeData, shape_b: ShapeData) -> GJKResult:
-        """Find minimum penetration depth for overlapping core shapes.
+    def mpr_depth(shape_a: ShapeData, shape_b: ShapeData) -> GJKResult:
+        """Find penetration depth and normal for overlapping core shapes.
 
-        Builds polytope from scratch (3 support directions), then expands.
-        Tracks best result across iterations (never degrades).
+        Uses Minkowski Portal Refinement.  Works in A-local frame.
+        Returns penetration depth (positive) and witness points in world frame.
         """
         result = GJKResult()
         result.normal = wp.vec3(0.0, 0.0, 1.0)
 
-        accuracy = wp.max(wp.length(shape_a.params) + shape_a.margin, wp.length(shape_b.params) + shape_b.margin) * 0.01
-        accuracy = wp.max(accuracy, GJK_EPSILON)
-        dist_eps = accuracy * 0.01
+        # Transform shape B into A-local frame
+        inv_rot_a = wp.quat_inverse(shape_a.rot)
+        sb = ShapeData()
+        sb.shape_type = shape_b.shape_type
+        sb.params = shape_b.params
+        sb.margin = shape_b.margin
+        sb.pos = wp.quat_rotate(inv_rot_a, shape_b.pos - shape_a.pos)
+        sb.rot = inv_rot_a * shape_b.rot
 
-        verts = EPAVerts()
-        verts_a = EPAVertsA()
-        verts_b = EPAVertsB()
-        faces = EPAFaces()
-        face_nx = EPAVerts()  # reuse: normal per face
-        face_dv = EPAVertsA()  # reuse: d value in column 0
-        num_verts = int(0)
-        num_faces = int(0)
+        sa = ShapeData()
+        sa.shape_type = shape_a.shape_type
+        sa.params = shape_a.params
+        sa.margin = shape_a.margin
+        sa.pos = wp.vec3(0.0, 0.0, 0.0)
+        sa.rot = wp.quat_identity()
 
-        # Best result tracking (PhysX mBest/mProj)
-        best_proj = float(-1.0e30)
-        best_face = int(0)
-        best_n = wp.vec3(0.0, 0.0, 1.0)
-        best_d = float(-1.0e30)
+        NUMERIC_EPSILON = 1.0e-16
 
-        # === Build initial polytope from 3 support directions ===
-        dir0 = shape_b.pos - shape_a.pos
-        if wp.length(dir0) < GJK_EPSILON:
-            dir0 = wp.vec3(1.0, 0.0, 0.0)
-        dir0 = wp.normalize(dir0)
+        # v0 = geometric center of Minkowski difference
+        v0_btoa = -sb.pos  # center_A(=0) - center_B
+        normal = -v0_btoa
+        if (
+            wp.abs(normal[0]) < NUMERIC_EPSILON
+            and wp.abs(normal[1]) < NUMERIC_EPSILON
+            and wp.abs(normal[2]) < NUMERIC_EPSILON
+        ):
+            v0_btoa = wp.vec3(1.0e-5, 0.0, 0.0)
+            normal = -v0_btoa
 
-        # Orthogonal direction
-        dir1 = wp.cross(dir0, wp.vec3(0.0, 0.0, 1.0))
-        if wp.length(dir1) < GJK_EPSILON:
-            dir1 = wp.cross(dir0, wp.vec3(0.0, 1.0, 0.0))
-        dir1 = wp.normalize(dir1)
-
-        # Point 0: along dir0
-        sa0 = support_world(shape_a, dir0)
-        sb0 = support_world(shape_b, -dir0)
-        verts[0] = sa0 - sb0
-        verts_a[0] = sa0
-        verts_b[0] = sb0
-        num_verts = int(1)
-
-        # Point 1: along -dir0
-        sa1 = support_world(shape_a, -dir0)
-        sb1 = support_world(shape_b, dir0)
-        p1 = sa1 - sb1
-        v0_pos = wp.vec3(verts[0][0], verts[0][1], verts[0][2])
-        if wp.length_sq(p1 - v0_pos) > accuracy * accuracy:
-            verts[1] = p1
-            verts_a[1] = sa1
-            verts_b[1] = sb1
-            num_verts = int(2)
-
-        # Point 2: along dir1 (or -dir1 if duplicate)
-        if num_verts >= 2:
-            sa2 = support_world(shape_a, dir1)
-            sb2 = support_world(shape_b, -dir1)
-            p2 = sa2 - sb2
-            dup2 = int(0)
-            for vi in range(2):
-                vv = wp.vec3(verts[vi][0], verts[vi][1], verts[vi][2])
-                if wp.length_sq(p2 - vv) < accuracy * accuracy:
-                    dup2 = int(1)
-            if dup2 == 0:
-                verts[2] = p2
-                verts_a[2] = sa2
-                verts_b[2] = sb2
-                num_verts = int(3)
-        if num_verts < 3:
-            sa2 = support_world(shape_a, -dir1)
-            sb2 = support_world(shape_b, dir1)
-            p2 = sa2 - sb2
-            dup2 = int(0)
-            for vi in range(2):
-                vv = wp.vec3(verts[vi][0], verts[vi][1], verts[vi][2])
-                if wp.length_sq(p2 - vv) < accuracy * accuracy:
-                    dup2 = int(1)
-            if dup2 == 0:
-                verts[num_verts] = p2
-                verts_a[num_verts] = sa2
-                verts_b[num_verts] = sb2
-                num_verts = num_verts + 1
-
-        if num_verts < 3:
-            return result  # Degenerate
-
-        # Create 2 initial faces with planes (triple cross for robust normal)
-        va0 = wp.vec3(verts[0][0], verts[0][1], verts[0][2])
-        va1 = wp.vec3(verts[1][0], verts[1][1], verts[1][2])
-        va2 = wp.vec3(verts[2][0], verts[2][1], verts[2][2])
-
-        abc0 = wp.cross(va1 - va0, va2 - va0) + wp.cross(va2 - va1, va0 - va1) + wp.cross(va0 - va2, va1 - va2)
-        len0 = wp.length(abc0)
-        if len0 < GJK_EPSILON:
+        # v1 = first support
+        v1_b, v1_btoa = minkowski_support(sa, sb, normal)
+        point_a = v1_b + v1_btoa  # reconstruct A point
+        point_b = v1_b
+        if wp.dot(v1_btoa, normal) <= 0.0:
+            result.distance = 0.0
+            result.point_a = wp.quat_rotate(shape_a.rot, point_a) + shape_a.pos
+            result.point_b = wp.quat_rotate(shape_a.rot, point_b) + shape_a.pos
             return result
-        n0 = abc0 / len0
-        d0 = wp.dot(n0, -va0)
-        faces[0] = wp.vec3(0.0, 1.0, 2.0)
-        face_nx[0] = n0
-        face_dv[0] = wp.vec3(d0, 0.0, 0.0)
 
-        abc1 = wp.cross(va0 - va1, va2 - va1) + wp.cross(va2 - va0, va1 - va0) + wp.cross(va1 - va2, va0 - va2)
-        n1 = abc1 / wp.max(wp.length(abc1), GJK_EPSILON)
-        d1_val = wp.dot(n1, -va1)
-        faces[1] = wp.vec3(1.0, 0.0, 2.0)
-        face_nx[1] = n1
-        face_dv[1] = wp.vec3(d1_val, 0.0, 0.0)
-        num_faces = int(2)
+        normal = wp.cross(v1_btoa, v0_btoa)
+        if wp.length_sq(normal) < NUMERIC_EPSILON * NUMERIC_EPSILON:
+            # Shapes are on the same line
+            normal = v1_btoa - v0_btoa
+            normal = wp.normalize(normal)
+            penetration = wp.dot(v1_btoa, normal)
+            result.distance = penetration
+            result.normal = wp.quat_rotate(shape_a.rot, normal)
+            result.point_a = wp.quat_rotate(shape_a.rot, point_a) + shape_a.pos
+            result.point_b = wp.quat_rotate(shape_a.rot, point_b) + shape_a.pos
+            return result
 
-        # Initialize best from first 2 faces
-        if d0 > d1_val:
-            best_d = d0
-            best_n = n0
-            best_face = int(0)
-        else:
-            best_d = d1_val
-            best_n = n1
-            best_face = int(1)
+        # v2 = second support
+        v2_b, v2_btoa = minkowski_support(sa, sb, normal)
+        if wp.dot(v2_btoa, normal) <= 0.0:
+            result.distance = 0.0
+            result.point_a = wp.quat_rotate(shape_a.rot, point_a) + shape_a.pos
+            result.point_b = wp.quat_rotate(shape_a.rot, point_b) + shape_a.pos
+            return result
 
-        # === Main EPA loop (done flag, no break) ===
-        done = int(0)
-        for _epa_iter in range(EPA_MAX_ITERATIONS):
-            if done == 1:
-                continue
+        # Orient portal so origin is on negative side
+        temp1 = v1_btoa - v0_btoa
+        temp2 = v2_btoa - v0_btoa
+        normal = wp.cross(temp1, temp2)
+        dist = wp.dot(normal, v0_btoa)
+        if dist > 0.0:
+            # Swap v1 and v2
+            tmp_b = v1_b
+            tmp_btoa = v1_btoa
+            v1_b = v2_b
+            v1_btoa = v2_btoa
+            v2_b = tmp_b
+            v2_btoa = tmp_btoa
+            normal = -normal
 
-            # Find closest face (largest d)
-            closest_idx = int(0)
-            closest_w = float(-1.0e30)
-            for fi in range(EPA_MAX_FACES):
-                if fi >= num_faces:
-                    continue
-                w = face_dv[fi][0]
-                if w > closest_w:
-                    closest_w = w
-                    closest_idx = fi
-
-            closest_n = wp.vec3(face_nx[closest_idx][0], face_nx[closest_idx][1], face_nx[closest_idx][2])
-
-            # Get new support point
-            sa_new = support_world(shape_a, closest_n)
-            sb_new = support_world(shape_b, -closest_n)
-            p_new = sa_new - sb_new
-            proj = wp.dot(p_new, -closest_n)
-
-            # Track best (PhysX mProj/mBest ratchet)
-            if proj > best_proj:
-                best_proj = proj
-                best_n = closest_n
-                best_d = closest_w
-                best_face = closest_idx
-
-            # Duplicate check
-            is_dup = int(0)
-            for vi in range(EPA_MAX_VERTS):
-                if vi >= num_verts:
-                    continue
-                vv = wp.vec3(verts[vi][0], verts[vi][1], verts[vi][2])
-                if wp.length_sq(p_new - vv) < accuracy * accuracy:
-                    is_dup = int(1)
-            if is_dup == 1:
-                done = int(1)
-                continue
-
-            # Convergence
-            if proj >= closest_w - dist_eps:
-                done = int(1)
-                continue
-
-            if num_verts >= EPA_MAX_VERTS:
-                done = int(1)
-                continue
-
-            # Add new vertex
-            new_vi = num_verts
-            verts[new_vi] = p_new
-            verts_a[new_vi] = sa_new
-            verts_b[new_vi] = sb_new
-            num_verts = num_verts + 1
-
-            # Remove visible faces, collect horizon edges
-            edges = EPAFaces()
-            num_edges = int(0)
-            new_num_faces = int(0)
-
-            for fi in range(EPA_MAX_FACES):
-                if fi >= num_faces:
-                    continue
-                fn = wp.vec3(face_nx[fi][0], face_nx[fi][1], face_nx[fi][2])
-                fd = face_dv[fi][0]
-                plane_dist = wp.dot(fn, p_new) + fd
-
-                if plane_dist > dist_eps:
-                    # Visible — remove, collect edges
-                    fv = faces[fi]
-                    fv0 = int(fv[0])
-                    fv1 = int(fv[1])
-                    fv2 = int(fv[2])
-                    for ei_new in range(3):
-                        if ei_new == 0:
-                            ev0 = fv0
-                            ev1 = fv1
-                        elif ei_new == 1:
-                            ev0 = fv1
-                            ev1 = fv2
-                        else:
-                            ev0 = fv2
-                            ev1 = fv0
-                        found = int(-1)
-                        for k in range(EPA_MAX_FACES):
-                            if k >= num_edges:
-                                continue
-                            if int(edges[k][0]) == ev1 and int(edges[k][1]) == ev0:
-                                found = k
-                        if found >= 0:
-                            edges[found] = edges[num_edges - 1]
-                            num_edges = num_edges - 1
-                        else:
-                            if num_edges < EPA_MAX_FACES:
-                                edges[num_edges] = wp.vec3(float(ev0), float(ev1), 0.0)
-                                num_edges = num_edges + 1
+        # Phase 1: Find initial portal (triangle v1, v2, v3)
+        v3_b = wp.vec3(0.0, 0.0, 0.0)
+        v3_btoa = wp.vec3(0.0, 0.0, 0.0)
+        portal_found = int(0)
+        for _p1 in range(MPR_MAX_ITERATIONS):
+            if portal_found == 0:
+                v3_b, v3_btoa = minkowski_support(sa, sb, normal)
+                if wp.dot(v3_btoa, normal) <= 0.0:
+                    portal_found = int(-1)  # no collision
                 else:
-                    if new_num_faces != fi:
-                        faces[new_num_faces] = faces[fi]
-                        face_nx[new_num_faces] = face_nx[fi]
-                        face_dv[new_num_faces] = face_dv[fi]
-                    new_num_faces = new_num_faces + 1
+                    # If origin is outside (v1, v0, v3), eliminate v2
+                    temp1 = wp.cross(v1_btoa, v3_btoa)
+                    if wp.dot(temp1, v0_btoa) < 0.0:
+                        v2_b = v3_b
+                        v2_btoa = v3_btoa
+                        temp1 = v1_btoa - v0_btoa
+                        temp2 = v3_btoa - v0_btoa
+                        normal = wp.cross(temp1, temp2)
+                    else:
+                        # If origin is outside (v3, v0, v2), eliminate v1
+                        temp1 = wp.cross(v3_btoa, v2_btoa)
+                        if wp.dot(temp1, v0_btoa) < 0.0:
+                            v1_b = v3_b
+                            v1_btoa = v3_btoa
+                            temp1 = v3_btoa - v0_btoa
+                            temp2 = v2_btoa - v0_btoa
+                            normal = wp.cross(temp1, temp2)
+                        else:
+                            # Portal found
+                            portal_found = int(1)
 
-            num_faces = new_num_faces
+        if portal_found != 1:
+            result.distance = 0.0
+            result.point_a = wp.quat_rotate(shape_a.rot, point_a) + shape_a.pos
+            result.point_b = wp.quat_rotate(shape_a.rot, point_b) + shape_a.pos
+            return result
 
-            if num_edges == 0 or num_faces + num_edges > EPA_MAX_FACES:
-                done = int(1)
-                continue
+        # Phase 2: Refine the portal
+        hit = bool(False)
+        penetration = float(0.0)
+        v4_b = wp.vec3(0.0, 0.0, 0.0)
+        v4_btoa = wp.vec3(0.0, 0.0, 0.0)
+        for _p2 in range(MPR_MAX_ITERATIONS):
+            # Compute normal of wedge face (v1, v2, v3)
+            temp1 = v2_btoa - v1_btoa
+            temp2 = v3_btoa - v1_btoa
+            normal = wp.cross(temp1, temp2)
+            normal_sq = wp.length_sq(normal)
 
-            # Create new faces from horizon edges + new vertex
-            for ei in range(EPA_MAX_FACES):
-                if ei >= num_edges:
-                    continue
-                if num_faces >= EPA_MAX_FACES:
-                    continue
-                ev0 = int(edges[ei][0])
-                ev1 = int(edges[ei][1])
-                va_e = wp.vec3(verts[ev0][0], verts[ev0][1], verts[ev0][2])
-                vb_e = wp.vec3(verts[ev1][0], verts[ev1][1], verts[ev1][2])
-                vc_e = wp.vec3(verts[new_vi][0], verts[new_vi][1], verts[new_vi][2])
-                # Triple cross for robust normal
-                abc_e = (
-                    wp.cross(vb_e - va_e, vc_e - va_e)
-                    + wp.cross(vc_e - vb_e, va_e - vb_e)
-                    + wp.cross(va_e - vc_e, vb_e - vc_e)
-                )
-                len_e = wp.length(abc_e)
-                if len_e < GJK_EPSILON:
-                    done = int(1)
-                    continue
-                n_e = abc_e / len_e
-                d_e = wp.dot(n_e, -va_e)
-                faces[num_faces] = wp.vec3(float(ev0), float(ev1), float(new_vi))
-                face_nx[num_faces] = n_e
-                face_dv[num_faces] = wp.vec3(d_e, 0.0, 0.0)
-                num_faces = num_faces + 1
+            if normal_sq < NUMERIC_EPSILON * NUMERIC_EPSILON:
+                result.distance = 0.0
+                result.point_a = wp.quat_rotate(shape_a.rot, point_a) + shape_a.pos
+                result.point_b = wp.quat_rotate(shape_a.rot, point_b) + shape_a.pos
+                return result
 
-        # === Extract result from best face ===
-        result.distance = -best_d  # positive penetration depth
-        result.normal = best_n
+            if not hit:
+                d = wp.dot(normal, v1_btoa)
+                hit = d >= 0.0
 
-        bi0 = int(faces[best_face][0])
-        bi1 = int(faces[best_face][1])
-        bi2 = int(faces[best_face][2])
-        fa = wp.vec3(verts[bi0][0], verts[bi0][1], verts[bi0][2])
-        fb = wp.vec3(verts[bi1][0], verts[bi1][1], verts[bi1][2])
-        fc = wp.vec3(verts[bi2][0], verts[bi2][1], verts[bi2][2])
+            v4_b, v4_btoa = minkowski_support(sa, sb, normal)
 
-        abc_best = wp.cross(fb - fa, fc - fa)
-        iabc2 = 1.0 / wp.max(wp.dot(abc_best, abc_best), GJK_EPSILON)
-        pabc = abc_best * wp.dot(abc_best, fa) * iabc2
-        tbc = wp.dot(abc_best, wp.cross(fb - pabc, fc - pabc))
-        tca = wp.dot(abc_best, wp.cross(fc - pabc, fa - pabc))
-        sa_w = tbc * iabc2
-        sb_w = tca * iabc2
-        sc_w = 1.0 - sa_w - sb_w
+            temp3 = v4_btoa - v3_btoa
+            delta = wp.dot(temp3, normal)
+            penetration = wp.dot(v4_btoa, normal)
 
-        result.point_a = (
-            wp.vec3(verts_a[bi0][0], verts_a[bi0][1], verts_a[bi0][2]) * sa_w
-            + wp.vec3(verts_a[bi1][0], verts_a[bi1][1], verts_a[bi1][2]) * sb_w
-            + wp.vec3(verts_a[bi2][0], verts_a[bi2][1], verts_a[bi2][2]) * sc_w
-        )
-        result.point_b = (
-            wp.vec3(verts_b[bi0][0], verts_b[bi0][1], verts_b[bi0][2]) * sa_w
-            + wp.vec3(verts_b[bi1][0], verts_b[bi1][1], verts_b[bi1][2]) * sb_w
-            + wp.vec3(verts_b[bi2][0], verts_b[bi2][1], verts_b[bi2][2]) * sc_w
-        )
+            if delta * delta <= MPR_COLLIDE_EPSILON * MPR_COLLIDE_EPSILON * normal_sq or penetration <= 0.0:
+                if hit:
+                    inv_normal = 1.0 / wp.sqrt(normal_sq)
+                    penetration = penetration * inv_normal
+                    normal = normal * inv_normal
+
+                    # Barycentric interpolation for witness points
+                    temp3 = wp.cross(v1_btoa, temp1)
+                    gamma = wp.dot(temp3, normal) * inv_normal
+                    temp3 = wp.cross(temp2, v1_btoa)
+                    beta = wp.dot(temp3, normal) * inv_normal
+                    alpha = 1.0 - gamma - beta
+
+                    point_a = alpha * (v1_b + v1_btoa) + beta * (v2_b + v2_btoa) + gamma * (v3_b + v3_btoa)
+                    point_b = alpha * v1_b + beta * v2_b + gamma * v3_b
+
+                    result.distance = penetration
+                    result.normal = wp.quat_rotate(shape_a.rot, normal)
+                    result.point_a = wp.quat_rotate(shape_a.rot, point_a) + shape_a.pos
+                    result.point_b = wp.quat_rotate(shape_a.rot, point_b) + shape_a.pos
+                    return result
+                else:
+                    result.distance = 0.0
+                    result.point_a = wp.quat_rotate(shape_a.rot, point_a) + shape_a.pos
+                    result.point_b = wp.quat_rotate(shape_a.rot, point_b) + shape_a.pos
+                    return result
+
+            # Determine which region of the wedge the origin is in
+            temp1 = wp.cross(v4_btoa, v0_btoa)
+            dot_val = wp.dot(temp1, v1_btoa)
+            if dot_val >= 0.0:
+                dot_val = wp.dot(temp1, v2_btoa)
+                if dot_val >= 0.0:
+                    v1_b = v4_b
+                    v1_btoa = v4_btoa
+                else:
+                    v3_b = v4_b
+                    v3_btoa = v4_btoa
+            else:
+                dot_val = wp.dot(temp1, v3_btoa)
+                if dot_val >= 0.0:
+                    v2_b = v4_b
+                    v2_btoa = v4_btoa
+                else:
+                    v1_b = v4_b
+                    v1_btoa = v4_btoa
+
+        # Max iterations reached
+        result.distance = 0.0
+        result.point_a = wp.quat_rotate(shape_a.rot, point_a) + shape_a.pos
+        result.point_b = wp.quat_rotate(shape_a.rot, point_b) + shape_a.pos
         return result
 
     # ===================================================================
-    # Combined GJK + EPA
+    # Combined GJK + MPR
     # ===================================================================
 
     @wp.func
-    def gjk_epa(shape_a: ShapeData, shape_b: ShapeData) -> GJKResult:
+    def gjk_mpr(shape_a: ShapeData, shape_b: ShapeData) -> GJKResult:
         """Compute signed distance between two shapes.
 
+        MPR first (handles penetration, exits early for separated).
+        GJK fallback for accurate separation distance and normal.
         Returns positive distance (separated) or negative (penetrating).
         Witness points are on shape surfaces (after margin adjustment).
         """
-        result = gjk_distance(shape_a, shape_b)
         total_margin = shape_a.margin + shape_b.margin
-        core_dist = result.distance
 
+        # MPR first — handles penetration directly
+        mpr_result = mpr_depth(shape_a, shape_b)
+        if mpr_result.distance > 0.0:
+            # MPR found collision
+            result = GJKResult()
+            result.distance = -(mpr_result.distance + total_margin)
+            result.normal = mpr_result.normal
+            result.point_a = mpr_result.point_a + mpr_result.normal * shape_a.margin
+            result.point_b = mpr_result.point_b - mpr_result.normal * shape_b.margin
+            return result
+
+        # MPR says no collision — GJK for accurate separation distance
+        result = gjk_distance(shape_a, shape_b)
+        core_dist = result.distance
+        result.distance = core_dist - total_margin
         if core_dist > 0.0:
-            # Separated cores — apply margin
-            result.distance = core_dist - total_margin
             result.point_a = result.point_a + result.normal * shape_a.margin
             result.point_b = result.point_b - result.normal * shape_b.margin
-        else:
-            # Core overlap — run EPA for penetration depth
-            epa_result = epa_depth(shape_a, shape_b)
-            result.distance = -(epa_result.distance + total_margin)
-            result.normal = epa_result.normal
-            result.point_a = epa_result.point_a + epa_result.normal * shape_a.margin
-            result.point_b = epa_result.point_b - epa_result.normal * shape_b.margin
 
         return result
 
@@ -860,6 +731,259 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
         ClipPoly stores (x, y, z, depth) per point.
         """
         result = ContactResult()
+        result.p0 = (gjk_result.point_a + gjk_result.point_b) * 0.5
+        result.d0 = gjk_result.distance
+        result.normal = gjk_result.normal
+        result.count = 1
+        return result
+
+        # TODO: restore contact generation after GJK/MPR is fixed
+        axis = gjk_result.normal
+        result.normal = axis
+
+        face_a = contact_face_world(shape_a, axis, gjk_result.point_a)
+        face_b = contact_face_world(shape_b, -axis, gjk_result.point_b)
+
+        na = face_a.normal
+        nb = face_b.normal
+        da_val = wp.dot(na, face_a.p0)
+        db_val = wp.dot(nb, face_b.p0)
+        denom_a = wp.dot(na, axis)
+        denom_b = wp.dot(nb, axis)
+        if wp.abs(denom_a) < 1.0e-10:
+            denom_a = 1.0e-10
+        if wp.abs(denom_b) < 1.0e-10:
+            denom_b = 1.0e-10
+
+        poly = ClipPoly()
+        num_pts = int(0)
+
+        # === clipNone ===
+        if face_a.count < 2 or face_b.count < 2:
+            mid = (gjk_result.point_a + gjk_result.point_b) * 0.5
+            result.p0 = mid
+            result.d0 = gjk_result.distance
+            result.count = 1
+            return result
+
+        # === clip2x2 (edge-edge) ===
+        if face_a.count == 2 and face_b.count == 2:
+            a0 = face_a.p0
+            a1 = face_a.p1
+            b0 = face_b.p0
+            b1 = face_b.p1
+            seg_ab = a1 - a0
+            seg_cd = b1 - b0
+            len_ab_sq = wp.dot(seg_ab, seg_ab)
+            len_cd_sq = wp.dot(seg_cd, seg_cd)
+            eps = 1.0e-5
+            t_val = wp.dot(b0 - a0, seg_ab)
+            if t_val > -eps * len_ab_sq and t_val < len_ab_sq * (1.0 + eps) and len_ab_sq > eps:
+                proj = a0 + seg_ab * (t_val / len_ab_sq)
+                mid = (b0 + proj) * 0.5
+                d = wp.dot(axis, proj - b0)
+                poly[num_pts] = wp.vec4(mid[0], mid[1], mid[2], d)
+                num_pts = num_pts + 1
+            t_val = wp.dot(b1 - a0, seg_ab)
+            if t_val > -eps * len_ab_sq and t_val < len_ab_sq * (1.0 + eps) and len_ab_sq > eps:
+                proj = a0 + seg_ab * (t_val / len_ab_sq)
+                mid = (b1 + proj) * 0.5
+                d = wp.dot(axis, proj - b1)
+                poly[num_pts] = wp.vec4(mid[0], mid[1], mid[2], d)
+                num_pts = num_pts + 1
+            t_val = wp.dot(a0 - b0, seg_cd)
+            if t_val > -eps * len_cd_sq and t_val < len_cd_sq * (1.0 + eps) and len_cd_sq > eps:
+                proj = b0 + seg_cd * (t_val / len_cd_sq)
+                mid = (a0 + proj) * 0.5
+                d = wp.dot(axis, proj - a0)
+                is_dup = int(0)
+                for di_idx in range(CLIP_MAX_POINTS):
+                    if di_idx >= num_pts:
+                        continue
+                    pv = wp.vec3(poly[di_idx][0], poly[di_idx][1], poly[di_idx][2])
+                    if wp.length_sq(mid - pv) < eps:
+                        is_dup = int(1)
+                if is_dup == 0:
+                    poly[num_pts] = wp.vec4(mid[0], mid[1], mid[2], d)
+                    num_pts = num_pts + 1
+            t_val = wp.dot(a1 - b0, seg_cd)
+            if t_val > -eps * len_cd_sq and t_val < len_cd_sq * (1.0 + eps) and len_cd_sq > eps:
+                proj = b0 + seg_cd * (t_val / len_cd_sq)
+                mid = (a1 + proj) * 0.5
+                d = wp.dot(axis, proj - a1)
+                is_dup = int(0)
+                for di_idx in range(CLIP_MAX_POINTS):
+                    if di_idx >= num_pts:
+                        continue
+                    pv = wp.vec3(poly[di_idx][0], poly[di_idx][1], poly[di_idx][2])
+                    if wp.length_sq(mid - pv) < eps:
+                        is_dup = int(1)
+                if is_dup == 0:
+                    poly[num_pts] = wp.vec4(mid[0], mid[1], mid[2], d)
+                    num_pts = num_pts + 1
+        else:
+            # === clipNxN (2xN, Nx2, NxN) ===
+            planes = ClipPlanes()
+            num_planes = int(0)
+            planes, num_planes = make_face_clip_planes(face_a, axis, planes, num_planes)
+            planes, num_planes = make_face_clip_planes(face_b, axis, planes, num_planes)
+
+            if face_a.count == 2:
+                poly[0] = wp.vec4(face_a.p0[0], face_a.p0[1], face_a.p0[2], 0.0)
+                poly[1] = wp.vec4(face_a.p1[0], face_a.p1[1], face_a.p1[2], 0.0)
+                num_pts = int(2)
+            elif face_b.count == 2:
+                poly[0] = wp.vec4(face_b.p0[0], face_b.p0[1], face_b.p0[2], 0.0)
+                poly[1] = wp.vec4(face_b.p1[0], face_b.p1[1], face_b.p1[2], 0.0)
+                num_pts = int(2)
+            else:
+                # Bounding quad (PhysX makePolygon)
+                u = wp.cross(axis, wp.vec3(0.0, 0.0, 1.0))
+                if wp.length(u) < 1.0e-6:
+                    u = wp.cross(axis, wp.vec3(0.0, 1.0, 0.0))
+                u = wp.normalize(u)
+                bv = wp.cross(axis, u)
+                min_u = float(1.0e30)
+                max_u = float(-1.0e30)
+                min_v = float(1.0e30)
+                max_v = float(-1.0e30)
+                for fi in range(4):
+                    if fi < face_a.count:
+                        pa = get_face_point(face_a, fi)
+                        pu = wp.dot(pa, u)
+                        pv_val = wp.dot(pa, bv)
+                        min_u = wp.min(min_u, pu)
+                        max_u = wp.max(max_u, pu)
+                        min_v = wp.min(min_v, pv_val)
+                        max_v = wp.max(max_v, pv_val)
+                    if fi < face_b.count:
+                        pb = get_face_point(face_b, fi)
+                        pu = wp.dot(pb, u)
+                        pv_val = wp.dot(pb, bv)
+                        min_u = wp.min(min_u, pu)
+                        max_u = wp.max(max_u, pu)
+                        min_v = wp.min(min_v, pv_val)
+                        max_v = wp.max(max_v, pv_val)
+                ref = (gjk_result.point_a + gjk_result.point_b) * 0.5
+                ref_u = wp.dot(ref, u)
+                ref_v = wp.dot(ref, bv)
+                c0 = ref + u * (min_u - ref_u) + bv * (min_v - ref_v)
+                c1 = ref + u * (max_u - ref_u) + bv * (min_v - ref_v)
+                c2 = ref + u * (max_u - ref_u) + bv * (max_v - ref_v)
+                c3 = ref + u * (min_u - ref_u) + bv * (max_v - ref_v)
+                poly[0] = wp.vec4(c0[0], c0[1], c0[2], 0.0)
+                poly[1] = wp.vec4(c1[0], c1[1], c1[2], 0.0)
+                poly[2] = wp.vec4(c2[0], c2[1], c2[2], 0.0)
+                poly[3] = wp.vec4(c3[0], c3[1], c3[2], 0.0)
+                num_pts = int(4)
+
+            # Clip
+            for pl_i in range(CLIP_MAX_POINTS):
+                if pl_i >= num_planes:
+                    continue
+                pn = wp.vec3(planes[pl_i][0], planes[pl_i][1], planes[pl_i][2])
+                pd = planes[pl_i][3]
+                poly, num_pts = clip_poly_against_plane(poly, num_pts, pn, pd)
+
+            # Project onto face planes -> midpoint + depth
+            for ci in range(CLIP_MAX_POINTS):
+                if ci >= num_pts:
+                    continue
+                pt = wp.vec3(poly[ci][0], poly[ci][1], poly[ci][2])
+                t_a = (da_val - wp.dot(na, pt)) / denom_a
+                t_b = (db_val - wp.dot(nb, pt)) / denom_b
+                p_on_a = pt + axis * t_a
+                p_on_b = pt + axis * t_b
+                mid = (p_on_a + p_on_b) * 0.5
+                depth = wp.dot(axis, p_on_b - p_on_a)
+                poly[ci] = wp.vec4(mid[0], mid[1], mid[2], depth)
+
+        # Fallback
+        if num_pts == 0:
+            mid = (gjk_result.point_a + gjk_result.point_b) * 0.5
+            result.p0 = mid
+            result.d0 = gjk_result.distance
+            result.count = 1
+            return result
+
+        # Reduce to 4 (deepest first, then largest quad)
+        if num_pts > 4:
+            best_w = float(1.0e30)
+            idx0 = int(0)
+            for i in range(CLIP_MAX_POINTS):
+                if i >= num_pts:
+                    continue
+                if poly[i][3] < best_w:
+                    best_w = poly[i][3]
+                    idx0 = i
+            p0 = wp.vec3(poly[idx0][0], poly[idx0][1], poly[idx0][2])
+            best_dist = float(-1.0)
+            idx1 = int(0)
+            for i in range(CLIP_MAX_POINTS):
+                if i >= num_pts:
+                    continue
+                if i == idx0:
+                    continue
+                pi = wp.vec3(poly[i][0], poly[i][1], poly[i][2])
+                dd = wp.length_sq(pi - p0)
+                if dd > best_dist:
+                    best_dist = dd
+                    idx1 = i
+            p1 = wp.vec3(poly[idx1][0], poly[idx1][1], poly[idx1][2])
+            perp = wp.cross(axis, p1 - p0)
+            best_pos = float(-1.0e30)
+            best_neg = float(1.0e30)
+            idx2 = int(-1)
+            idx3 = int(-1)
+            for k in range(CLIP_MAX_POINTS):
+                if k >= num_pts:
+                    continue
+                if k == idx0 or k == idx1:
+                    continue
+                pk = wp.vec3(poly[k][0], poly[k][1], poly[k][2])
+                dd = wp.dot(pk - p0, perp)
+                if dd > best_pos:
+                    best_pos = dd
+                    idx2 = k
+                if dd < best_neg:
+                    best_neg = dd
+                    idx3 = k
+            out = ClipPoly()
+            out[0] = poly[idx0]
+            out[1] = poly[idx1]
+            out_count = int(2)
+            if idx2 >= 0:
+                out[out_count] = poly[idx2]
+                out_count = out_count + 1
+            if idx3 >= 0 and idx3 != idx2:
+                out[out_count] = poly[idx3]
+                out_count = out_count + 1
+            poly = out
+            num_pts = out_count
+
+        # Store in ContactResult
+        count = int(0)
+        for ci in range(CLIP_MAX_POINTS):
+            if ci >= num_pts:
+                continue
+            if count >= 4:
+                continue
+            if count == 0:
+                result.p0 = wp.vec3(poly[ci][0], poly[ci][1], poly[ci][2])
+                result.d0 = poly[ci][3]
+            elif count == 1:
+                result.p1 = wp.vec3(poly[ci][0], poly[ci][1], poly[ci][2])
+                result.d1 = poly[ci][3]
+            elif count == 2:
+                result.p2 = wp.vec3(poly[ci][0], poly[ci][1], poly[ci][2])
+                result.d2 = poly[ci][3]
+            elif count == 3:
+                result.p3 = wp.vec3(poly[ci][0], poly[ci][1], poly[ci][2])
+                result.d3 = poly[ci][3]
+            count = count + 1
+        result.count = count
+        return result
+
         result.count = 0
         axis = gjk_result.normal
         result.normal = axis
@@ -1111,9 +1235,9 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
 
     @wp.func
     def generate_contacts(shape_a: ShapeData, shape_b: ShapeData) -> ContactResult:
-        """Generate contact patch (runs GJK/EPA internally)."""
-        gjk_result = gjk_epa(shape_a, shape_b)
-        if gjk_result.distance >= 0.0:
+        """Generate contact patch (runs GJK/MPR internally)."""
+        gjk_result = gjk_mpr(shape_a, shape_b)
+        if gjk_result.distance > 0.0:
             result = ContactResult()
             result.count = 0
             return result
@@ -1177,7 +1301,7 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
         results_normal[tid] = r.normal
 
     @wp.kernel(enable_backward=False)
-    def gjk_epa_kernel(
+    def gjk_mpr_kernel(
         shapes_a: wp.array(dtype=ShapeData),
         shapes_b: wp.array(dtype=ShapeData),
         results_dist: wp.array(dtype=float),
@@ -1186,7 +1310,7 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
         results_normal: wp.array(dtype=wp.vec3),
     ):
         tid = wp.tid()
-        r = gjk_epa(shapes_a[tid], shapes_b[tid])
+        r = gjk_mpr(shapes_a[tid], shapes_b[tid])
         results_dist[tid] = r.distance
         results_point_a[tid] = r.point_a
         results_point_b[tid] = r.point_b
@@ -1255,10 +1379,10 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
         sb.margin = shape_margins[j]
 
         # Narrowphase
-        gjk_result = gjk_epa(sa, sb)
+        gjk_result = gjk_mpr(sa, sb)
 
         # Generate full contact patch if within contact_distance
-        if gjk_result.distance < contact_distance:
+        if gjk_result.distance <= contact_distance:
             r = generate_contacts_from_gjk(sa, sb, gjk_result)
             for ci in range(4):
                 if ci >= r.count:
@@ -1288,14 +1412,14 @@ def create_collider(shape_entries: list[ShapeEntry] | None = None):
         contact_face_world=contact_face_world,
         get_aabb=get_aabb,
         gjk_distance=gjk_distance,
-        gjk_epa=gjk_epa,
-        epa_depth=epa_depth,
+        gjk_mpr=gjk_mpr,
+        mpr_depth=mpr_depth,
         generate_contacts=generate_contacts,
         support_kernel=support_kernel,
         contact_face_kernel=contact_face_kernel,
         aabb_kernel=aabb_kernel,
         gjk_kernel=gjk_kernel,
-        gjk_epa_kernel=gjk_epa_kernel,
+        gjk_mpr_kernel=gjk_mpr_kernel,
         generate_contacts_kernel=generate_contacts_kernel,
         collide_nxn_kernel=collide_nxn_kernel,
     )

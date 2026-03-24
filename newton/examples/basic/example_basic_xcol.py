@@ -200,6 +200,9 @@ class XColPipeline:
 
         self._collider.collide(self._xcol_model, contact_distance=0.2)
 
+        # Clear Newton contact count before converting
+        contacts.rigid_contact_count.zero_()
+
         # Convert xcol contacts to Newton format
         wp.launch(
             _convert_contacts,

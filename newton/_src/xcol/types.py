@@ -22,13 +22,11 @@ import warp as wp
 # ---------------------------------------------------------------------------
 
 MAX_FACE_POINTS = 4
-GJK_MAX_ITERATIONS = 64
+GJK_MAX_ITERATIONS = 30
 GJK_EPSILON = 1.0e-6
-
-EPA_MAX_ITERATIONS = 32
-EPA_MAX_FACES = 64
-EPA_MAX_VERTS = 32
-EPA_EPSILON = 1.0e-4
+GJK_COLLIDE_EPSILON = 1.0e-4
+MPR_MAX_ITERATIONS = 30
+MPR_COLLIDE_EPSILON = 1.0e-5
 
 # Maximum intermediate polygon size during Sutherland-Hodgman clipping.
 # Starting polygon (4 pts) clipped by up to 8 planes can produce up to 12 vertices.
@@ -38,11 +36,8 @@ CLIP_MAX_POINTS = 16
 # Fixed-size matrix types
 # ---------------------------------------------------------------------------
 
-# EPA polytope storage
-EPAVerts = wp.types.matrix(shape=(EPA_MAX_VERTS, 3), dtype=wp.float32)
-EPAVertsA = wp.types.matrix(shape=(EPA_MAX_VERTS, 3), dtype=wp.float32)
-EPAVertsB = wp.types.matrix(shape=(EPA_MAX_VERTS, 3), dtype=wp.float32)
-EPAFaces = wp.types.matrix(shape=(EPA_MAX_FACES, 3), dtype=wp.float32)
+# GJK simplex storage: 4 vertices × 2 rows each (B, BtoA) = 8 rows of vec3
+Mat83f = wp.types.matrix(shape=(8, 3), dtype=wp.float32)
 
 # Clipped polygon storage: (x, y, z, depth) per point
 ClipPoly = wp.types.matrix(shape=(CLIP_MAX_POINTS, 4), dtype=wp.float32)
