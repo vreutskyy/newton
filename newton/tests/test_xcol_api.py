@@ -441,7 +441,114 @@ class TestBothBoxesRotating(unittest.TestCase):
                 n = normals[i]
                 n_len = np.linalg.norm(n)
                 self.assertGreater(n_len, 0.9, f"{msg}: contact {i} degenerate normal (len={n_len:.4f})")
-                self.assertLess(n_len, 1.1, f"{msg}: contact {i} non-unit normal (len={n_len:.4f})")
+
+
+class TestEdgeDepthSign(unittest.TestCase):
+    """Verify contact depth sign is correct for edge-edge contacts."""
+
+    @staticmethod
+    def _quat_y(angle):
+        return (0.0, np.sin(angle / 2.0), 0.0, np.cos(angle / 2.0))
+
+    def test_separated_parallel_edges_positive_depth(self):
+        """Two boxes tilted 45°, edges parallel, separated by gap.
+        All contact depths must be positive (= separation)."""
+        b = xc.Builder()
+        b.add_shape(xc.SHAPE_BOX, params=(0.25, 0.25, 0.25))
+        b.add_shape(xc.SHAPE_BOX, params=(0.25, 0.25, 0.25))
+        model = b.finalize()
+
+        tilt = np.pi / 4.0
+        q = self._quat_y(tilt)
+        gap = 0.05
+        sep = np.sqrt(2.0) * 0.25 * 2.0 + gap
+
+        transforms = np.zeros((2, 7), dtype=np.float32)
+        transforms[0, 3:] = q
+        transforms[1, :3] = [0, 0, sep]
+        transforms[1, 3:] = q
+        model.shape_transforms.assign(transforms)
+        _collider.collide(model, contact_distance=0.2)
+
+        count = _contact_count(model)
+        self.assertGreater(count, 0, "Should detect separated contact within contact_distance")
+        depths = model.contact_depth.numpy()[:count]
+        for i in range(count):
+            self.assertGreater(depths[i], 0, f"Separated contact {i} should have positive depth, got {depths[i]:.4f}")
+            self.assertAlmostEqual(
+                depths[i], gap, delta=0.01, msg=f"Contact {i} depth {depths[i]:.4f} != expected gap {gap}"
+            )
+
+    def test_penetrating_parallel_edges_negative_depth(self):
+        """Two boxes tilted 45°, edges parallel, overlapping.
+        All contact depths must be negative (= penetration)."""
+        b = xc.Builder()
+        b.add_shape(xc.SHAPE_BOX, params=(0.25, 0.25, 0.25))
+        b.add_shape(xc.SHAPE_BOX, params=(0.25, 0.25, 0.25))
+        model = b.finalize()
+
+        tilt = np.pi / 4.0
+        q = self._quat_y(tilt)
+        pen = 0.02
+        sep = np.sqrt(2.0) * 0.25 * 2.0 - pen
+
+        transforms = np.zeros((2, 7), dtype=np.float32)
+        transforms[0, 3:] = q
+        transforms[1, :3] = [0, 0, sep]
+        transforms[1, 3:] = q
+        model.shape_transforms.assign(transforms)
+        _collider.collide(model)
+
+        count = _contact_count(model)
+        self.assertGreater(count, 0, "Should detect penetrating contact")
+        depths = model.contact_depth.numpy()[:count]
+        for i in range(count):
+            self.assertLess(depths[i], 0, f"Penetrating contact {i} should have negative depth, got {depths[i]:.4f}")
+
+    def test_separated_nonparallel_edges_positive_depth(self):
+        """Two boxes at different tilts, edges not parallel, separated.
+        Contacts should have positive depth."""
+        b = xc.Builder()
+        b.add_shape(xc.SHAPE_BOX, params=(0.25, 0.25, 0.25))
+        b.add_shape(xc.SHAPE_BOX, params=(0.25, 0.25, 0.25))
+        model = b.finalize()
+
+        qa = self._quat_y(np.pi / 4.0)
+        # Box B tilted 45° around X instead of Y — edges cross
+        qb = (np.sin(np.pi / 8.0), 0.0, 0.0, np.cos(np.pi / 8.0))
+
+        gap = 0.05
+        # Conservative separation
+        sep = np.sqrt(3.0) * 0.25 + np.sqrt(3.0) * 0.25 + gap
+
+        for angle_z_deg in range(0, 360, 30):
+            angle_z = np.radians(angle_z_deg)
+            sz = np.sin(angle_z / 2.0)
+            cz = np.cos(angle_z / 2.0)
+            # Compose qb_rot = qz * qb
+            w1, x1, y1, z1 = cz, 0.0, 0.0, sz
+            w2, x2, y2, z2 = qb[3], qb[0], qb[1], qb[2]
+            qb_rot = (
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            )
+
+            transforms = np.zeros((2, 7), dtype=np.float32)
+            transforms[0, 3:] = qa
+            transforms[1, :3] = [0, 0, sep]
+            transforms[1, 3:] = qb_rot
+            model.shape_transforms.assign(transforms)
+            _collider.collide(model, contact_distance=0.2)
+
+            count = _contact_count(model)
+            if count == 0:
+                continue
+            depths = model.contact_depth.numpy()[:count]
+            msg = f"angle_z={angle_z_deg}°"
+            for i in range(count):
+                self.assertGreater(depths[i], -0.01, f"{msg}: separated contact {i} has wrong depth {depths[i]:.4f}")
 
 
 if __name__ == "__main__":

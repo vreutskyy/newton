@@ -245,13 +245,20 @@ class Example:
         # Ground box (static — body=-1 means fixed)
         builder.add_shape_box(body=-1, hx=5.0, hy=5.0, hz=0.1)
 
-        # Drop 5 boxes from increasing heights
+        # Drop 5 boxes from increasing heights with different rotations
         box_half = 0.25
+        rotations = [
+            wp.quat_identity(),
+            wp.quat_from_axis_angle(wp.vec3(0, 1, 0), 0.3),
+            wp.quat_from_axis_angle(wp.vec3(1, 0, 0), 0.5),
+            wp.quat_from_axis_angle(wp.vec3(1, 1, 0), 0.7),
+            wp.quat_from_axis_angle(wp.vec3(0, 1, 1), 1.0),
+        ]
         for i in range(5):
-            x = (i - 2) * 1.0
-            z = 1.0 + i * 0.8
+            x = 0  # (i - 2) * 1.0
+            z = 1.0 + i * 1.1
             body = builder.add_body(
-                xform=wp.transform(p=wp.vec3(x, 0.0, z), q=wp.quat_identity()),
+                xform=wp.transform(p=wp.vec3(x, 0.0, z), q=rotations[i]),
                 label=f"box_{i}",
             )
             builder.add_shape_box(body, hx=box_half, hy=box_half, hz=box_half)
