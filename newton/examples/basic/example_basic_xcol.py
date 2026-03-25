@@ -232,10 +232,10 @@ class XColPipeline:
 
 class Example:
     def __init__(self, viewer, args):
-        self.fps = 60
+        self.fps = 100
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 32
+        self.sim_substeps = 10
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.viewer = viewer
