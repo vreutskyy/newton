@@ -36,7 +36,7 @@ CLIP_MAX_POINTS = 16
 # Fixed-size matrix types
 # ---------------------------------------------------------------------------
 
-# GJK simplex storage: 4 vertices × 2 rows each (B, BtoA) = 8 rows of vec3
+# GJK simplex storage: 4 vertices x 2 rows each (B, BtoA) = 8 rows of vec3
 Mat83f = wp.types.matrix(shape=(8, 3), dtype=wp.float32)
 
 # Clipped polygon storage: (x, y, z, depth) per point

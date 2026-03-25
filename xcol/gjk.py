@@ -20,11 +20,11 @@
 
 """GJK simplex solver using bitmask vertex management.
 
-Simplex vertices are stored in a ``Mat83f`` (8×3 matrix).  Each vertex
+Simplex vertices are stored in a ``Mat83f`` (8x3 matrix).  Each vertex
 occupies two consecutive rows:
 
-- ``v[2*i]``     → B  (point on shape B in A-local frame)
-- ``v[2*i + 1]`` → BtoA  (Minkowski difference = A − B)
+- ``v[2*i]``     -> B  (point on shape B in A-local frame)
+- ``v[2*i + 1]`` -> BtoA  (Minkowski difference = A - B)
 
 A ``wp.uint32`` usage mask tracks which of the 4 slots are active.
 """
