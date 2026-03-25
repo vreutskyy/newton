@@ -24,7 +24,7 @@ import unittest
 import numpy as np
 import warp as wp
 
-import newton._src.xcol as xc
+import xcol as xc
 
 _collider = xc.create_collider()
 

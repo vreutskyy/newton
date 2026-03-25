@@ -26,8 +26,8 @@
 import warp as wp
 
 import newton
-import newton._src.xcol as xc
 import newton.examples
+import xcol as xc
 from newton._src.geometry.types import GeoType
 
 

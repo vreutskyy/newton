@@ -19,7 +19,7 @@ import unittest
 
 import numpy as np
 
-import newton._src.xcol as xc
+import xcol as xc
 
 _collider = xc.create_collider()
 

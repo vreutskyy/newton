@@ -17,7 +17,7 @@
 
 Example::
 
-    import newton._src.xcol as xc
+    import xcol as xc
 
     # Register custom shapes (optional — built-ins auto-registered)
     # xc.register_shape("cone", support_fn=..., contact_face_fn=..., aabb_fn=...)

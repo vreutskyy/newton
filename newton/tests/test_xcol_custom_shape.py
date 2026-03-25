@@ -25,8 +25,8 @@ import unittest
 import numpy as np
 import warp as wp
 
-import newton._src.xcol as xc
-from newton._src.xcol.types import ContactFaceResult, ShapeData
+import xcol as xc
+from xcol.types import ContactFaceResult, ShapeData
 
 # ---------------------------------------------------------------------------
 # Custom disk shape functions
