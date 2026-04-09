@@ -37,6 +37,7 @@
 - Add `compute_normals` and `compute_uvs` optional arguments to `Mesh.create_heightfield()` and `Mesh.create_terrain()`
 - Add RJ45 plug-socket insertion example with SDF contacts, latch joint, and interactive gizmo
 - Add `ViewerGL.log_scalar()` for live scalar time-series plots in the viewer
+- Add `ViewerViser.log_scalar()` for live scalar time-series plots via uPlot
 
 ### Changed
 
