@@ -388,7 +388,10 @@ def compare_compiled_model_fields(
         fields = MODEL_BACKFILL_FIELDS
 
     # Validated by compare_inertia_tensors() with physics-equivalence check
-    skip_fields = {"body_inertia", "body_iquat"}
+    # eq_data for CONNECT constraints is body-frame dependent: when body_quat differs
+    # due to inertia re-diagonalization, the body2-frame anchor differs structurally
+    # but remains physically equivalent (validated by dynamics after backfill).
+    skip_fields = {"body_inertia", "body_iquat", "eq_data"}
 
     for field in fields:
         if field in skip_fields:
@@ -2229,7 +2232,15 @@ class TestMenagerie_AgilityCassie(TestMenagerieMJCF):
     """Agility Robotics Cassie biped."""
 
     robot_folder = "agility_cassie"
-    skip_reason = "Closed-loop kinematic chains cause different DOF layout"
+    num_steps = 20
+    dynamics_tolerance = 2e-5
+    backfill_model = True
+    # jnt_actfrclimited: Newton unconditionally sets True with effort_limit=1e6,
+    # while native keeps False when no actuatorfrcrange is specified. Flagged as
+    # "no effect" in DEFAULT_MODEL_SKIP_FIELDS, but Cassie's closed-loop dynamics
+    # show a measurable divergence without this backfill (qvel step 0 diff ~2e-5).
+    backfill_fields = MODEL_BACKFILL_FIELDS + ["eq_data", "jnt_actfrclimited"]
+    model_skip_fields = DEFAULT_MODEL_SKIP_FIELDS | {"eq_data"}
 
 
 # -----------------------------------------------------------------------------
