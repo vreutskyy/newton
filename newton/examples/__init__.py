@@ -237,10 +237,15 @@ class _ExampleBrowser:
         try:
             mod = importlib.import_module(module_path)
             parser = getattr(mod.Example, "create_parser", create_parser)()
-            example = mod.Example(self.viewer, default_args(parser))
+            new_args = default_args(parser)
+            example = mod.Example(self.viewer, new_args)
         except Exception as e:
             warnings.warn(f"Failed to load example {module_path}: {e}", stacklevel=2)
             return None, example_class
+        # Track the args used to launch the current example so a subsequent
+        # Reset reuses the new example's args, not the originally launched
+        # example's args (different parsers expose different fields).
+        self._initial_args = copy.deepcopy(new_args)
         self._register_ui(example)
         return example, type(example)
 
