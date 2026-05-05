@@ -186,12 +186,13 @@ def test_particle_state(
 class _ExampleBrowser:
     """Manages the example browser UI and switching/reset logic for the run loop."""
 
-    def __init__(self, viewer):
+    def __init__(self, viewer, args=None):
         self.viewer = viewer
         self.switch_target: str | None = None
         self._reset_requested = False
         self.callback = None
         self._tree: dict[str, list[tuple[str, str]]] = {}
+        self._initial_args = args
 
         if not hasattr(viewer, "register_ui_callback"):
             return
@@ -245,11 +246,19 @@ class _ExampleBrowser:
         The caller must drop its reference to the old example before calling
         this method.
         """
+        import argparse  # noqa: PLC0415
+
         self._reset_requested = False
         self.viewer.clear_model()
         try:
-            parser = getattr(example_class, "create_parser", create_parser)()
-            new_example = example_class(self.viewer, default_args(parser))
+            if self._initial_args is not None:
+                # Re-create the example with the user's original CLI args so
+                # options like --world-count survive a reset.
+                args = argparse.Namespace(**vars(self._initial_args))
+            else:
+                parser = getattr(example_class, "create_parser", create_parser)()
+                args = default_args(parser)
+            new_example = example_class(self.viewer, args)
         except Exception as e:
             warnings.warn(f"Failed to reset example: {e}", stacklevel=2)
             return None
@@ -274,7 +283,7 @@ def run(example, args):
     test_post_step = perform_test and hasattr(example, "test_post_step")
     test_final = perform_test and hasattr(example, "test_final")
 
-    browser = _ExampleBrowser(viewer) if not perform_test else None
+    browser = _ExampleBrowser(viewer, args) if not perform_test else None
 
     if hasattr(example, "gui") and hasattr(viewer, "register_ui_callback"):
         viewer.register_ui_callback(lambda ui, ex=example: ex.gui(ui), position="side")
