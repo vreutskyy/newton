@@ -1,124 +1,150 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Regression tests for the example-browser switch/reset args plumbing.
+"""Smoke-test registered examples for browser switch & reset compatibility.
 
-The companion :mod:`newton.tests.smoketest_example_browser` script runs every
-registered example through the browser using a real GL viewer; it is not
-auto-discovered.
+This script requires the GL viewer and must be run manually (not via pytest).
+No functions use the ``test_`` prefix, so pytest will not collect any test cases.
+
+Iterates through examples returned by ``newton.examples.get_examples()``,
+attempts to instantiate each one (as the example browser would) using the GL
+viewer, runs N frames of step + render, and then resets it.  Exceptions are
+caught and logged so the full suite runs to completion.
+
+Usage:
+    uv run python newton/tests/test_example_browser.py                     # all examples, 1 frame
+    uv run python newton/tests/test_example_browser.py "mpm_*" --frames 10 # mpm examples, 10 frames
+    uv run python newton/tests/test_example_browser.py "robot_h1" "cloth_*" --frames 5
 """
 
-import types
-import unittest
-from unittest.mock import patch
+import argparse
+import fnmatch
+import importlib
+import sys
+import time
+import traceback
 
+import warp as wp
+
+import newton
 import newton.examples
-from newton.examples import _ExampleBrowser
+import newton.viewer
+
+wp.init()
+
+SKIP_EXAMPLES = {
+    "robot_policy",  # non-standard constructor: (viewer, config, asset_directory, mjc_to_physx, physx_to_mjc)
+}
 
 
-class _StubViewer:
-    """Minimal viewer stub for exercising _ExampleBrowser without a UI."""
-
-    def __init__(self):
-        self.cleared = 0
-
-    def clear_model(self):
-        self.cleared += 1
+def _step_and_render(example, num_frames):
+    for _ in range(num_frames):
+        if hasattr(example, "step"):
+            example.step()
+        if hasattr(example, "render"):
+            example.render()
 
 
-class _StubExample:
-    """Captures the args namespace passed by the example browser."""
+def main():
+    parser = argparse.ArgumentParser(description="Smoke-test example browser switch & reset.")
+    parser.add_argument(
+        "patterns", nargs="*", default=["*"], help="Wildcard patterns to match example names (default: all)"
+    )
+    parser.add_argument(
+        "--frames", "-n", type=int, default=1, help="Number of frames to step/render per example (default: 1)"
+    )
+    cli_args = parser.parse_args()
 
-    def __init__(self, viewer, args):
-        self.viewer = viewer
-        self.args = args
+    example_map = newton.examples.get_examples()
+    create_parser = newton.examples.create_parser
+    default_args = newton.examples.default_args
 
-    @staticmethod
-    def create_parser():
-        parser = newton.examples.create_parser()
-        newton.examples.add_world_count_arg(parser)
-        parser.set_defaults(world_count=4)
-        return parser
+    matched = {
+        name: mod
+        for name, mod in sorted(example_map.items())
+        if name not in SKIP_EXAMPLES and any(fnmatch.fnmatch(name, p) for p in cli_args.patterns)
+    }
 
+    if not matched:
+        print(f"No examples matched patterns: {cli_args.patterns}")
+        return 1
 
-class _OtherStubExample:
-    """Second stub example with a different parser default to exercise switch()."""
+    viewer = newton.viewer.ViewerGL()
 
-    def __init__(self, viewer, args):
-        self.viewer = viewer
-        self.args = args
+    results: list[dict] = []
+    total = len(matched)
 
-    @staticmethod
-    def create_parser():
-        parser = newton.examples.create_parser()
-        newton.examples.add_world_count_arg(parser)
-        parser.set_defaults(world_count=7)
-        return parser
+    print(f"Running {total} example(s), {cli_args.frames} frame(s) each\n", flush=True)
 
+    for i, (name, module_path) in enumerate(matched.items(), 1):
+        entry = {"name": name, "module": module_path, "switch": None, "reset": None}
+        print(f"[{i}/{total}] {name} ({module_path})", flush=True)
 
-class TestExampleBrowserReset(unittest.TestCase):
-    def test_reset_preserves_user_provided_args(self):
-        # Simulate the user invoking the example with `--world-count 2`.
-        args = _StubExample.create_parser().parse_args(["--world-count", "2"])
-        self.assertEqual(args.world_count, 2)
+        # --- switch (instantiate from scratch) ---
+        try:
+            viewer.clear_model()
+            mod = importlib.import_module(module_path)
+            ex_parser = getattr(mod.Example, "create_parser", create_parser)()
+            args = default_args(ex_parser)
+            t0 = time.perf_counter()
+            example = mod.Example(viewer, args)
+            _step_and_render(example, cli_args.frames)
+            dt = time.perf_counter() - t0
+            entry["switch"] = "OK"
+            print(f"  switch: OK ({dt:.2f}s)", flush=True)
+        except Exception:
+            entry["switch"] = traceback.format_exc()
+            print(f"  switch: FAIL\n{entry['switch']}", flush=True)
+            results.append(entry)
+            continue
 
-        viewer = _StubViewer()
-        browser = _ExampleBrowser(viewer, args)
+        # --- reset (re-instantiate same class) ---
+        try:
+            viewer.clear_model()
+            example_class = type(example)
+            ex_parser = getattr(example_class, "create_parser", create_parser)()
+            args = default_args(ex_parser)
+            t0 = time.perf_counter()
+            example2 = example_class(viewer, args)
+            _step_and_render(example2, cli_args.frames)
+            dt = time.perf_counter() - t0
+            entry["reset"] = "OK"
+            print(f"  reset:  OK ({dt:.2f}s)", flush=True)
+        except Exception:
+            entry["reset"] = traceback.format_exc()
+            print(f"  reset:  FAIL\n{entry['reset']}", flush=True)
 
-        new_example = browser.reset(_StubExample)
+        results.append(entry)
 
-        self.assertIsNotNone(new_example)
-        self.assertEqual(new_example.args.world_count, 2)
-        self.assertEqual(viewer.cleared, 1)
+    # --- summary ---
+    switch_ok = sum(1 for r in results if r["switch"] == "OK")
+    reset_ok = sum(1 for r in results if r["reset"] == "OK")
+    switch_fail = [r for r in results if r["switch"] != "OK"]
+    reset_fail = [r for r in results if r["reset"] not in ("OK", None)]
 
-    def test_reset_falls_back_to_defaults_when_no_args(self):
-        viewer = _StubViewer()
-        browser = _ExampleBrowser(viewer)
+    print("\n" + "=" * 70, flush=True)
+    print(f"RESULTS: {switch_ok}/{total} switch OK, {reset_ok}/{total} reset OK")
+    print("=" * 70)
 
-        new_example = browser.reset(_StubExample)
+    if switch_fail:
+        print(f"\n--- SWITCH FAILURES ({len(switch_fail)}) ---")
+        for r in switch_fail:
+            print(f"\n  {r['name']} ({r['module']}):")
+            for line in r["switch"].strip().splitlines():
+                print(f"    {line}")
 
-        self.assertIsNotNone(new_example)
-        self.assertEqual(new_example.args.world_count, 4)
+    if reset_fail:
+        print(f"\n--- RESET FAILURES ({len(reset_fail)}) ---")
+        for r in reset_fail:
+            print(f"\n  {r['name']} ({r['module']}):")
+            for line in r["reset"].strip().splitlines():
+                print(f"    {line}")
 
-    def test_reset_snapshots_args_against_later_mutation(self):
-        # The browser should snapshot the args at construction time so that
-        # later mutations of the caller's namespace (or of nested mutable
-        # fields) do not leak into the reset behavior.
-        args = _StubExample.create_parser().parse_args(["--world-count", "2"])
-        args.warp_config.append("dummy=1")
+    if not switch_fail and not reset_fail:
+        print("\nAll examples passed!")
 
-        browser = _ExampleBrowser(_StubViewer(), args)
-
-        args.world_count = 99
-        args.warp_config.append("mutated=1")
-
-        new_example = browser.reset(_StubExample)
-
-        self.assertIsNotNone(new_example)
-        self.assertEqual(new_example.args.world_count, 2)
-        self.assertEqual(new_example.args.warp_config, ["dummy=1"])
-
-    def test_reset_after_switch_uses_new_example_args(self):
-        # Original launch: _StubExample with --world-count 2.
-        args = _StubExample.create_parser().parse_args(["--world-count", "2"])
-        browser = _ExampleBrowser(_StubViewer(), args)
-
-        # Simulate the user picking _OtherStubExample from the browser tree.
-        browser.switch_target = "fake.module.path"
-        fake_module = types.SimpleNamespace(Example=_OtherStubExample)
-        with patch("newton.examples.importlib.import_module", return_value=fake_module):
-            new_example, new_class = browser.switch(_StubExample)
-
-        self.assertIs(new_class, _OtherStubExample)
-        self.assertEqual(new_example.args.world_count, 7)
-
-        # Reset after switch must use the new example's args (its parser
-        # defaults), not the originally launched _StubExample's args.
-        reset_example = browser.reset(new_class)
-        self.assertIsNotNone(reset_example)
-        self.assertIsInstance(reset_example, _OtherStubExample)
-        self.assertEqual(reset_example.args.world_count, 7)
+    return 1 if (switch_fail or reset_fail) else 0
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(main())
