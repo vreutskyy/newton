@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import ast
+import copy
 import gc
 import importlib
 import os
@@ -192,7 +193,10 @@ class _ExampleBrowser:
         self._reset_requested = False
         self.callback = None
         self._tree: dict[str, list[tuple[str, str]]] = {}
-        self._initial_args = args
+        # Deep-copy so later mutations to the caller's namespace (or to
+        # nested mutable fields like ``args.warp_config``) do not change
+        # what Reset restores.
+        self._initial_args = copy.deepcopy(args) if args is not None else None
 
         if not hasattr(viewer, "register_ui_callback"):
             return
@@ -246,15 +250,14 @@ class _ExampleBrowser:
         The caller must drop its reference to the old example before calling
         this method.
         """
-        import argparse  # noqa: PLC0415
-
         self._reset_requested = False
         self.viewer.clear_model()
         try:
             if self._initial_args is not None:
                 # Re-create the example with the user's original CLI args so
-                # options like --world-count survive a reset.
-                args = argparse.Namespace(**vars(self._initial_args))
+                # options like --world-count survive a reset; deep-copy so
+                # the new instance cannot mutate the snapshot.
+                args = copy.deepcopy(self._initial_args)
             else:
                 parser = getattr(example_class, "create_parser", create_parser)()
                 args = default_args(parser)

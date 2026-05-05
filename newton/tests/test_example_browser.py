@@ -63,6 +63,23 @@ class TestExampleBrowserReset(unittest.TestCase):
         self.assertIsNotNone(new_example)
         self.assertEqual(new_example.args.world_count, 4)
 
+    def test_reset_snapshots_args_against_later_mutation(self):
+        # The browser should snapshot the args at construction time so that
+        # later mutations of the caller's namespace (or of nested mutable
+        # fields) do not leak into the reset behavior.
+        args = _StubExample.create_parser().parse_args(["--world-count", "2"])
+        args.warp_config.append("dummy=1")
+
+        browser = _ExampleBrowser(_StubViewer(), args)
+
+        args.world_count = 99
+        args.warp_config.append("mutated=1")
+
+        new_example = browser.reset(_StubExample)
+
+        self.assertEqual(new_example.args.world_count, 2)
+        self.assertEqual(new_example.args.warp_config, ["dummy=1"])
+
 
 if __name__ == "__main__":
     unittest.main()
