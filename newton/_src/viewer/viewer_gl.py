@@ -402,14 +402,17 @@ class ViewerGL(ViewerBase):
 
     @override
     def _arrow_scale(self) -> float:
+        """Contact-arrow length multiplier, sourced from the GL renderer."""
         return self.renderer.arrow_length_scale
 
     @override
     def _joint_scale(self) -> float:
+        """Joint-axis length multiplier, sourced from the GL renderer."""
         return self.renderer.joint_scale
 
     @override
     def _com_scale(self) -> float:
+        """COM sphere radius multiplier, sourced from the GL renderer."""
         return self.renderer.com_scale
 
     @override
@@ -1160,7 +1163,7 @@ class ViewerGL(ViewerBase):
 
         if radii is None:
             radii = wp.full(num_points, 0.1, dtype=wp.float32, device=self.device)
-        elif isinstance(radii, (int, float)):
+        elif isinstance(radii, (int, float, np.integer, np.floating)):
             radii = wp.full(num_points, float(radii), dtype=wp.float32, device=self.device)
 
         # If a point object is first created/recreated and no colors are provided,
