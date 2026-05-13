@@ -36,10 +36,12 @@ import warp as wp
 import newton
 import newton.utils
 from newton.solvers import SolverMuJoCo
+from newton._src.sim.enums import JointType
 from newton.tests.test_menagerie_mujoco import (
     DEFAULT_MODEL_SKIP_FIELDS,
     TestMenagerieBase,
     compare_inertia_tensors,
+    run_newton_eval_fk,
 )
 from newton.tests.unittest_utils import USD_AVAILABLE
 from newton.usd import SchemaResolverMjc, SchemaResolverNewton
@@ -596,6 +598,33 @@ def build_dof_index_map(
             dof_map[native_adr + d] = newton_adr + d
 
     return dof_map
+
+
+def build_qpos_index_map(
+    newton_mjw: Any,
+    native_mjw: Any,
+    jnt_map: dict[int, int],
+) -> dict[int, int]:
+    """Build native_qpos_idx -> newton_qpos_idx mapping from the joint map.
+
+    Per-joint qpos slot counts: FREE=7 (xyz + wxyz), BALL=4 (wxyz), HINGE/SLIDE=1.
+    """
+    newton_qposadr = newton_mjw.jnt_qposadr.numpy().flatten()
+    native_qposadr = native_mjw.jnt_qposadr.numpy().flatten()
+    native_type = native_mjw.jnt_type.numpy().flatten()
+
+    def _nqpos(jtype: int) -> int:
+        return {0: 7, 1: 4, 2: 1, 3: 1}.get(int(jtype), 1)
+
+    qpos_map: dict[int, int] = {}
+    for native_ji, newton_ji in jnt_map.items():
+        native_adr = int(native_qposadr[native_ji])
+        newton_adr = int(newton_qposadr[newton_ji])
+        n = _nqpos(native_type[native_ji])
+        for d in range(n):
+            qpos_map[native_adr + d] = newton_adr + d
+
+    return qpos_map
 
 
 def _actuator_target_name(mj_model: Any, act_idx: int) -> str:
@@ -1187,6 +1216,11 @@ class TestMenagerieUSD(TestMenagerieBase):
             native_mjw_model,
             cls._jnt_map,
         )
+        cls._qpos_map = build_qpos_index_map(
+            newton_solver.mjw_model,
+            native_mjw_model,
+            cls._jnt_map,
+        )
         cls._actuator_map = build_actuator_index_map(newton_solver.mj_model, mj_model)
 
     def _compare_body_physics(self, newton_mjw: Any, native_mjw: Any) -> None:
@@ -1236,6 +1270,92 @@ class TestMenagerieUSD(TestMenagerieBase):
             num_worlds=self.num_worlds,
             add_ground=False,  # scene.xml includes ground plane
         )
+
+    def test_forward_kinematics(self):
+        """USD variant: remap qpos and body indices by name before comparing.
+
+        Newton's USD importer assigns body/joint indices in alphabetical-by-prim-path
+        order (inherited from ``UsdPhysics.ArticulationDesc.articulatedBodies``),
+        which differs from native MJCF's authored-order indexing for any robot whose
+        subtree names don't sort the same as their authoring order. The base FK test
+        copies Newton's qpos vector directly to native and compares xpos index-by-
+        index; that fails whenever the orderings differ. This override remaps qpos
+        from Newton's joint layout to native's via ``_qpos_map`` before copying, and
+        permutes body fields via ``_body_map`` before the per-field comparison.
+        """
+        if not self.fk_enabled:
+            self.skipTest("Forward kinematics not enabled for this robot")
+
+        self._ensure_models()
+        self._run_model_comparisons()
+        self._backfill_and_recompute()
+
+        from mujoco_warp._src import smooth as mjw_smooth  # noqa: PLC0415
+
+        model = self._newton_model
+        solver = self._newton_solver
+
+        state = model.state()
+
+        rng = np.random.default_rng(seed=42)
+        joint_q_np = model.joint_q.numpy()
+        joint_q_np += rng.uniform(-0.1, 0.1, size=joint_q_np.shape).astype(np.float32)
+
+        joint_type = model.joint_type.numpy()
+        q_start = model.joint_q_start.numpy()
+        for j in range(len(joint_type)):
+            jt = joint_type[j]
+            qi = q_start[j]
+            if jt == JointType.FREE:
+                q = joint_q_np[qi + 3 : qi + 7]
+                q /= np.linalg.norm(q)
+            elif jt == JointType.BALL:
+                q = joint_q_np[qi : qi + 4]
+                q /= np.linalg.norm(q)
+
+        state.joint_q.assign(joint_q_np)
+        solver._update_mjc_data(solver.mjw_data, model, state)
+
+        # Remap Newton-layout qpos into native-layout before copying.
+        newton_qpos = solver.mjw_data.qpos.numpy()
+        native_qpos = self._native_mjw_data.qpos.numpy().copy()
+        native_idx = np.fromiter(self._qpos_map.keys(), dtype=np.int64)
+        newton_idx = np.fromiter(self._qpos_map.values(), dtype=np.int64)
+        native_qpos[..., native_idx] = newton_qpos[..., newton_idx]
+        self._native_mjw_data.qpos.assign(native_qpos)
+
+        run_newton_eval_fk(solver, model, state)
+        mjw_smooth.kinematics(self._native_mjw_model, self._native_mjw_data)
+        mjw_smooth.com_pos(self._native_mjw_model, self._native_mjw_data)
+
+        # Compare FK fields after permuting Newton's body axis to native's order.
+        # _body_map is native_body_idx -> newton_body_idx.
+        body_perm = np.fromiter(
+            (self._body_map[ni] for ni in range(self._native_mjw_model.nbody)),
+            dtype=np.int64,
+            count=int(self._native_mjw_model.nbody),
+        )
+        for field_name in self.fk_fields:
+            newton_arr = getattr(solver.mjw_data, field_name).numpy()
+            native_arr = self._native_mjw_data.qpos.numpy() if field_name == "qpos" else getattr(
+                self._native_mjw_data, field_name
+            ).numpy()
+            # body-axis is axis 1 (shape: nworld, nbody, ...)
+            newton_permuted = newton_arr[:, body_perm]
+            if newton_arr.dtype == wp.quat or field_name == "xquat":
+                direct = np.abs(newton_permuted - native_arr)
+                flipped = np.abs(newton_permuted + native_arr)
+                use_flipped = np.max(flipped, axis=-1, keepdims=True) < np.max(direct, axis=-1, keepdims=True)
+                diff = np.where(use_flipped, flipped, direct)
+            else:
+                diff = np.abs(newton_permuted - native_arr)
+            max_diff = float(np.max(diff))
+            if max_diff > self.fk_tolerance:
+                worst = np.unravel_index(np.argmax(diff), diff.shape)
+                raise AssertionError(
+                    f"FK field '{field_name}': max diff {max_diff:.4e} > tol {self.fk_tolerance:.2e}\n"
+                    f"  at index {worst}: newton(permuted)={newton_permuted[worst]} native={native_arr[worst]}"
+                )
 
     def test_fk_initial_xforms(self):
         """Verify initial body transforms are consistent with forward kinematics.
@@ -1370,7 +1490,7 @@ class TestMenagerieUSD_G1WithHands(TestMenagerieUSD):
 
     num_worlds = 2
     num_steps = 0  # USD dynamics not yet tested with step-response
-    fk_enabled = False  # xpos diff 0.109 — USD import issue (#2420)
+    fk_enabled = True
 
 
 @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
@@ -1384,7 +1504,7 @@ class TestMenagerieUSD_ShadowHand(TestMenagerieUSD):
 
     num_worlds = 2
     num_steps = 0  # USD dynamics not yet tested with step-response
-    fk_enabled = False  # xpos diff 0.146 — USD import issue (#2420)
+    fk_enabled = True
 
 
 @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
@@ -1413,7 +1533,7 @@ class TestMenagerieUSD_ApptronikApollo(TestMenagerieUSD):
 
     num_worlds = 2
     num_steps = 0  # USD dynamics not yet tested with step-response
-    fk_enabled = False  # xpos diff 1.56 — USD import issue (#2420)
+    fk_enabled = True
     njmax = 398
 
     # Apollo's USD has no collision geoms, so geom/collision counts differ.
@@ -1435,7 +1555,14 @@ class TestMenagerieUSD_BoosterT1(TestMenagerieUSD):
 
     num_worlds = 2
     num_steps = 0  # USD dynamics not yet tested with step-response
-    fk_enabled = False  # xpos diff 0.509 — USD import issue (#2420)
+    fk_enabled = True
+    # AL1/AR1 body_quat in the USD asset is authored as
+    # (0.9999999, 0, 0.00048828122, 0) while the source MJCF has
+    # quat="1 0 0.000440565 0" (post-normalize ~0.000440565). Newton imports
+    # the USD value faithfully so the FK xquat diff (~4.77e-5) propagates
+    # into those bodies and their children. Upstream asset mismatch, not a
+    # Newton bug; bump tolerance until the USD asset is synced with the MJCF.
+    fk_tolerance = 1e-4
 
 
 @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
@@ -1449,7 +1576,7 @@ class TestMenagerieUSD_WonikAllegro(TestMenagerieUSD):
 
     num_worlds = 2
     num_steps = 0  # USD dynamics not yet tested with step-response
-    fk_enabled = False  # xpos diff 0.106 — USD import issue (#2420)
+    fk_enabled = True
 
     def _compare_inertia(self, newton_mjw: Any, native_mjw: Any) -> None:
         # TODO: USD asset has different mass/inertia values than the original MJCF.
