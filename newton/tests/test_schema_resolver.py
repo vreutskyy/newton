@@ -457,20 +457,23 @@ class TestSchemaResolver(unittest.TestCase):
 
         self.assertEqual(len(builder_newton.joint_limit_ke), len(builder_mjc.joint_limit_ke))
         self.assertEqual(len(builder_newton.joint_limit_kd), len(builder_mjc.joint_limit_kd))
-        # Skip entries with zero stiffness (free-joint DOFs have no limits authored).
-        revolute_count = 0
+        # Skip entries with zero stiffness/damping (free-joint DOFs have no limits authored).
+        ke_count = 0
         for physx_ke, mjc_ke in zip(builder_newton.joint_limit_ke, builder_mjc.joint_limit_ke, strict=False):
             if physx_ke == 0.0 and mjc_ke == 0.0:
                 continue
-            revolute_count += 1
+            ke_count += 1
             self.assertAlmostEqual(physx_ke, expected_physx_ke, places=3)
             self.assertAlmostEqual(mjc_ke, expected_mjc_ke, places=3)
+        kd_count = 0
         for physx_kd, mjc_kd in zip(builder_newton.joint_limit_kd, builder_mjc.joint_limit_kd, strict=False):
             if physx_kd == 0.0 and mjc_kd == 0.0:
                 continue
+            kd_count += 1
             self.assertAlmostEqual(physx_kd, expected_physx_kd, places=3)
             self.assertAlmostEqual(mjc_kd, expected_mjc_kd, places=3)
-        self.assertGreater(revolute_count, 0, "Expected at least one revolute joint with authored limits")
+        self.assertGreater(ke_count, 0, "Expected at least one revolute joint with authored limit_ke")
+        self.assertGreater(kd_count, 0, "Expected at least one revolute joint with authored limit_kd")
 
     def test_newton_custom_attributes(self):
         """

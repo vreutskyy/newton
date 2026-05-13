@@ -1937,6 +1937,7 @@ def Xform "Articulation" (
         self.assertAlmostEqual(float(limit_ke[dof2]), builder.default_joint_cfg.limit_ke, places=4)
         self.assertAlmostEqual(float(limit_kd[dof2]), builder.default_joint_cfg.limit_kd, places=4)
 
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_solreflimit_parsing_revolute(self):
         """Joint mjc:solreflimit on a revolute joint must produce per-radian limit_ke/_kd.
 
