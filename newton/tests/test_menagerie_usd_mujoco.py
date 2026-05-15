@@ -35,8 +35,8 @@ import warp as wp
 
 import newton
 import newton.utils
-from newton.solvers import SolverMuJoCo
 from newton._src.sim.enums import JointType
+from newton.solvers import SolverMuJoCo
 from newton.tests.test_menagerie_mujoco import (
     DEFAULT_MODEL_SKIP_FIELDS,
     TestMenagerieBase,
@@ -1336,7 +1336,7 @@ class TestMenagerieUSD(TestMenagerieBase):
 
         # Re-run kinematics/RNE so derived data fields reflect the backfilled model
         # (mirrors TestMenagerieBase._backfill_and_recompute).
-        from mujoco_warp._src import smooth as mjw_smooth  # noqa: PLC0415
+        from mujoco_warp._src import smooth as mjw_smooth
 
         mjw_smooth.kinematics(newton_mjw, self._newton_solver.mjw_data)
         mjw_smooth.com_pos(newton_mjw, self._newton_solver.mjw_data)
@@ -1374,7 +1374,7 @@ class TestMenagerieUSD(TestMenagerieBase):
         self._run_model_comparisons()
         self._backfill_and_recompute()
 
-        from mujoco_warp._src import smooth as mjw_smooth  # noqa: PLC0415
+        from mujoco_warp._src import smooth as mjw_smooth
 
         model = self._newton_model
         solver = self._newton_solver
@@ -1421,9 +1421,11 @@ class TestMenagerieUSD(TestMenagerieBase):
         )
         for field_name in self.fk_fields:
             newton_arr = getattr(solver.mjw_data, field_name).numpy()
-            native_arr = self._native_mjw_data.qpos.numpy() if field_name == "qpos" else getattr(
-                self._native_mjw_data, field_name
-            ).numpy()
+            native_arr = (
+                self._native_mjw_data.qpos.numpy()
+                if field_name == "qpos"
+                else getattr(self._native_mjw_data, field_name).numpy()
+            )
             # body-axis is axis 1 (shape: nworld, nbody, ...)
             newton_permuted = newton_arr[:, body_perm]
             if newton_arr.dtype == wp.quat or field_name == "xquat":
