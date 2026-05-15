@@ -35,7 +35,6 @@ import warp as wp
 
 import newton
 import newton.utils
-from newton._src.sim.enums import JointType
 from newton.solvers import SolverMuJoCo
 from newton.tests.test_menagerie_mujoco import (
     DEFAULT_MODEL_SKIP_FIELDS,
@@ -1390,10 +1389,10 @@ class TestMenagerieUSD(TestMenagerieBase):
         for j in range(len(joint_type)):
             jt = joint_type[j]
             qi = q_start[j]
-            if jt == JointType.FREE:
+            if jt == newton.JointType.FREE:
                 q = joint_q_np[qi + 3 : qi + 7]
                 q /= np.linalg.norm(q)
-            elif jt == JointType.BALL:
+            elif jt == newton.JointType.BALL:
                 q = joint_q_np[qi : qi + 4]
                 q /= np.linalg.norm(q)
 
@@ -1421,14 +1420,11 @@ class TestMenagerieUSD(TestMenagerieBase):
         )
         for field_name in self.fk_fields:
             newton_arr = getattr(solver.mjw_data, field_name).numpy()
-            native_arr = (
-                self._native_mjw_data.qpos.numpy()
-                if field_name == "qpos"
-                else getattr(self._native_mjw_data, field_name).numpy()
-            )
+            native_arr = getattr(self._native_mjw_data, field_name).numpy()
             # body-axis is axis 1 (shape: nworld, nbody, ...)
             newton_permuted = newton_arr[:, body_perm]
-            if newton_arr.dtype == wp.quat or field_name == "xquat":
+            if field_name == "xquat":
+                # Quaternion sign equivalence: q and -q represent the same rotation.
                 direct = np.abs(newton_permuted - native_arr)
                 flipped = np.abs(newton_permuted + native_arr)
                 use_flipped = np.max(flipped, axis=-1, keepdims=True) < np.max(direct, axis=-1, keepdims=True)
