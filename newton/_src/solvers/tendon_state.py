@@ -327,6 +327,7 @@ class TendonStateMixin:
                 self.tendon_seg_rolling_delta_r,
                 0,
                 0,
+                model.tendon_material_sweeps,
             ],
             device=model.device,
         )

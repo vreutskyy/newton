@@ -2352,6 +2352,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_seg_rolling_delta_r,
                 1,
                 1,
+                model.tendon_material_sweeps,
             ],
             device=self.device,
         )

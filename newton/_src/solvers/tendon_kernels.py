@@ -120,6 +120,7 @@ def update_tendon_attachments(
     seg_rolling_delta_r: wp.array[float],
     apply_rolling_transfer: int,
     apply_pinhole_slip: int,
+    tendon_material_sweeps: wp.array[int],
 ):
     """Update routed tendon tangent points and free-span rest-length transfer."""
     tendon_id = wp.tid()
@@ -302,13 +303,14 @@ def update_tendon_attachments(
                 # rebuild below conserves total cable length (rest = len - stretch).
                 seg_stretch[seg] = len_snap - seg_rest_length[seg]
 
-        material_sweep_count = int(4)
-        for i in range(1, num_links - 1):
-            link_idx = link_start + i
-            if tendon_link_type[link_idx] == int(TendonLinkType.PINHOLE):
-                material_sweep_count = int(32)
+        # Number of capstan/material relaxation passes for this tendon (model.tendon_material_sweeps,
+        # auto-sized from its segment count, overridable per tendon). The transport is a convergent
+        # relaxation, so more passes give a more precise capstan, monotonically, until converged --
+        # same mechanism for rolling and pinhole links (no per-type tuning). Clamped to the static
+        # loop bound for compile-time unrolling; `continue` (not `break`) keeps the bound static.
+        material_sweep_count = wp.min(tendon_material_sweeps[tendon_id], 256)
 
-        for material_sweep in range(32):
+        for material_sweep in range(256):
             if material_sweep >= material_sweep_count:
                 continue
 
@@ -328,44 +330,6 @@ def update_tendon_attachments(
                 seg_adj_left = seg_offset + i - 1
                 seg_adj_right = seg_offset + i
                 cap_ratio = float(1.0)
-
-                if material_sweep == 0 and is_rolling and apply_rolling_transfer != 0:
-                    radius = tendon_link_radius[link_idx]
-                    if radius > 0.0:
-                        body = tendon_link_body[link_idx]
-                        pose = body_q[body]
-                        center = wp.transform_point(pose, tendon_link_offset[link_idx])
-                        normal = wp.transform_vector(pose, tendon_link_axis[link_idx])
-
-                        pt_left = seg_attachment_r[seg_adj_left]
-                        pt_right = seg_attachment_l[seg_adj_right]
-                        r_left = pt_left - center
-                        r_right = pt_right - center
-                        r_left = r_left - wp.dot(r_left, normal) * normal
-                        r_right = r_right - wp.dot(r_right, normal) * normal
-                        len_rl = wp.length(r_left)
-                        len_rr = wp.length(r_right)
-                        theta = wp.pi
-                        if len_rl > 1.0e-8 and len_rr > 1.0e-8:
-                            u_left = r_left / len_rl
-                            u_right = r_right / len_rr
-                            theta = wp.abs(wp.atan2(wp.dot(wp.cross(u_left, u_right), normal), wp.dot(u_left, u_right)))
-
-                        cap_ratio = wp.exp(wp.min(wp.max(tendon_link_mu[link_idx], 0.0) * theta, 20.0))
-                        beta = (cap_ratio - 1.0) / (cap_ratio + 1.0)
-
-                        # rolling beta-nudge, expressed on the stretch state (rest += x  <=>  d -= x);
-                        # rest >= min_rest  <=>  d <= len - min_rest.
-                        len_al = wp.length(seg_attachment_r[seg_adj_left] - seg_attachment_l[seg_adj_left])
-                        len_ar = wp.length(seg_attachment_r[seg_adj_right] - seg_attachment_l[seg_adj_right])
-                        stretch_l = seg_stretch[seg_adj_left] - seg_rolling_delta_r[seg_adj_left] * beta
-                        stretch_r = seg_stretch[seg_adj_right] - seg_rolling_delta_l[seg_adj_right] * beta
-                        if stretch_l > len_al - min_rest:
-                            stretch_l = len_al - min_rest
-                        if stretch_r > len_ar - min_rest:
-                            stretch_r = len_ar - min_rest
-                        seg_stretch[seg_adj_left] = stretch_l
-                        seg_stretch[seg_adj_right] = stretch_r
 
                 seg_left = int(-1)
                 seg_right = int(-1)
@@ -497,6 +461,59 @@ def update_tendon_attachments(
                         delta = max_delta
                     seg_stretch[seg_left] = d_l_raw + delta
                     seg_stretch[seg_right] = d_r_raw - delta
+
+        # Rolling kinematic transport: the pulley's rotation carries rest length across the
+        # contact by the arc it rolled (seg_rolling_delta). One-shot geometric move, not a
+        # relaxation, so it runs after the cone loop -- inside, the cone erodes it across sweeps.
+        if apply_rolling_transfer != 0:
+            for i_roll in range(1, num_links - 1):
+                link_idx = link_start + i_roll
+                if tendon_link_type[link_idx] != int(TendonLinkType.ROLLING) or tendon_link_active[link_idx] == 0:
+                    continue
+
+                seg_adj_left = seg_offset + i_roll - 1
+                seg_adj_right = seg_offset + i_roll
+                if seg_active[seg_adj_left] == 0 or seg_active[seg_adj_right] == 0:
+                    continue
+
+                radius = tendon_link_radius[link_idx]
+                if radius <= 0.0:
+                    continue
+
+                body = tendon_link_body[link_idx]
+                pose = body_q[body]
+                center = wp.transform_point(pose, tendon_link_offset[link_idx])
+                normal = wp.transform_vector(pose, tendon_link_axis[link_idx])
+
+                pt_left = seg_attachment_r[seg_adj_left]
+                pt_right = seg_attachment_l[seg_adj_right]
+                r_left = pt_left - center
+                r_right = pt_right - center
+                r_left = r_left - wp.dot(r_left, normal) * normal
+                r_right = r_right - wp.dot(r_right, normal) * normal
+                len_rl = wp.length(r_left)
+                len_rr = wp.length(r_right)
+                theta = wp.pi
+                if len_rl > 1.0e-8 and len_rr > 1.0e-8:
+                    u_left = r_left / len_rl
+                    u_right = r_right / len_rr
+                    theta = wp.abs(wp.atan2(wp.dot(wp.cross(u_left, u_right), normal), wp.dot(u_left, u_right)))
+
+                cap_ratio = wp.exp(wp.min(wp.max(tendon_link_mu[link_idx], 0.0) * theta, 20.0))
+                beta = (cap_ratio - 1.0) / (cap_ratio + 1.0)
+
+                # beta-nudge expressed on the stretch state (rest += x  <=>  stretch -= x);
+                # rest >= min_rest  <=>  stretch <= len - min_rest.
+                len_al = wp.length(seg_attachment_r[seg_adj_left] - seg_attachment_l[seg_adj_left])
+                len_ar = wp.length(seg_attachment_r[seg_adj_right] - seg_attachment_l[seg_adj_right])
+                stretch_l = seg_stretch[seg_adj_left] - seg_rolling_delta_r[seg_adj_left] * beta
+                stretch_r = seg_stretch[seg_adj_right] - seg_rolling_delta_l[seg_adj_right] * beta
+                if stretch_l > len_al - min_rest:
+                    stretch_l = len_al - min_rest
+                if stretch_r > len_ar - min_rest:
+                    stretch_r = len_ar - min_rest
+                seg_stretch[seg_adj_left] = stretch_l
+                seg_stretch[seg_adj_right] = stretch_r
 
         # rebuild rest lengths from the telescoped stretch state (one cancellation per call,
         # paid once instead of every sweep -- this is what keeps the capstan accurate for stiff
