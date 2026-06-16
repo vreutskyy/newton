@@ -366,8 +366,6 @@ class Model:
         """Total number of tendon segments (= tendon_link_count - tendon_count)."""
         self.tendon_start: wp.array[wp.int32] | None = None
         """Start index into link arrays for each tendon, shape [tendon_count + 1], int."""
-        self.tendon_material_sweeps: wp.array[wp.int32] | None = None
-        """Capstan relaxation passes per tendon (accuracy/speed knob), shape [tendon_count]."""
         self.tendon_link_body: wp.array[wp.int32] | None = None
         """Body index for each tendon link, shape [tendon_link_count], int."""
         self.tendon_link_type: wp.array[wp.int32] | None = None

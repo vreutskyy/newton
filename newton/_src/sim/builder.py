@@ -986,7 +986,6 @@ class ModelBuilder:
         # tendons (cable-driven mechanisms)
         self.tendon_start: list[int] = []
         """Start index into link arrays for each tendon."""
-        self.tendon_material_sweeps: list[int] = []
         """Capstan relaxation pass count per tendon (-1 = auto-size from segment count)."""
         self.tendon_link_body: list[int] = []
         """Body index for each tendon link."""
@@ -4473,24 +4472,22 @@ class ModelBuilder:
             **kwargs,
         )
 
-    def add_tendon(self, material_sweeps: int = -1) -> int:
+    def add_tendon(self) -> int:
         """Begin a new tendon. Returns the tendon index.
 
         After calling this, add links via :meth:`add_tendon_link`. Each pair
         of consecutive links implicitly creates a tendon segment (distance
         constraint) between them.
 
-        Args:
-            material_sweeps: Capstan relaxation passes for this tendon; more passes converge
-                the friction further. ``-1`` (default) auto-sizes from the segment count.
-                Clamped to 256.
+        The capstan relaxation pass count and settle tolerance are solver-level
+        cable parameters (e.g. ``SolverXPBD(tendon_max_sweeps=..., tendon_settle_tol=...)``),
+        not per-tendon properties.
 
         Returns:
             The index of the new tendon.
         """
         tendon_idx = len(self.tendon_start)
         self.tendon_start.append(len(self.tendon_link_body))
-        self.tendon_material_sweeps.append(int(material_sweeps))
         return tendon_idx
 
     def add_tendon_link(
@@ -10525,17 +10522,6 @@ class ModelBuilder:
             if tendon_count > 0:
                 tendon_start = [*self.tendon_start, link_count]
                 m.tendon_start = wp.array(tendon_start, dtype=wp.int32)
-                # Per-tendon capstan relaxation passes, auto-sized from the segment count when
-                # unset (-1). Longer chains need more passes to converge the cone; 3 * num_segs
-                # covers the worst single-step case (frictionless equalization). Capped at 256;
-                # override via add_tendon(material_sweeps=...).
-                tendon_material_sweeps = []
-                for t in range(tendon_count):
-                    num_segs = (tendon_start[t + 1] - tendon_start[t]) - 1
-                    override = self.tendon_material_sweeps[t]
-                    sweeps = override if override > 0 else max(3 * num_segs, 1)
-                    tendon_material_sweeps.append(min(sweeps, 256))
-                m.tendon_material_sweeps = wp.array(tendon_material_sweeps, dtype=wp.int32)
                 m.tendon_link_body = wp.array(self.tendon_link_body, dtype=wp.int32)
                 m.tendon_link_type = wp.array(self.tendon_link_type, dtype=wp.int32)
                 m.tendon_link_radius = wp.array(self.tendon_link_radius, dtype=wp.float32, requires_grad=requires_grad)

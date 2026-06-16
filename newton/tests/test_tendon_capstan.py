@@ -795,7 +795,7 @@ def _kinematic_capstan_metrics(device, mu, num_frames=100, substeps=12, fps=60):
     # The compliant cable is a spring, so the atwood oscillates and any single-frame travel (or
     # tension ratio) is phase-dependent. The robust slip-vs-lock signal is the PEAK travel over the
     # run: a locked cable never moves much, a slipping one reaches large travel regardless of phase.
-    model, left_idx, right_idx, pulley_idx = build_kinematic_pulley_atwood(mu=mu, compliance=3.0e-7)
+    model, _left_idx, right_idx, pulley_idx = build_kinematic_pulley_atwood(mu=mu, compliance=3.0e-7)
     solver = newton.solvers.SolverXPBD(model, iterations=8, joint_linear_relaxation=0.8)
     state_0, state_1 = model.state(), model.state()
     control, contacts = model.control(), model.contacts()
@@ -1626,19 +1626,20 @@ def test_kinematic_rolling_transfer_independent_of_iterations(test, device):
             )
 
 
-def test_kinematic_rolling_transfer_independent_of_material_sweeps(test, device):
-    """Prescribed pulley spin should transfer the same material for any material_sweeps count.
+def test_kinematic_rolling_transfer_independent_of_cone_sweeps(test, device):
+    """Prescribed pulley spin should transfer the same material for any cone sweep count.
 
     The rolling transport is a one-shot kinematic move set by the pulley geometry, not a
     convergent relaxation; refining the capstan cone (more sweeps) must not erode it. Regression
     for the cone eroding the rolling beta-nudge across sweeps (transfer drifted toward zero as
-    material_sweeps grew).
+    the sweep count grew). tendon_settle_tol=0 forces the full tendon_max_sweeps so the count varies.
     """
 
-    def run_once(material_sweeps):
+    def run_once(tendon_max_sweeps):
         model, pulley_idx = build_kinematic_rolling_transport(mu=10.0)
-        model.tendon_material_sweeps.assign(np.array([material_sweeps], dtype=np.int32))
-        solver = newton.solvers.SolverXPBD(model, iterations=8, joint_linear_relaxation=1.0)
+        solver = newton.solvers.SolverXPBD(
+            model, iterations=8, joint_linear_relaxation=1.0, tendon_max_sweeps=tendon_max_sweeps, tendon_settle_tol=0.0
+        )
         state_0 = model.state()
         state_1 = model.state()
         control = model.control()
@@ -1660,8 +1661,8 @@ def test_kinematic_rolling_transfer_independent_of_material_sweeps(test, device)
             1.0e-4,
             f"Prescribed rolling spin should produce nonzero material transfer: delta={reference}",
         )
-        for material_sweeps in (2, 4, 8, 16, 64, 256):
-            rest_delta = run_once(material_sweeps)
+        for tendon_max_sweeps in (2, 4, 8, 16, 64, 256):
+            rest_delta = run_once(tendon_max_sweeps)
             np.testing.assert_allclose(
                 rest_delta,
                 reference,
@@ -1669,7 +1670,7 @@ def test_kinematic_rolling_transfer_independent_of_material_sweeps(test, device)
                 atol=1.0e-6,
                 err_msg=(
                     "Rolling material transport should be invariant to the capstan sweep count "
-                    f"(one-shot kinematic move, not a relaxation): material_sweeps={material_sweeps}, "
+                    f"(one-shot kinematic move, not a relaxation): tendon_max_sweeps={tendon_max_sweeps}, "
                     f"reference={reference}, actual={rest_delta}"
                 ),
             )
@@ -1720,7 +1721,8 @@ def test_frictionless_zero_span_equalizes_global_tension(test, device):
     """A zero-rest middle span should not split a frictionless tendon into tension islands."""
     with wp.ScopedDevice(device):
         model, initial_rest, compliance = build_frictionless_zero_span_route()
-        solver = newton.solvers.SolverXPBD(model, iterations=12, joint_linear_relaxation=1.0)
+        # this test checks tight equalization (rtol 1e-4), so request a tight cone tolerance
+        solver = newton.solvers.SolverXPBD(model, iterations=12, joint_linear_relaxation=1.0, tendon_settle_tol=1.0e-6)
         state_0 = model.state()
         state_1 = model.state()
         control = model.control()
@@ -1981,9 +1983,9 @@ add_test(
 )
 add_test(
     TestTendonCapstan,
-    "kinematic_rolling_transfer_independent_of_material_sweeps",
+    "kinematic_rolling_transfer_independent_of_cone_sweeps",
     devices,
-    test_kinematic_rolling_transfer_independent_of_material_sweeps,
+    test_kinematic_rolling_transfer_independent_of_cone_sweeps,
 )
 add_test(
     TestTendonCapstan, "rolling_transfer_saturates_at_zero_span", devices, test_rolling_transfer_saturates_at_zero_span

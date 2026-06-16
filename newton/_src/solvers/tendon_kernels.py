@@ -120,9 +120,16 @@ def update_tendon_attachments(
     seg_rolling_delta_r: wp.array[float],
     apply_rolling_transfer: int,
     apply_pinhole_slip: int,
-    tendon_material_sweeps: wp.array[int],
+    tendon_max_sweeps: int,
+    tendon_settle_tol: float,
 ):
-    """Update routed tendon tangent points and free-span rest-length transfer."""
+    """Update routed tendon tangent points and free-span rest-length transfer.
+
+    The capstan cone is relaxed by up to ``tendon_max_sweeps`` Gauss-Seidel passes, stopping early
+    once the relaxation has settled: the max per-sweep relative tension change (largest tension
+    change / peak tension, dimensionless) falls below ``tendon_settle_tol``. Already-converged
+    cables stop almost immediately; stiff/transient ones run up to the cap.
+    """
     tendon_id = wp.tid()
     link_start = tendon_start[tendon_id]
     link_end = tendon_start[tendon_id + 1]
@@ -303,17 +310,18 @@ def update_tendon_attachments(
                 # rebuild below conserves total cable length (rest = len - stretch).
                 seg_stretch[seg] = len_snap - seg_rest_length[seg]
 
-        # Number of capstan/material relaxation passes for this tendon (model.tendon_material_sweeps,
-        # auto-sized from its segment count, overridable per tendon). The transport is a convergent
-        # relaxation, so more passes give a more precise capstan, monotonically, until converged --
-        # same mechanism for rolling and pinhole links (no per-type tuning). Clamped to the static
-        # loop bound for compile-time unrolling; `continue` (not `break`) keeps the bound static.
-        material_sweep_count = wp.min(tendon_material_sweeps[tendon_id], 256)
+        # Cap on capstan/material relaxation passes (tendon_max_sweeps, a solver-level cable param),
+        # clamped to the static loop bound for compile-time unrolling. The loop early-outs below
+        # once the relaxation settles; `continue` (not `break`) keeps the bound static.
+        material_sweep_count = wp.min(tendon_max_sweeps, 256)
 
+        converged = int(0)
         for material_sweep in range(256):
-            if material_sweep >= material_sweep_count:
+            if material_sweep >= material_sweep_count or converged != 0:
                 continue
 
+            sweep_dtension = float(0.0)
+            sweep_maxtension = float(0.0)
             for order in range(1, num_links - 1):
                 i = order
                 if material_sweep % 2 == 1:
@@ -437,6 +445,8 @@ def update_tendon_attachments(
                 delta = float(0.0)
                 max_delta = float(0.0)
 
+                sweep_maxtension = wp.max(sweep_maxtension, wp.max(force_l, force_r))
+
                 if force_l > force_r * cap_ratio:
                     delta = (comp_r * d_l - cap_ratio * comp_l * d_r) / (comp_r + cap_ratio * comp_l)
                     if delta < 0.0:
@@ -450,6 +460,7 @@ def update_tendon_attachments(
                     # rest_left += delta => d_l -= delta ; rest_right -= delta => d_r += delta
                     seg_stretch[seg_left] = d_l_raw - delta
                     seg_stretch[seg_right] = d_r_raw + delta
+                    sweep_dtension = wp.max(sweep_dtension, wp.max(delta / comp_l, delta / comp_r))
                 elif force_r > force_l * cap_ratio:
                     delta = (comp_l * d_r - cap_ratio * comp_r * d_l) / (comp_l + cap_ratio * comp_r)
                     if delta < 0.0:
@@ -461,6 +472,15 @@ def update_tendon_attachments(
                         delta = max_delta
                     seg_stretch[seg_left] = d_l_raw + delta
                     seg_stretch[seg_right] = d_r_raw - delta
+                    sweep_dtension = wp.max(sweep_dtension, wp.max(delta / comp_l, delta / comp_r))
+
+            # early-out: stop once the relaxation has settled -- the max per-sweep relative tension
+            # change (largest tension change / peak tension) is below tendon_settle_tol. Once the cone
+            # stops moving material it is at its fixed point (converged, or clamped at min_rest), so a
+            # separate cone-violation test would add nothing (it can't be improved by more sweeps).
+            rel_change = sweep_dtension / wp.max(sweep_maxtension, 1.0e-30)
+            if rel_change < tendon_settle_tol:
+                converged = 1
 
         # Rolling kinematic transport: the pulley's rotation carries rest length across the
         # contact by the arc it rolled (seg_rolling_delta). One-shot geometric move, not a

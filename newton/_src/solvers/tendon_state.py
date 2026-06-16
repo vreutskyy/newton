@@ -99,6 +99,11 @@ class TendonStateMixin:
 
     def _init_tendon_state(self, model: Model, allocate_xpbd_lambdas: bool = True) -> None:
         """Allocate mutable tendon state arrays and build segment/link mappings."""
+        # Solver-level cable cone parameters (a solver may override before calling this).
+        if not hasattr(self, "tendon_max_sweeps"):
+            self.tendon_max_sweeps = 256
+        if not hasattr(self, "tendon_settle_tol"):
+            self.tendon_settle_tol = 1.0e-3
         if model.tendon_segment_count == 0:
             self.tendon_seg_rest_length = None
             self.tendon_seg_rest_length_step = None
@@ -327,7 +332,8 @@ class TendonStateMixin:
                 self.tendon_seg_rolling_delta_r,
                 0,
                 0,
-                model.tendon_material_sweeps,
+                self.tendon_max_sweeps,
+                self.tendon_settle_tol,
             ],
             device=model.device,
         )
