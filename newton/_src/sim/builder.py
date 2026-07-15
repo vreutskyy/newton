@@ -513,6 +513,50 @@ class ModelBuilder:
                 limit_kd=0.0,
             )
 
+    @dataclass(kw_only=True, frozen=True)
+    class TendonLink:
+        """Complete description of one tendon route link."""
+
+        body: int
+        """Rigid body index this link is attached to."""
+
+        link_type: int = int(TendonLinkType.ROLLING)
+        """Link type."""
+
+        radius: float = 0.0
+        """Contact radius [m]."""
+
+        orientation: int = 1
+        """Winding direction, +1 or -1."""
+
+        mu: float = 0.0
+        """Coulomb friction coefficient."""
+
+        active: bool = True
+        """Initial active-state guess for automatic route selection."""
+
+        wrap_turns: int = 0
+        """Initial number of complete cable wraps around a rolling link."""
+
+        offset: Vec3 = (0.0, 0.0, 0.0)
+        """Local-frame cable-plane center [m]."""
+
+        axis: Vec3 = (0.0, 0.0, 1.0)
+        """Local-frame cable-plane normal."""
+
+    @dataclass(kw_only=True, frozen=True)
+    class TendonSegment:
+        """Material properties of one tendon segment."""
+
+        compliance: float = 0.0
+        """Compliance [m/N]."""
+
+        damping: float = 0.0
+        """Damping coefficient."""
+
+        rest_length: float = -1.0
+        """Rest length [m]. A negative value selects automatic initialization."""
+
     @dataclass
     class CustomAttribute:
         """
@@ -987,6 +1031,10 @@ class ModelBuilder:
         # tendons (cable-driven mechanisms)
         self.tendon_start: list[int] = []
         """Start index into link arrays for each tendon."""
+        self.tendon_seg_start: list[int] = []
+        """Start index into segment arrays for each tendon."""
+        self.tendon_closed: list[bool] = []
+        """Whether each tendon has cyclic topology."""
         self.tendon_link_body: list[int] = []
         """Body index for each tendon link."""
         self.tendon_link_type: list[int] = []
@@ -1003,6 +1051,14 @@ class ModelBuilder:
         """Local-frame offset of the cable plane center on each body [m]."""
         self.tendon_link_axis: list[tuple[float, float, float]] = []
         """Local-frame normal of the cable plane on each body."""
+        self.tendon_link_active: list[bool] = []
+        """Initial material-route state for each tendon link."""
+        self.tendon_link_wrap_turns: list[int] = []
+        """Initial complete cable wraps around each tendon link."""
+        self.tendon_seg_link_l: list[int] = []
+        """Left link index for each tendon segment."""
+        self.tendon_seg_link_r: list[int] = []
+        """Right link index for each tendon segment."""
         self.tendon_seg_compliance: list[float] = []
         """Compliance [m/N] for each tendon segment."""
         self.tendon_seg_damping: list[float] = []
@@ -4472,18 +4528,115 @@ class ModelBuilder:
             **kwargs,
         )
 
-    def add_tendon(self) -> int:
-        """Begin a new tendon. Returns the tendon index.
+    def add_tendon(
+        self,
+        links: Sequence[ModelBuilder.TendonLink] | None = None,
+        segments: Sequence[ModelBuilder.TendonSegment] | ModelBuilder.TendonSegment | None = None,
+    ) -> int:
+        """Add a complete tendon or begin incremental tendon construction.
 
-        After calling this, add links via :meth:`add_tendon_link`. Each pair
-        of consecutive links implicitly creates a tendon segment (distance
-        constraint) between them.
+        A complete tendon beginning with an attachment is open and must end
+        with another attachment. A tendon beginning with a rolling link or
+        pinhole is closed, and its final segment connects the last link back
+        to the first.
+
+        Args:
+            links: Complete ordered link list. If omitted, begin incremental
+                construction using :meth:`add_tendon_link`.
+            segments: Segment specifications. A single specification is
+                applied to every segment. If omitted, default segment
+                properties are used.
 
         Returns:
-            The index of the new tendon.
+            The tendon index.
         """
+        if links is None:
+            if segments is not None:
+                raise ValueError("segments require a complete tendon link list")
+            tendon_idx = len(self.tendon_start)
+            self.tendon_start.append(len(self.tendon_link_body))
+            self.tendon_seg_start.append(len(self.tendon_seg_rest_length))
+            self.tendon_closed.append(False)
+            return tendon_idx
+
+        links = list(links)
+        if len(links) < 2:
+            raise ValueError("a tendon requires at least 2 links")
+        if not all(isinstance(link, ModelBuilder.TendonLink) for link in links):
+            raise TypeError("links must contain ModelBuilder.TendonLink values")
+
+        link_types: list[TendonLinkType] = []
+        for link in links:
+            try:
+                link_type = TendonLinkType(link.link_type)
+            except ValueError as error:
+                raise ValueError(f"invalid tendon link type: {link.link_type}") from error
+            if link.orientation not in (-1, 1):
+                raise ValueError(f"tendon link orientation must be +1 or -1, got {link.orientation}")
+            if link_type != TendonLinkType.ROLLING and not link.active:
+                raise ValueError("only ROLLING tendon links may be initially inactive")
+            if link.wrap_turns < 0:
+                raise ValueError(f"tendon link wrap_turns must be non-negative, got {link.wrap_turns}")
+            if link_type != TendonLinkType.ROLLING and link.wrap_turns != 0:
+                raise ValueError("only ROLLING tendon links may have initial full wraps")
+            link_types.append(link_type)
+
+        closed = link_types[0] != TendonLinkType.ATTACHMENT
+        if closed:
+            if TendonLinkType.ATTACHMENT in link_types:
+                raise ValueError("closed tendon cannot contain ATTACHMENT links")
+        else:
+            if link_types[-1] != TendonLinkType.ATTACHMENT:
+                raise ValueError("open tendon must end with an ATTACHMENT")
+
+        segment_count = len(links) if closed else len(links) - 1
+        if segments is None:
+            segment_specs = [ModelBuilder.TendonSegment()] * segment_count
+        elif isinstance(segments, ModelBuilder.TendonSegment):
+            segment_specs = [segments] * segment_count
+        else:
+            segment_specs = list(segments)
+            if not all(isinstance(segment, ModelBuilder.TendonSegment) for segment in segment_specs):
+                raise TypeError("segments must contain ModelBuilder.TendonSegment values")
+            if len(segment_specs) != segment_count:
+                topology = "closed" if closed else "open"
+                raise ValueError(
+                    f"{topology} tendon requires {segment_count} segments for {len(links)} links, "
+                    f"got {len(segment_specs)}"
+                )
+
         tendon_idx = len(self.tendon_start)
-        self.tendon_start.append(len(self.tendon_link_body))
+        link_start = len(self.tendon_link_body)
+        self.tendon_start.append(link_start)
+        self.tendon_seg_start.append(len(self.tendon_seg_rest_length))
+        self.tendon_closed.append(closed)
+
+        for link, link_type in zip(links, link_types, strict=True):
+            self.tendon_link_body.append(link.body)
+            self.tendon_link_type.append(int(link_type))
+            self.tendon_link_radius.append(link.radius)
+            self.tendon_link_orientation.append(link.orientation)
+            self.tendon_link_mu.append(link.mu)
+            flags = (
+                int(TendonLinkFlags.DYNAMIC) | int(TendonLinkFlags.CONTINUOUS_WRAP)
+                if link_type == TendonLinkType.ROLLING
+                else 0
+            )
+            self.tendon_link_flags.append(int(flags))
+            self.tendon_link_offset.append(link.offset)
+            self.tendon_link_axis.append(link.axis)
+            self.tendon_link_active.append(link.active)
+            self.tendon_link_wrap_turns.append(link.wrap_turns)
+
+        for segment_idx, segment in enumerate(segment_specs):
+            link_l = link_start + segment_idx
+            link_r = link_start + ((segment_idx + 1) % len(links))
+            self.tendon_seg_link_l.append(link_l)
+            self.tendon_seg_link_r.append(link_r)
+            self.tendon_seg_compliance.append(segment.compliance)
+            self.tendon_seg_damping.append(segment.damping)
+            self.tendon_seg_rest_length.append(segment.rest_length)
+
         return tendon_idx
 
     def add_tendon_link(
@@ -4542,9 +4695,13 @@ class ModelBuilder:
         self.tendon_link_flags.append(int(flags))
         self.tendon_link_offset.append(offset)
         self.tendon_link_axis.append(axis)
+        self.tendon_link_active.append(True)
+        self.tendon_link_wrap_turns.append(0)
 
         # create a segment for every link after the first in this tendon
         if link_idx > tendon_link_start:
+            self.tendon_seg_link_l.append(link_idx - 1)
+            self.tendon_seg_link_r.append(link_idx)
             self.tendon_seg_compliance.append(compliance)
             self.tendon_seg_damping.append(damping)
             self.tendon_seg_rest_length.append(rest_length)
@@ -10521,7 +10678,10 @@ class ModelBuilder:
 
             if tendon_count > 0:
                 tendon_start = [*self.tendon_start, link_count]
+                tendon_seg_start = [*self.tendon_seg_start, seg_count]
                 m.tendon_start = wp.array(tendon_start, dtype=wp.int32)
+                m.tendon_seg_start = wp.array(tendon_seg_start, dtype=wp.int32)
+                m.tendon_closed = wp.array(self.tendon_closed, dtype=wp.bool)
                 m.tendon_link_body = wp.array(self.tendon_link_body, dtype=wp.int32)
                 m.tendon_link_type = wp.array(self.tendon_link_type, dtype=wp.int32)
                 m.tendon_link_radius = wp.array(self.tendon_link_radius, dtype=wp.float32, requires_grad=requires_grad)
@@ -10530,6 +10690,10 @@ class ModelBuilder:
                 m.tendon_link_flags = wp.array(self.tendon_link_flags, dtype=wp.int32)
                 m.tendon_link_offset = wp.array(self.tendon_link_offset, dtype=wp.vec3)
                 m.tendon_link_axis = wp.array(self.tendon_link_axis, dtype=wp.vec3)
+                m.tendon_link_active = wp.array(self.tendon_link_active, dtype=wp.bool)
+                m.tendon_link_wrap_turns = wp.array(self.tendon_link_wrap_turns, dtype=wp.int32)
+                m.tendon_seg_link_l = wp.array(self.tendon_seg_link_l, dtype=wp.int32)
+                m.tendon_seg_link_r = wp.array(self.tendon_seg_link_r, dtype=wp.int32)
                 m.tendon_seg_compliance = wp.array(
                     self.tendon_seg_compliance, dtype=wp.float32, requires_grad=requires_grad
                 )

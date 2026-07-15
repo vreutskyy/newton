@@ -363,9 +363,13 @@ class Model:
         self.tendon_link_count: int = 0
         """Total number of tendon links (waypoints) across all tendons."""
         self.tendon_segment_count: int = 0
-        """Total number of tendon segments (= tendon_link_count - tendon_count)."""
+        """Total number of tendon segments."""
         self.tendon_start: wp.array[wp.int32] | None = None
         """Start index into link arrays for each tendon, shape [tendon_count + 1], int."""
+        self.tendon_seg_start: wp.array[wp.int32] | None = None
+        """Start index into segment arrays for each tendon, shape [tendon_count + 1], int."""
+        self.tendon_closed: wp.array[wp.bool] | None = None
+        """Whether each tendon has cyclic topology, shape [tendon_count], bool."""
         self.tendon_link_body: wp.array[wp.int32] | None = None
         """Body index for each tendon link, shape [tendon_link_count], int."""
         self.tendon_link_type: wp.array[wp.int32] | None = None
@@ -382,6 +386,14 @@ class Model:
         """Local-frame offset of the cable plane center on each body [m], shape [tendon_link_count], vec3."""
         self.tendon_link_axis: wp.array[wp.vec3] | None = None
         """Local-frame normal of the cable plane on each body [dimensionless], shape [tendon_link_count], vec3."""
+        self.tendon_link_active: wp.array[wp.bool] | None = None
+        """Initial material-route state for each tendon link, shape [tendon_link_count], bool."""
+        self.tendon_link_wrap_turns: wp.array[wp.int32] | None = None
+        """Initial complete wraps around each tendon link, shape [tendon_link_count], int."""
+        self.tendon_seg_link_l: wp.array[wp.int32] | None = None
+        """Left link index for each tendon segment, shape [tendon_segment_count], int."""
+        self.tendon_seg_link_r: wp.array[wp.int32] | None = None
+        """Right link index for each tendon segment, shape [tendon_segment_count], int."""
         self.tendon_seg_compliance: wp.array[wp.float32] | None = None
         """Compliance [m/N] for each tendon segment, shape [tendon_segment_count], float."""
         self.tendon_seg_damping: wp.array[wp.float32] | None = None

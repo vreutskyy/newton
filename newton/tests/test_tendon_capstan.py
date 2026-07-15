@@ -1024,6 +1024,437 @@ def run_motorized_model(model, drive_joint, target=2.0, num_frames=70, substeps=
 
 
 class TestTendonCapstan(unittest.TestCase):
+    def test_complete_open_tendon_topology(self):
+        builder = newton.ModelBuilder()
+        bodies = [builder.add_body(mass=0.0) for _ in range(4)]
+        tendon = builder.add_tendon(
+            links=[
+                builder.TendonLink(body=bodies[0], link_type=TendonLinkType.ATTACHMENT),
+                builder.TendonLink(body=bodies[1], link_type=TendonLinkType.ROLLING, radius=0.1),
+                builder.TendonLink(body=bodies[2], link_type=TendonLinkType.ATTACHMENT),
+                builder.TendonLink(body=bodies[3], link_type=TendonLinkType.ATTACHMENT),
+            ],
+            segments=[
+                builder.TendonSegment(compliance=1.0e-5, rest_length=0.4),
+                builder.TendonSegment(compliance=2.0e-5, rest_length=0.6),
+                builder.TendonSegment(compliance=3.0e-5, rest_length=0.8),
+            ],
+        )
+        model = builder.finalize(device="cpu")
+
+        self.assertEqual(tendon, 0)
+        self.assertEqual(model.tendon_start.numpy().tolist(), [0, 4])
+        self.assertEqual(model.tendon_seg_start.numpy().tolist(), [0, 3])
+        self.assertEqual(model.tendon_closed.numpy().tolist(), [False])
+        self.assertEqual(model.tendon_seg_link_l.numpy().tolist(), [0, 1, 2])
+        self.assertEqual(model.tendon_seg_link_r.numpy().tolist(), [1, 2, 3])
+        np.testing.assert_allclose(model.tendon_seg_compliance.numpy(), [1.0e-5, 2.0e-5, 3.0e-5])
+        np.testing.assert_allclose(model.tendon_seg_rest_length.numpy(), [0.4, 0.6, 0.8])
+
+    def test_complete_closed_tendon_topology(self):
+        builder = newton.ModelBuilder()
+        bodies = [builder.add_body(mass=0.0) for _ in range(3)]
+        segment = builder.TendonSegment(compliance=1.0e-5, rest_length=0.5)
+        builder.add_tendon(
+            links=[
+                builder.TendonLink(body=bodies[0], link_type=TendonLinkType.PINHOLE),
+                builder.TendonLink(body=bodies[1], link_type=TendonLinkType.ROLLING, radius=0.1),
+                builder.TendonLink(body=bodies[2], link_type=TendonLinkType.PINHOLE),
+            ],
+            segments=segment,
+        )
+        model = builder.finalize(device="cpu")
+
+        self.assertEqual(model.tendon_start.numpy().tolist(), [0, 3])
+        self.assertEqual(model.tendon_seg_start.numpy().tolist(), [0, 3])
+        self.assertEqual(model.tendon_closed.numpy().tolist(), [True])
+        self.assertEqual(model.tendon_seg_link_l.numpy().tolist(), [0, 1, 2])
+        self.assertEqual(model.tendon_seg_link_r.numpy().tolist(), [1, 2, 0])
+        np.testing.assert_allclose(model.tendon_seg_rest_length.numpy(), [0.5, 0.5, 0.5])
+
+    def test_complete_closed_tendon_initializes_all_segments(self):
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        bodies = [
+            builder.add_body(xform=wp.transform(p=wp.vec3(position)), mass=0.0)
+            for position in ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+        ]
+        builder.add_tendon(
+            links=[
+                builder.TendonLink(body=body, link_type=TendonLinkType.PINHOLE) for body in bodies
+            ],
+            segments=builder.TendonSegment(compliance=1.0e-5),
+        )
+        model = builder.finalize(device="cpu")
+        solver = newton.solvers.SolverXPBD(model, iterations=1)
+
+        expected_rest = np.array([1.0, np.sqrt(2.0), 1.0], dtype=np.float32)
+        self.assertEqual(solver.tendon_seg_active.numpy().tolist(), [1, 1, 1])
+        np.testing.assert_allclose(solver.tendon_seg_rest_length.numpy(), expected_rest, atol=1.0e-6)
+        self.assertAlmostEqual(float(solver.tendon_total_cable.numpy()[0]), float(np.sum(expected_rest)), delta=1.0e-6)
+
+        state_0, state_1 = model.state(), model.state()
+        solver.step(state_0, state_1, model.control(), None, 1.0 / 120.0)
+        np.testing.assert_allclose(solver.tendon_seg_rest_length.numpy(), expected_rest, atol=1.0e-6)
+
+    def test_complete_closed_tendon_initializes_rolling_route(self):
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        bodies = [
+            builder.add_body(xform=wp.transform(p=wp.vec3(position)), mass=0.0)
+            for position in ((0.0, 0.0, 0.0), (1.0, -0.3, 0.0), (2.0, 0.0, 0.0))
+        ]
+        builder.add_tendon(
+            links=[
+                builder.TendonLink(body=bodies[0], link_type=TendonLinkType.PINHOLE),
+                builder.TendonLink(
+                    body=bodies[1],
+                    link_type=TendonLinkType.ROLLING,
+                    radius=0.2,
+                    orientation=1,
+                ),
+                builder.TendonLink(body=bodies[2], link_type=TendonLinkType.PINHOLE),
+            ],
+            segments=builder.TendonSegment(compliance=1.0e-5),
+        )
+        model = builder.finalize(device="cpu")
+        solver = newton.solvers.SolverXPBD(model, iterations=1)
+
+        self.assertEqual(solver.tendon_link_active.numpy().tolist(), [True, True, True])
+        self.assertEqual(solver.tendon_seg_active_link_l.numpy().tolist(), [0, 1, 2])
+        self.assertEqual(solver.tendon_seg_active_link_r.numpy().tolist(), [1, 2, 0])
+        initial_rest = solver.tendon_seg_rest_length.numpy().copy()
+        self.assertTrue(np.all(initial_rest > 0.0))
+        self.assertGreater(float(solver.tendon_total_cable.numpy()[0]), float(np.sum(initial_rest)))
+
+        state_0, state_1 = model.state(), model.state()
+        solver.step(state_0, state_1, model.control(), None, 1.0 / 120.0)
+        np.testing.assert_allclose(solver.tendon_seg_rest_length.numpy(), initial_rest, atol=1.0e-6)
+
+    def test_complete_tendon_preserves_initial_full_wraps(self):
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        bodies = [
+            builder.add_body(xform=wp.transform(p=wp.vec3(position)), mass=0.0)
+            for position in ((0.0, 0.0, 0.0), (1.0, -0.3, 0.0), (2.0, 0.0, 0.0))
+        ]
+        radius = 0.2
+        builder.add_tendon(
+            links=[
+                builder.TendonLink(body=bodies[0], link_type=TendonLinkType.PINHOLE),
+                builder.TendonLink(
+                    body=bodies[1],
+                    link_type=TendonLinkType.ROLLING,
+                    radius=radius,
+                    orientation=1,
+                    wrap_turns=2,
+                ),
+                builder.TendonLink(body=bodies[2], link_type=TendonLinkType.PINHOLE),
+            ],
+            segments=builder.TendonSegment(compliance=1.0e-5),
+        )
+        model = builder.finalize(device="cpu")
+        solver = newton.solvers.SolverXPBD(model, iterations=1)
+
+        wrap_angle = float(solver.tendon_link_wrap_angle.numpy()[1])
+        self.assertGreaterEqual(wrap_angle, 4.0 * np.pi)
+        expected_material = float(np.sum(solver.tendon_seg_rest_length.numpy())) + radius * wrap_angle
+        self.assertAlmostEqual(float(solver.tendon_total_cable.numpy()[0]), expected_material, delta=1.0e-5)
+
+    def test_complete_tendon_preserves_material_across_wrap_branch(self):
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        start_angle = -0.2
+        radius = 0.1
+        left = builder.add_body(
+            xform=wp.transform(p=wp.vec3(-0.4, 0.0, 0.0)), mass=0.0, is_kinematic=True
+        )
+        pulley = builder.add_body(xform=wp.transform(), mass=0.0, is_kinematic=True)
+        right = builder.add_body(
+            xform=wp.transform(p=wp.vec3(0.4 * math.cos(start_angle), 0.4 * math.sin(start_angle), 0.0)),
+            mass=0.0,
+            is_kinematic=True,
+        )
+        builder.add_tendon(
+            links=[
+                builder.TendonLink(body=left, link_type=TendonLinkType.ATTACHMENT),
+                builder.TendonLink(
+                    body=pulley,
+                    link_type=TendonLinkType.ROLLING,
+                    radius=radius,
+                    orientation=1,
+                    wrap_turns=1,
+                ),
+                builder.TendonLink(body=right, link_type=TendonLinkType.ATTACHMENT),
+            ],
+            segments=builder.TendonSegment(compliance=1.0e-6),
+        )
+        model = builder.finalize(device="cpu")
+        solver = newton.solvers.SolverXPBD(model, iterations=4)
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+
+        def material_length():
+            return float(np.sum(solver.tendon_seg_rest_length.numpy())) + radius * float(
+                solver.tendon_link_wrap_angle.numpy()[1]
+            )
+
+        expected_material = material_length()
+        max_error = 0.0
+        for angle in np.linspace(start_angle, 0.2, 41):
+            body_q = state_0.body_q.numpy()
+            body_q[right, :3] = np.array(
+                [0.4 * math.cos(angle), 0.4 * math.sin(angle), 0.0], dtype=np.float32
+            )
+            state_0.body_q.assign(body_q)
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, None, 1.0 / 60.0)
+            state_0, state_1 = state_1, state_0
+            self.assertTrue(bool(solver.tendon_link_active.numpy()[1]))
+            self.assertGreater(float(solver.tendon_link_wrap_angle.numpy()[1]), 2.0 * np.pi)
+            max_error = max(max_error, abs(material_length() - expected_material))
+
+        self.assertLess(max_error, 2.0e-5)
+
+    def test_complete_closed_tendon_preserves_material_at_first_link(self):
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        start_angle = -0.2
+        radius = 0.1
+        pulley = builder.add_body(xform=wp.transform(), mass=0.0, is_kinematic=True)
+        right = builder.add_body(
+            xform=wp.transform(p=wp.vec3(0.4 * math.cos(start_angle), 0.4 * math.sin(start_angle), 0.0)),
+            mass=0.0,
+            is_kinematic=True,
+        )
+        left = builder.add_body(
+            xform=wp.transform(p=wp.vec3(-0.4, 0.0, 0.0)), mass=0.0, is_kinematic=True
+        )
+        builder.add_tendon(
+            links=[
+                builder.TendonLink(
+                    body=pulley,
+                    link_type=TendonLinkType.ROLLING,
+                    radius=radius,
+                    orientation=1,
+                    wrap_turns=1,
+                ),
+                builder.TendonLink(body=right, link_type=TendonLinkType.PINHOLE),
+                builder.TendonLink(body=left, link_type=TendonLinkType.PINHOLE),
+            ],
+            segments=builder.TendonSegment(compliance=1.0e-6),
+        )
+        model = builder.finalize(device="cpu")
+        solver = newton.solvers.SolverXPBD(model, iterations=4)
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+
+        def material_length():
+            active_rest = solver.tendon_seg_rest_length.numpy()[solver.tendon_seg_active.numpy() != 0]
+            return float(np.sum(active_rest)) + radius * float(solver.tendon_link_wrap_angle.numpy()[0])
+
+        expected_material = material_length()
+        max_error = 0.0
+        for angle in np.linspace(start_angle, 0.2, 41):
+            body_q = state_0.body_q.numpy()
+            body_q[right, :3] = np.array(
+                [0.4 * math.cos(angle), 0.4 * math.sin(angle), 0.0], dtype=np.float32
+            )
+            state_0.body_q.assign(body_q)
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, None, 1.0 / 60.0)
+            state_0, state_1 = state_1, state_0
+            max_error = max(max_error, abs(material_length() - expected_material))
+
+        self.assertLess(max_error, 2.0e-5)
+
+    def test_complete_closed_tendon_resolves_initial_dynamic_route(self):
+        cases = ((0.0, False, 0, True), (-0.3, True, 0, False), (-0.3, False, 1, True))
+        for candidate_x, initial_active, wrap_turns, expected_active in cases:
+            with self.subTest(candidate_x=candidate_x, initial_active=initial_active, wrap_turns=wrap_turns):
+                builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+                candidate = builder.add_body(
+                    xform=wp.transform(p=wp.vec3(candidate_x, 0.0, 0.0)), mass=0.0, is_kinematic=True
+                )
+                upper = builder.add_body(
+                    xform=wp.transform(p=wp.vec3(0.0, 1.0, 0.0)), mass=0.0, is_kinematic=True
+                )
+                lower = builder.add_body(
+                    xform=wp.transform(p=wp.vec3(0.0, -1.0, 0.0)), mass=0.0, is_kinematic=True
+                )
+                builder.add_tendon(
+                    links=[
+                        builder.TendonLink(
+                            body=candidate,
+                            link_type=TendonLinkType.ROLLING,
+                            radius=0.1,
+                            orientation=1,
+                            active=initial_active,
+                            wrap_turns=wrap_turns,
+                        ),
+                        builder.TendonLink(body=upper, link_type=TendonLinkType.PINHOLE),
+                        builder.TendonLink(body=lower, link_type=TendonLinkType.PINHOLE),
+                    ],
+                    segments=builder.TendonSegment(compliance=1.0e-6),
+                )
+                model = builder.finalize(device="cpu")
+                solver = newton.solvers.SolverXPBD(model, iterations=1)
+
+                self.assertEqual(bool(solver.tendon_link_active.numpy()[0]), expected_active)
+
+    def test_complete_closed_tendon_conserves_material_through_route_changes(self):
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        candidate = builder.add_body(
+            xform=wp.transform(p=wp.vec3(-0.3, 0.0, 0.0)), mass=0.0, is_kinematic=True
+        )
+        route_bodies = [
+            builder.add_body(xform=wp.transform(p=wp.vec3(position)), mass=0.0, is_kinematic=True)
+            for position in ((0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, -1.0, 0.0))
+        ]
+        radius = 0.1
+        builder.add_tendon(
+            links=[
+                builder.TendonLink(
+                    body=candidate,
+                    link_type=TendonLinkType.ROLLING,
+                    radius=radius,
+                    orientation=1,
+                    active=False,
+                ),
+                *[
+                    builder.TendonLink(body=body, link_type=TendonLinkType.PINHOLE)
+                    for body in route_bodies
+                ],
+            ],
+            segments=builder.TendonSegment(compliance=1.0e-6),
+        )
+        model = builder.finalize(device="cpu")
+        solver = newton.solvers.SolverXPBD(model, iterations=4)
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+
+        def material_length():
+            active_rest = solver.tendon_seg_rest_length.numpy()[solver.tendon_seg_active.numpy() != 0]
+            wrapped = 0.0
+            if bool(solver.tendon_link_active.numpy()[0]):
+                wrapped = radius * float(solver.tendon_link_wrap_angle.numpy()[0])
+            return float(np.sum(active_rest)) + wrapped
+
+        expected_material = material_length()
+        observed_states = set()
+        max_error = 0.0
+        for candidate_x in (-0.3, -0.15, 0.0, 0.15, 0.3, 0.0, -0.15, -0.3):
+            body_q = state_0.body_q.numpy()
+            body_q[candidate, 0] = candidate_x
+            state_0.body_q.assign(body_q)
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, None, 1.0 / 60.0)
+            state_0, state_1 = state_1, state_0
+            observed_states.add(bool(solver.tendon_link_active.numpy()[0]))
+            max_error = max(max_error, abs(material_length() - expected_material))
+
+        self.assertEqual(observed_states, {False, True})
+        self.assertLess(max_error, 2.0e-5)
+
+    def test_complete_tendon_combines_explicit_material_across_inactive_link(self):
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        lower = builder.add_body(
+            xform=wp.transform(p=wp.vec3(0.0, -1.0, 0.0)), mass=0.0, is_kinematic=True
+        )
+        candidate = builder.add_body(
+            xform=wp.transform(p=wp.vec3(-0.3, 0.0, 0.0)), mass=0.0, is_kinematic=True
+        )
+        upper = builder.add_body(
+            xform=wp.transform(p=wp.vec3(0.0, 1.0, 0.0)), mass=0.0, is_kinematic=True
+        )
+        builder.add_tendon(
+            links=[
+                builder.TendonLink(body=lower, link_type=TendonLinkType.ATTACHMENT),
+                builder.TendonLink(
+                    body=candidate,
+                    link_type=TendonLinkType.ROLLING,
+                    radius=0.1,
+                    orientation=1,
+                ),
+                builder.TendonLink(body=upper, link_type=TendonLinkType.ATTACHMENT),
+            ],
+            segments=[
+                builder.TendonSegment(compliance=1.0e-6, rest_length=0.4),
+                builder.TendonSegment(compliance=1.0e-6, rest_length=0.6),
+            ],
+        )
+        model = builder.finalize(device="cpu")
+        solver = newton.solvers.SolverXPBD(model, iterations=1)
+
+        self.assertFalse(bool(solver.tendon_link_active.numpy()[1]))
+        self.assertEqual(solver.tendon_seg_active.numpy().tolist(), [1, 0])
+        self.assertAlmostEqual(float(solver.tendon_seg_rest_length.numpy()[0]), 1.0, delta=1.0e-6)
+        self.assertAlmostEqual(float(solver.tendon_total_cable.numpy()[0]), 1.0, delta=1.0e-6)
+
+    def test_complete_closed_tendon_supports_all_rolling_links(self):
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        bodies = [
+            builder.add_body(xform=wp.transform(p=wp.vec3(position)), mass=0.0, is_kinematic=True)
+            for position in ((0.0, 1.0, 0.0), (-1.0, -1.0, 0.0), (1.0, -1.0, 0.0))
+        ]
+        builder.add_tendon(
+            links=[
+                builder.TendonLink(
+                    body=body,
+                    link_type=TendonLinkType.ROLLING,
+                    radius=0.1,
+                    orientation=1,
+                )
+                for body in bodies
+            ],
+            segments=builder.TendonSegment(compliance=1.0e-6),
+        )
+        model = builder.finalize(device="cpu")
+        solver = newton.solvers.SolverXPBD(model, iterations=4)
+
+        self.assertEqual(solver.tendon_link_active.numpy().tolist(), [True, True, True])
+        self.assertEqual(solver.tendon_seg_active.numpy().tolist(), [1, 1, 1])
+        self.assertEqual(solver.tendon_seg_active_link_l.numpy().tolist(), [0, 1, 2])
+        self.assertEqual(solver.tendon_seg_active_link_r.numpy().tolist(), [1, 2, 0])
+        self.assertTrue(np.all(solver.tendon_seg_rest_length.numpy() > 0.0))
+
+        initial_material = float(solver.tendon_total_cable.numpy()[0])
+        state_0, state_1 = model.state(), model.state()
+        solver.step(state_0, state_1, model.control(), None, 1.0 / 60.0)
+        material = float(np.sum(solver.tendon_seg_rest_length.numpy())) + float(
+            np.sum(solver.tendon_link_wrap_angle.numpy() * model.tendon_link_radius.numpy())
+        )
+        self.assertAlmostEqual(material, initial_material, delta=2.0e-5)
+
+    def test_complete_tendon_validates_topology(self):
+        def make_builder():
+            builder = newton.ModelBuilder()
+            body = builder.add_body(mass=0.0)
+            return builder, body
+
+        builder, body = make_builder()
+        with self.assertRaisesRegex(ValueError, "open tendon must end with an ATTACHMENT"):
+            builder.add_tendon(
+                links=[
+                    builder.TendonLink(body=body, link_type=TendonLinkType.ATTACHMENT),
+                    builder.TendonLink(body=body, link_type=TendonLinkType.ROLLING, radius=0.1),
+                ]
+            )
+
+        builder, body = make_builder()
+        with self.assertRaisesRegex(ValueError, "closed tendon cannot contain ATTACHMENT links"):
+            builder.add_tendon(
+                links=[
+                    builder.TendonLink(body=body, link_type=TendonLinkType.PINHOLE),
+                    builder.TendonLink(body=body, link_type=TendonLinkType.ATTACHMENT),
+                ]
+            )
+
+        builder, body = make_builder()
+        with self.assertRaisesRegex(ValueError, "closed tendon requires 2 segments for 2 links"):
+            builder.add_tendon(
+                links=[
+                    builder.TendonLink(body=body, link_type=TendonLinkType.PINHOLE),
+                    builder.TendonLink(body=body, link_type=TendonLinkType.ROLLING, radius=0.1),
+                ],
+                segments=[builder.TendonSegment()],
+            )
+
     def test_rejects_dynamic_routing_on_non_rolling_link(self):
         for link_type in (TendonLinkType.ATTACHMENT, TendonLinkType.PINHOLE):
             with self.subTest(link_type=link_type):

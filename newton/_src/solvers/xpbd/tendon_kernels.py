@@ -10,7 +10,7 @@ capstan slip through the link friction coefficient.
 
 import warp as wp
 
-from ...sim.tendon import TendonLinkType
+from ...sim.tendon import TendonLinkFlags, TendonLinkType
 from ..tendon_kernels import (  # noqa: F401
     advance_point_on_circle,
     signed_arc_length,
@@ -163,16 +163,22 @@ def solve_tendon_slip(
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
     tendon_start: wp.array[int],
+    tendon_seg_start: wp.array[int],
     tendon_link_body: wp.array[int],
     tendon_link_type: wp.array[int],
+    tendon_link_flags: wp.array[int],
     tendon_link_radius: wp.array[float],
     tendon_link_mu: wp.array[float],
     tendon_link_active: wp.array[bool],
     tendon_link_offset: wp.array[wp.vec3],
     tendon_link_axis: wp.array[wp.vec3],
+    tendon_link_wrap_angle: wp.array[float],
     seg_rest_length: wp.array[float],
     seg_attachment_l: wp.array[wp.vec3],
     seg_attachment_r: wp.array[wp.vec3],
+    seg_active: wp.array[int],
+    seg_active_link_l: wp.array[int],
+    seg_active_link_r: wp.array[int],
     seg_compliance: wp.array[float],
     seg_delta_lambda: wp.array[float],
     relaxation: float,
@@ -189,15 +195,12 @@ def solve_tendon_slip(
     link_start = tendon_start[tendon_id]
     link_end = tendon_start[tendon_id + 1]
     num_links = link_end - link_start
-    num_segs = num_links - 1
+    seg_offset = tendon_seg_start[tendon_id]
+    num_segs = tendon_seg_start[tendon_id + 1] - seg_offset
     if num_segs < 2:
         return
 
-    seg_offset = int(0)
-    for t in range(tendon_id):
-        seg_offset = seg_offset + (tendon_start[t + 1] - tendon_start[t] - 1)
-
-    for i in range(1, num_links - 1):
+    for i in range(num_links):
         link_idx = link_start + i
         if tendon_link_type[link_idx] != int(TendonLinkType.ROLLING):
             continue
@@ -208,8 +211,19 @@ def solve_tendon_slip(
         if radius <= 0.0:
             continue
 
-        seg_left = seg_offset + i - 1
-        seg_right = seg_offset + i
+        seg_left = int(-1)
+        seg_right = int(-1)
+        for probe in range(num_segs):
+            seg = seg_offset + probe
+            if seg_active[seg] == 0:
+                continue
+            if seg_active_link_r[seg] == link_idx:
+                seg_left = seg
+            if seg_active_link_l[seg] == link_idx:
+                seg_right = seg
+        if seg_left < 0 or seg_right < 0:
+            continue
+
         body = tendon_link_body[link_idx]
         pose = body_q[body]
         center = wp.transform_point(pose, tendon_link_offset[link_idx])
@@ -223,8 +237,12 @@ def solve_tendon_slip(
         r_right = r_right - wp.dot(r_right, normal) * normal
         len_rl = wp.length(r_left)
         len_rr = wp.length(r_right)
-        theta = wp.pi
-        if len_rl > 1.0e-8 and len_rr > 1.0e-8:
+        theta = wp.abs(tendon_link_wrap_angle[link_idx])
+        if (
+            (tendon_link_flags[link_idx] & int(TendonLinkFlags.CONTINUOUS_WRAP)) == 0
+            and len_rl > 1.0e-8
+            and len_rr > 1.0e-8
+        ):
             u_left = r_left / len_rl
             u_right = r_right / len_rr
             theta = wp.abs(wp.atan2(wp.dot(wp.cross(u_left, u_right), normal), wp.dot(u_left, u_right)))

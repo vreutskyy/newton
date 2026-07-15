@@ -45,3 +45,6 @@ class TendonLinkFlags(IntEnum):
 
     DYNAMIC = 1 << 0
     """Link activity is updated from the current route geometry."""
+
+    CONTINUOUS_WRAP = 1 << 1
+    """Wrapped material is tracked with an unwrapped contact angle."""

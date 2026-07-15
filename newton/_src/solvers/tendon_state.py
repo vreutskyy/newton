@@ -71,6 +71,8 @@ class TendonStateMixin:
             self.tendon_seg_active_damping = None
             self.tendon_link_active = None
             self.tendon_link_active_step = None
+            self.tendon_link_wrap_angle = None
+            self.tendon_link_wrap_angle_step = None
             self.tendon_link_seg_left = None
             self.tendon_total_cable = None
             return
@@ -100,28 +102,22 @@ class TendonStateMixin:
             self.tendon_seg_active_damping = wp.array(
                 model.tendon_seg_damping.numpy().copy(), dtype=float, device=model.device
             )
-            self.tendon_link_active = wp.ones(model.tendon_link_count, dtype=bool)
-            self.tendon_link_active_step = wp.ones(model.tendon_link_count, dtype=bool)
+            link_active_np = model.tendon_link_active.numpy().copy()
+            self.tendon_link_active = wp.array(link_active_np, dtype=bool, device=model.device)
+            self.tendon_link_active_step = wp.array(link_active_np, dtype=bool, device=model.device)
+            self.tendon_link_wrap_angle = wp.zeros(model.tendon_link_count, dtype=float)
+            self.tendon_link_wrap_angle_step = wp.zeros(model.tendon_link_count, dtype=float)
             self.tendon_total_cable = wp.zeros(model.tendon_count, dtype=float)
 
-            tendon_start_np = model.tendon_start.numpy()
-            seg_link_l = []
+            seg_link_l = model.tendon_seg_link_l.numpy().copy()
+            seg_link_r = model.tendon_seg_link_r.numpy().copy()
             link_seg_left = np.full(model.tendon_link_count, -1, dtype=np.int32)
-            seg = 0
-            for t in range(model.tendon_count):
-                start = tendon_start_np[t]
-                end = tendon_start_np[t + 1]
-                for link_idx in range(start, end - 1):
-                    seg_link_l.append(link_idx)
-                    if link_idx + 1 < end - 1:
-                        link_seg_left[link_idx + 1] = seg
-                    seg += 1
+            for seg, link_r in enumerate(seg_link_r):
+                link_seg_left[link_r] = seg
 
             self.tendon_seg_link_l = wp.array(seg_link_l, dtype=wp.int32, device=model.device)
             self.tendon_seg_active_link_l = wp.array(seg_link_l, dtype=wp.int32, device=model.device)
-            self.tendon_seg_active_link_r = wp.array(
-                np.asarray(seg_link_l, dtype=np.int32) + 1, dtype=wp.int32, device=model.device
-            )
+            self.tendon_seg_active_link_r = wp.array(seg_link_r, dtype=wp.int32, device=model.device)
             self.tendon_link_seg_left = wp.array(link_seg_left, dtype=wp.int32, device=model.device)
 
             rest_np = model.tendon_seg_rest_length.numpy().copy()
@@ -163,6 +159,7 @@ class TendonStateMixin:
                 inputs=[self.tendon_link_active, self.tendon_link_active_step, self.model.tendon_link_flags],
                 device=self.tendon_link_active.device,
             )
+        wp.copy(self.tendon_link_wrap_angle_step, self.tendon_link_wrap_angle)
 
     def _update_tendon_link_active(self, model: Model, body_q: wp.array[wp.transform]) -> None:
         """Update solver-owned dynamic routing flags from the current body poses."""
@@ -175,9 +172,12 @@ class TendonStateMixin:
             inputs=[
                 body_q,
                 model.tendon_start,
+                model.tendon_closed,
                 model.tendon_link_body,
                 model.tendon_link_type,
                 model.tendon_link_flags,
+                model.tendon_link_wrap_turns,
+                self.tendon_link_wrap_angle,
                 model.tendon_link_radius,
                 model.tendon_link_orientation,
                 model.tendon_link_offset,
@@ -194,8 +194,11 @@ class TendonStateMixin:
             return
 
         tendon_start_np = model.tendon_start.numpy()
+        tendon_seg_start_np = model.tendon_seg_start.numpy()
         link_body_np = model.tendon_link_body.numpy()
         link_offset_np = model.tendon_link_offset.numpy()
+        seg_link_l_np = model.tendon_seg_link_l.numpy()
+        seg_link_r_np = model.tendon_seg_link_r.numpy()
         body_q_np = body_q.numpy()
 
         att_l = np.zeros((model.tendon_segment_count, 3), dtype=np.float32)
@@ -203,20 +206,17 @@ class TendonStateMixin:
         att_l_local = np.zeros((model.tendon_segment_count, 3), dtype=np.float32)
         att_r_local = np.zeros((model.tendon_segment_count, 3), dtype=np.float32)
 
-        seg = 0
-        for t in range(model.tendon_count):
-            start = tendon_start_np[t]
-            end = tendon_start_np[t + 1]
-            for i in range(start, end - 1):
-                body_l = link_body_np[i]
-                body_r = link_body_np[i + 1]
-                off_l = link_offset_np[i]
-                off_r = link_offset_np[i + 1]
-                att_l[seg] = _transform_point_np(body_q_np[body_l], off_l)
-                att_r[seg] = _transform_point_np(body_q_np[body_r], off_r)
-                att_l_local[seg] = off_l
-                att_r_local[seg] = off_r
-                seg += 1
+        for seg in range(model.tendon_segment_count):
+            link_l = seg_link_l_np[seg]
+            link_r = seg_link_r_np[seg]
+            body_l = link_body_np[link_l]
+            body_r = link_body_np[link_r]
+            off_l = link_offset_np[link_l]
+            off_r = link_offset_np[link_r]
+            att_l[seg] = _transform_point_np(body_q_np[body_l], off_l)
+            att_r[seg] = _transform_point_np(body_q_np[body_r], off_r)
+            att_l_local[seg] = off_l
+            att_r_local[seg] = off_r
 
         with wp.ScopedDevice(model.device):
             self.tendon_seg_attachment_l = wp.array(att_l, dtype=wp.vec3, device=model.device)
@@ -230,9 +230,12 @@ class TendonStateMixin:
             inputs=[
                 body_q,
                 model.tendon_start,
+                model.tendon_seg_start,
+                model.tendon_closed,
                 model.tendon_link_body,
                 model.tendon_link_type,
                 model.tendon_link_flags,
+                model.tendon_link_wrap_turns,
                 model.tendon_link_radius,
                 model.tendon_link_orientation,
                 model.tendon_link_mu,
@@ -243,6 +246,8 @@ class TendonStateMixin:
                 self.tendon_seg_stretch,
                 model.tendon_seg_compliance,
                 model.tendon_seg_damping,
+                model.tendon_seg_link_l,
+                model.tendon_seg_link_r,
                 self.tendon_seg_active,
                 self.tendon_seg_active_link_l,
                 self.tendon_seg_active_link_r,
@@ -250,6 +255,8 @@ class TendonStateMixin:
                 self.tendon_seg_active_damping,
                 self.tendon_link_active,
                 self.tendon_link_active_step,
+                self.tendon_link_wrap_angle,
+                self.tendon_link_wrap_angle_step,
                 self.tendon_seg_attachment_l,
                 self.tendon_seg_attachment_r,
                 self.tendon_seg_attachment_l_local,
@@ -259,6 +266,7 @@ class TendonStateMixin:
                 self.tendon_seg_rolling_delta_l,
                 self.tendon_seg_rolling_delta_r,
                 self.tendon_cone_sweep_count,
+                1,
                 0,
                 0,
                 0,
@@ -271,36 +279,64 @@ class TendonStateMixin:
         att_l_np = self.tendon_seg_attachment_l.numpy()
         att_r_np = self.tendon_seg_attachment_r.numpy()
         rest_np = self.tendon_seg_rest_length.numpy()
+        model_rest_np = model.tendon_seg_rest_length.numpy()
+        tendon_closed_np = model.tendon_closed.numpy()
         seg_active_np = self.tendon_seg_active.numpy()
-        for i in range(model.tendon_segment_count):
-            if auto_mask[i] and seg_active_np[i]:
-                rest_np[i] = np.linalg.norm(att_r_np[i] - att_l_np[i])
+        seg_active_link_l_np = self.tendon_seg_active_link_l.numpy()
+        seg_active_link_r_np = self.tendon_seg_active_link_r.numpy()
+        for t in range(model.tendon_count):
+            link_start = tendon_start_np[t]
+            link_end = tendon_start_np[t + 1]
+            seg_start = tendon_seg_start_np[t]
+            seg_end = tendon_seg_start_np[t + 1]
+            for seg_idx in range(seg_start, seg_end):
+                if seg_active_np[seg_idx] == 0:
+                    continue
+
+                link_l = seg_active_link_l_np[seg_idx]
+                link_r = seg_active_link_r_np[seg_idx]
+                source_segments = []
+                source_link = link_l
+                for _ in range(link_end - link_start):
+                    if source_link == link_r:
+                        break
+                    source_segments.append(seg_start + source_link - link_start)
+                    source_link += 1
+                    if tendon_closed_np[t] and source_link == link_end:
+                        source_link = link_start
+
+                if np.any(auto_mask[source_segments]):
+                    rest_np[seg_idx] = np.linalg.norm(att_r_np[seg_idx] - att_l_np[seg_idx])
+                else:
+                    rest_np[seg_idx] = np.sum(model_rest_np[source_segments])
         self.tendon_seg_rest_length = wp.array(rest_np, dtype=float, device=model.device)
         self._snapshot_tendon_step_state()
 
         link_type_np = model.tendon_link_type.numpy()
+        link_flags_np = model.tendon_link_flags.numpy()
         link_radius_np = model.tendon_link_radius.numpy()
         link_offset_np = model.tendon_link_offset.numpy()
         link_axis_np = model.tendon_link_axis.numpy()
         link_active_np = self.tendon_link_active.numpy()
+        link_wrap_angle_np = self.tendon_link_wrap_angle.numpy()
         seg_active_np = self.tendon_seg_active.numpy()
-        seg_active_link_l_np = self.tendon_seg_active_link_l.numpy()
-        seg_active_link_r_np = self.tendon_seg_active_link_r.numpy()
 
         total_cable = np.zeros(model.tendon_count, dtype=np.float32)
-        seg = 0
         for t in range(model.tendon_count):
             start = tendon_start_np[t]
             end = tendon_start_np[t + 1]
-            num_links = end - start
-            seg_base = seg
+            seg_start = tendon_seg_start_np[t]
+            seg_end = tendon_seg_start_np[t + 1]
             cable_len = 0.0
-            for s in range(num_links - 1):
-                if seg_active_np[seg_base + s] != 0:
-                    cable_len += rest_np[seg_base + s]
-            for i in range(start + 1, end - 1):
+            for seg_idx in range(seg_start, seg_end):
+                if seg_active_np[seg_idx] != 0:
+                    cable_len += rest_np[seg_idx]
+            for i in range(start, end):
                 if link_type_np[i] == int(TendonLinkType.ROLLING):
                     if not link_active_np[i]:
+                        continue
+                    if (link_flags_np[i] & int(TendonLinkFlags.CONTINUOUS_WRAP)) != 0:
+                        cable_len += abs(link_wrap_angle_np[i]) * link_radius_np[i]
                         continue
                     body_idx = link_body_np[i]
                     q = body_q_np[body_idx]
@@ -309,8 +345,7 @@ class TendonStateMixin:
                     radius = link_radius_np[i]
                     pt_left = None
                     pt_right = None
-                    for s in range(num_links - 1):
-                        seg_idx = seg_base + s
+                    for seg_idx in range(seg_start, seg_end):
                         if seg_active_np[seg_idx] == 0:
                             continue
                         if seg_active_link_r_np[seg_idx] == i:
@@ -327,6 +362,5 @@ class TendonStateMixin:
                     theta = abs(np.arctan2(cross_val, dot_val))
                     cable_len += theta * radius
             total_cable[t] = cable_len
-            seg += num_links - 1
 
         self.tendon_total_cable = wp.array(total_cable, dtype=float, device=model.device)

@@ -90,6 +90,33 @@ def wrapped_arc_length(
 
 
 @wp.func
+def oriented_wrap_angle(
+    pt_left: wp.vec3,
+    pt_right: wp.vec3,
+    center: wp.vec3,
+    plane_normal: wp.vec3,
+    orientation: int,
+) -> float:
+    """Return the oriented contact angle in the interval [0, 2 pi)."""
+    r_left = pt_left - center
+    r_right = pt_right - center
+    r_left = r_left - wp.dot(r_left, plane_normal) * plane_normal
+    r_right = r_right - wp.dot(r_right, plane_normal) * plane_normal
+    len_left = wp.length(r_left)
+    len_right = wp.length(r_right)
+    if len_left <= 1.0e-8 or len_right <= 1.0e-8:
+        return 0.0
+
+    u_left = r_left / len_left
+    u_right = r_right / len_right
+    angle = wp.atan2(wp.dot(wp.cross(u_left, u_right), plane_normal), wp.dot(u_left, u_right))
+    angle = angle * float(orientation)
+    if angle < 0.0:
+        angle += 2.0 * wp.pi
+    return angle
+
+
+@wp.func
 def advance_point_on_circle(
     old_pt: wp.vec3,
     center: wp.vec3,
@@ -130,9 +157,12 @@ def snapshot_tendon_link_active(
 def update_tendon_link_active(
     body_q: wp.array[wp.transform],
     tendon_start: wp.array[int],
+    tendon_closed: wp.array[bool],
     tendon_link_body: wp.array[int],
     tendon_link_type: wp.array[int],
     tendon_link_flags: wp.array[int],
+    tendon_link_wrap_turns: wp.array[int],
+    tendon_link_wrap_angle: wp.array[float],
     tendon_link_radius: wp.array[float],
     tendon_link_orientation: wp.array[int],
     tendon_link_offset: wp.array[wp.vec3],
@@ -145,24 +175,50 @@ def update_tendon_link_active(
     link_end = tendon_start[tendon_id + 1]
 
     num_links = link_end - link_start
+    closed = tendon_closed[tendon_id]
     routing_converged = int(0)
     for _pass in range(num_links):
         if routing_converged != 0:
             continue
 
         state_changed = int(0)
-        for link_idx in range(link_start + 1, link_end - 1):
+        for local_idx in range(num_links):
+            if not closed and (local_idx == 0 or local_idx == num_links - 1):
+                continue
+            link_idx = link_start + local_idx
             if tendon_link_type[link_idx] != int(TendonLinkType.ROLLING):
                 continue
             if (tendon_link_flags[link_idx] & int(TendonLinkFlags.DYNAMIC)) == 0 or tendon_link_radius[link_idx] <= 0.0:
                 continue
+            if (
+                (tendon_link_wrap_turns[link_idx] > 0 and tendon_link_wrap_angle[link_idx] == 0.0)
+                or wp.abs(tendon_link_wrap_angle[link_idx]) >= 2.0 * wp.pi
+            ):
+                if not tendon_link_active[link_idx]:
+                    state_changed = 1
+                tendon_link_active[link_idx] = True
+                continue
 
-            prev_link = link_idx - 1
-            while prev_link > link_start and not tendon_link_active[prev_link]:
-                prev_link -= 1
-            next_link = link_idx + 1
-            while next_link < link_end - 1 and not tendon_link_active[next_link]:
-                next_link += 1
+            prev_link = link_idx
+            next_link = link_idx
+            found_prev = int(0)
+            found_next = int(0)
+            for neighbor_step in range(1, num_links):
+                prev_candidate = local_idx - neighbor_step
+                if prev_candidate < 0:
+                    prev_candidate += num_links
+                next_candidate = local_idx + neighbor_step
+                if next_candidate >= num_links:
+                    next_candidate -= num_links
+                if found_prev == 0 and tendon_link_active[link_start + prev_candidate]:
+                    prev_link = link_start + prev_candidate
+                    found_prev = 1
+                if found_next == 0 and tendon_link_active[link_start + next_candidate]:
+                    next_link = link_start + next_candidate
+                    found_next = 1
+
+            if found_prev == 0 or found_next == 0 or prev_link == next_link:
+                continue
 
             prev_pose = body_q[tendon_link_body[prev_link]]
             next_pose = body_q[tendon_link_body[next_link]]
@@ -257,9 +313,12 @@ def update_tendon_link_active(
 def update_tendon_attachments(
     body_q: wp.array[wp.transform],
     tendon_start: wp.array[int],
+    tendon_seg_start: wp.array[int],
+    tendon_closed: wp.array[bool],
     tendon_link_body: wp.array[int],
     tendon_link_type: wp.array[int],
     tendon_link_flags: wp.array[int],
+    tendon_link_wrap_turns: wp.array[int],
     tendon_link_radius: wp.array[float],
     tendon_link_orientation: wp.array[int],
     tendon_link_mu: wp.array[float],
@@ -270,6 +329,8 @@ def update_tendon_attachments(
     seg_stretch: wp.array[float],
     seg_compliance: wp.array[float],
     seg_damping: wp.array[float],
+    seg_link_l: wp.array[int],
+    seg_link_r: wp.array[int],
     seg_active: wp.array[int],
     seg_active_link_l: wp.array[int],
     seg_active_link_r: wp.array[int],
@@ -277,6 +338,8 @@ def update_tendon_attachments(
     seg_active_damping: wp.array[float],
     tendon_link_active: wp.array[bool],
     tendon_link_active_step: wp.array[bool],
+    tendon_link_wrap_angle: wp.array[float],
+    tendon_link_wrap_angle_step: wp.array[float],
     seg_attachment_l: wp.array[wp.vec3],
     seg_attachment_r: wp.array[wp.vec3],
     seg_attachment_l_local: wp.array[wp.vec3],
@@ -286,6 +349,7 @@ def update_tendon_attachments(
     seg_rolling_delta_l: wp.array[float],
     seg_rolling_delta_r: wp.array[float],
     tendon_cone_sweep_count: wp.array[int],
+    initialize_wrap_angle: int,
     apply_rolling_transfer: int,
     apply_pinhole_slip: int,
     adaptive_cone_sweeps: int,
@@ -302,21 +366,20 @@ def update_tendon_attachments(
     link_start = tendon_start[tendon_id]
     link_end = tendon_start[tendon_id + 1]
     num_links = link_end - link_start
-    num_segs = num_links - 1
+    seg_offset = tendon_seg_start[tendon_id]
+    seg_end = tendon_seg_start[tendon_id + 1]
+    num_segs = seg_end - seg_offset
+    closed = tendon_closed[tendon_id]
     tendon_cone_sweep_count[tendon_id] = 0
     if num_segs < 1:
         return
-
-    seg_offset = int(0)
-    for t in range(tendon_id):
-        seg_offset = seg_offset + (tendon_start[t + 1] - tendon_start[t] - 1)
 
     min_rest = 1.0e-6
 
     for s in range(num_segs):
         seg = seg_offset + s
-        link_l = link_start + s
-        link_r = link_l + 1
+        link_l = seg_link_l[seg]
+        link_r = seg_link_r[seg]
         seg_active[seg] = 0
         seg_active_link_l[seg] = link_l
         seg_active_link_r[seg] = link_r
@@ -327,33 +390,69 @@ def update_tendon_attachments(
         if apply_rolling_transfer != 0 or apply_pinhole_slip != 0:
             seg_rest_length[seg] = seg_rest_length_step[seg]
 
-    tendon_link_active[link_start] = True
-    tendon_link_active[link_end - 1] = True
+    if not closed:
+        tendon_link_active[link_start] = True
+        tendon_link_active[link_end - 1] = True
 
-    for i in range(1, num_links - 1):
+    for i in range(num_links):
         link_idx = link_start + i
         if (tendon_link_flags[link_idx] & int(TendonLinkFlags.DYNAMIC)) == 0:
             tendon_link_active[link_idx] = True
             tendon_link_active_step[link_idx] = True
 
-    prev_active_link = link_start
-    for link_idx in range(link_start + 1, link_end):
-        if not tendon_link_active[link_idx]:
-            continue
+    if closed:
+        for local_l in range(num_links):
+            link_l = link_start + local_l
+            if not tendon_link_active[link_l]:
+                continue
 
-        seg = seg_offset + prev_active_link - link_start
-        seg_active[seg] = 1
-        seg_active_link_l[seg] = prev_active_link
-        seg_active_link_r[seg] = link_idx
-        compliance = float(0.0)
-        damping = float(0.0)
-        for source_link in range(prev_active_link, link_idx):
-            source_seg = seg_offset + source_link - link_start
-            compliance += seg_compliance[source_seg]
-            damping += seg_damping[source_seg]
-        seg_active_compliance[seg] = compliance
-        seg_active_damping[seg] = damping
-        prev_active_link = link_idx
+            link_r = link_l
+            found_r = int(0)
+            for step in range(1, num_links):
+                candidate = link_start + (local_l + step) % num_links
+                if found_r == 0 and tendon_link_active[candidate]:
+                    link_r = candidate
+                    found_r = 1
+            if found_r == 0:
+                continue
+
+            seg = seg_offset + local_l
+            seg_active[seg] = 1
+            seg_active_link_l[seg] = link_l
+            seg_active_link_r[seg] = link_r
+            compliance = float(0.0)
+            damping = float(0.0)
+            collecting = int(1)
+            for source_step in range(num_links):
+                source_link = link_start + (local_l + source_step) % num_links
+                if collecting != 0:
+                    if source_link == link_r:
+                        collecting = 0
+                    else:
+                        source_seg = seg_offset + source_link - link_start
+                        compliance += seg_compliance[source_seg]
+                        damping += seg_damping[source_seg]
+            seg_active_compliance[seg] = compliance
+            seg_active_damping[seg] = damping
+    else:
+        prev_active_link = link_start
+        for link_idx in range(link_start + 1, link_end):
+            if not tendon_link_active[link_idx]:
+                continue
+
+            seg = seg_offset + prev_active_link - link_start
+            seg_active[seg] = 1
+            seg_active_link_l[seg] = prev_active_link
+            seg_active_link_r[seg] = link_idx
+            compliance = float(0.0)
+            damping = float(0.0)
+            for source_link in range(prev_active_link, link_idx):
+                source_seg = seg_offset + source_link - link_start
+                compliance += seg_compliance[source_seg]
+                damping += seg_damping[source_seg]
+            seg_active_compliance[seg] = compliance
+            seg_active_damping[seg] = damping
+            prev_active_link = link_idx
 
     for s in range(num_segs):
         seg = seg_offset + s
@@ -397,8 +496,20 @@ def update_tendon_attachments(
             base_al = seed_al
         if tendon_link_active_step[link_r]:
             previous_link_l = link_r - 1
-            while previous_link_l > link_start and not tendon_link_active_step[previous_link_l]:
-                previous_link_l -= 1
+            if closed:
+                if previous_link_l < link_start:
+                    previous_link_l = link_end - 1
+                found_previous = int(0)
+                for _previous_step in range(num_links):
+                    if found_previous == 0 and tendon_link_active_step[previous_link_l]:
+                        found_previous = 1
+                    elif found_previous == 0:
+                        previous_link_l -= 1
+                        if previous_link_l < link_start:
+                            previous_link_l = link_end - 1
+            else:
+                while previous_link_l > link_start and not tendon_link_active_step[previous_link_l]:
+                    previous_link_l -= 1
             previous_incoming_seg = seg_offset + previous_link_l - link_start
             seed_ar = wp.transform_point(pose_r, seg_attachment_r_local_step[previous_incoming_seg])
             base_ar = seed_ar
@@ -442,10 +553,106 @@ def update_tendon_attachments(
         seg_attachment_l_local[seg] = wp.transform_point(wp.transform_inverse(pose_l), new_al)
         seg_attachment_r_local[seg] = wp.transform_point(wp.transform_inverse(pose_r), new_ar)
 
+    for link_idx in range(link_start, link_end):
+        if (tendon_link_flags[link_idx] & int(TendonLinkFlags.CONTINUOUS_WRAP)) == 0:
+            continue
+        if not tendon_link_active[link_idx]:
+            continue
+
+        incoming_seg = int(-1)
+        outgoing_seg = int(-1)
+        for s in range(num_segs):
+            seg = seg_offset + s
+            if seg_active[seg] == 0:
+                continue
+            if seg_active_link_r[seg] == link_idx:
+                incoming_seg = seg
+            if seg_active_link_l[seg] == link_idx:
+                outgoing_seg = seg
+        if incoming_seg < 0 or outgoing_seg < 0:
+            continue
+
+        body = tendon_link_body[link_idx]
+        pose = body_q[body]
+        center = wp.transform_point(pose, tendon_link_offset[link_idx])
+        normal = wp.transform_vector(pose, tendon_link_axis[link_idx])
+        raw_angle = oriented_wrap_angle(
+            seg_attachment_r[incoming_seg],
+            seg_attachment_l[outgoing_seg],
+            center,
+            normal,
+            tendon_link_orientation[link_idx],
+        )
+        if initialize_wrap_angle != 0:
+            tendon_link_wrap_angle[link_idx] = raw_angle + 2.0 * wp.pi * float(tendon_link_wrap_turns[link_idx])
+            tendon_link_wrap_angle_step[link_idx] = tendon_link_wrap_angle[link_idx]
+        elif not tendon_link_active_step[link_idx]:
+            tendon_link_wrap_angle[link_idx] = raw_angle
+        else:
+            previous_angle = tendon_link_wrap_angle[link_idx]
+            turn_offset = wp.floor((previous_angle - raw_angle) / (2.0 * wp.pi) + 0.5)
+            tendon_link_wrap_angle[link_idx] = raw_angle + 2.0 * wp.pi * turn_offset
+
+    if closed:
+        topology_changed = int(0)
+        for local_idx in range(num_links):
+            link_idx = link_start + local_idx
+            if tendon_link_active[link_idx] != tendon_link_active_step[link_idx]:
+                topology_changed = 1
+
+        if topology_changed != 0:
+            old_material = float(0.0)
+            new_arc = float(0.0)
+            new_free_length = float(0.0)
+            new_span_count = int(0)
+            for local_idx in range(num_links):
+                link_idx = link_start + local_idx
+                seg = seg_offset + local_idx
+                if tendon_link_active_step[link_idx]:
+                    old_material += seg_rest_length_step[seg]
+                    if (
+                        tendon_link_type[link_idx] == int(TendonLinkType.ROLLING)
+                        and (tendon_link_flags[link_idx] & int(TendonLinkFlags.CONTINUOUS_WRAP)) != 0
+                    ):
+                        old_material += (
+                            wp.abs(tendon_link_wrap_angle_step[link_idx]) * tendon_link_radius[link_idx]
+                        )
+
+                if tendon_link_active[link_idx]:
+                    new_free_length += wp.length(seg_attachment_r[seg] - seg_attachment_l[seg])
+                    new_span_count += 1
+                    if (
+                        tendon_link_type[link_idx] == int(TendonLinkType.ROLLING)
+                        and (tendon_link_flags[link_idx] & int(TendonLinkFlags.CONTINUOUS_WRAP)) != 0
+                    ):
+                        new_arc += wp.abs(tendon_link_wrap_angle[link_idx]) * tendon_link_radius[link_idx]
+
+            free_rest = wp.max(old_material - new_arc, float(new_span_count) * min_rest)
+            distributable_rest = free_rest - float(new_span_count) * min_rest
+            remaining_rest = free_rest
+            remaining_spans = new_span_count
+            for local_idx in range(num_links):
+                link_idx = link_start + local_idx
+                if not tendon_link_active[link_idx]:
+                    continue
+                seg = seg_offset + local_idx
+                rest = remaining_rest
+                if remaining_spans > 1:
+                    span_length = wp.length(seg_attachment_r[seg] - seg_attachment_l[seg])
+                    if new_free_length > 1.0e-8:
+                        rest = min_rest + distributable_rest * span_length / new_free_length
+                    else:
+                        rest = free_rest / float(new_span_count)
+                seg_rest_length[seg] = rest
+                remaining_rest -= rest
+                remaining_spans -= 1
+
     # Repartition material only inside intervals whose active topology changed. Links
     # active in both snapshots bound each interval, so their rolling transfer remains
     # independent from links that appeared or disappeared inside it.
     persistent_l = link_start
+    if closed:
+        persistent_l = link_end - 1
     while persistent_l < link_end - 1:
         persistent_r = persistent_l + 1
         while persistent_r < link_end - 1 and not (
@@ -548,7 +755,9 @@ def update_tendon_attachments(
             material_sweep_count = wp.min(tendon_max_sweeps, 256)
         else:
             # Preserve VBD's established fixed policy while XPBD evaluates adaptive convergence.
-            for i_policy in range(1, num_links - 1):
+            for i_policy in range(num_links):
+                if not closed and (i_policy == 0 or i_policy == num_links - 1):
+                    continue
                 if tendon_link_type[link_start + i_policy] == int(TendonLinkType.PINHOLE):
                     material_sweep_count = int(32)
 
@@ -560,10 +769,12 @@ def update_tendon_attachments(
             tendon_cone_sweep_count[tendon_id] = tendon_cone_sweep_count[tendon_id] + 1
             sweep_dtension = float(0.0)
             sweep_maxtension = float(0.0)
-            for order in range(1, num_links - 1):
+            for order in range(num_links):
                 i = order
                 if material_sweep % 2 == 1:
-                    i = num_links - order - 1
+                    i = num_links - 1 - order
+                if not closed and (i == 0 or i == num_links - 1):
+                    continue
 
                 link_idx = link_start + i
                 link_type = tendon_link_type[link_idx]
@@ -578,61 +789,63 @@ def update_tendon_attachments(
 
                 seg_left = int(-1)
                 seg_right = int(-1)
-                if is_rolling:
-                    previous_active_link = link_idx - 1
-                    while previous_active_link > link_start and not tendon_link_active[previous_active_link]:
-                        previous_active_link -= 1
-                    seg_left = seg_offset + previous_active_link - link_start
-                    seg_right = seg_offset + link_idx - link_start
-                else:
-                    for probe in range(num_segs):
-                        left_candidate = i - 1 - probe
-                        if left_candidate >= 0 and seg_left < 0:
-                            seg = seg_offset + left_candidate
-                            if seg_active[seg] != 0:
-                                length = wp.length(seg_attachment_r[seg] - seg_attachment_l[seg])
-                                if length > 1.0e-5:
-                                    seg_left = seg
-
-                        right_candidate = i + probe
-                        if right_candidate < num_segs and seg_right < 0:
-                            seg = seg_offset + right_candidate
-                            if seg_active[seg] != 0:
-                                length = wp.length(seg_attachment_r[seg] - seg_attachment_l[seg])
-                                if length > 1.0e-5:
-                                    seg_right = seg
+                for probe in range(num_segs):
+                    seg = seg_offset + probe
+                    if seg_active[seg] == 0:
+                        continue
+                    length = wp.length(seg_attachment_r[seg] - seg_attachment_l[seg])
+                    if length <= 1.0e-5:
+                        continue
+                    if seg_active_link_r[seg] == link_idx:
+                        seg_left = seg
+                    if seg_active_link_l[seg] == link_idx:
+                        seg_right = seg
 
                 if seg_left < 0 or seg_right < 0:
                     continue
 
                 if material_sweep == 0 and is_rolling:
-                    body = tendon_link_body[link_idx]
-                    pose = body_q[body]
-                    center = wp.transform_point(pose, tendon_link_offset[link_idx])
-                    normal = wp.transform_vector(pose, tendon_link_axis[link_idx])
-                    r_left = seg_attachment_r[seg_left] - center
-                    r_right = seg_attachment_l[seg_right] - center
-                    r_left = r_left - wp.dot(r_left, normal) * normal
-                    r_right = r_right - wp.dot(r_right, normal) * normal
-                    len_r_left = wp.length(r_left)
-                    len_r_right = wp.length(r_right)
-                    if len_r_left > 1.0e-8 and len_r_right > 1.0e-8:
-                        u_left = r_left / len_r_left
-                        u_right = r_right / len_r_right
-                        signed_wrap_angle = wp.atan2(wp.dot(wp.cross(u_left, u_right), normal), wp.dot(u_left, u_right))
-                        if signed_wrap_angle * float(tendon_link_orientation[link_idx]) < 0.0:
-                            wp.printf(
-                                "Warning: Tendon %d rolling link %d has an unsupported wrap outside [0, pi]. "
-                                "Check its orientation or use dynamic routing.\n",
-                                tendon_id,
-                                link_idx,
-                            )
-
                     # The common mode is material exchanged with the changing wrapped arc. Apply
                     # it before relaxation so the capstan projection sees the conserved cable.
-                    common_rest_delta = 0.5 * (seg_rolling_delta_r[seg_left] + seg_rolling_delta_l[seg_right])
-                    seg_stretch[seg_left] = seg_stretch[seg_left] - common_rest_delta
-                    seg_stretch[seg_right] = seg_stretch[seg_right] - common_rest_delta
+                    if (
+                        (tendon_link_flags[link_idx] & int(TendonLinkFlags.CONTINUOUS_WRAP)) != 0
+                        and tendon_link_active[link_idx] == tendon_link_active_step[link_idx]
+                    ):
+                        wrapped_delta = tendon_link_radius[link_idx] * (
+                            tendon_link_wrap_angle[link_idx] - tendon_link_wrap_angle_step[link_idx]
+                        )
+                        seg_stretch[seg_left] = seg_stretch[seg_left] + 0.5 * wrapped_delta
+                        seg_stretch[seg_right] = seg_stretch[seg_right] + 0.5 * wrapped_delta
+                    else:
+                        common_rest_delta = 0.5 * (
+                            seg_rolling_delta_r[seg_left] + seg_rolling_delta_l[seg_right]
+                        )
+                        seg_stretch[seg_left] = seg_stretch[seg_left] - common_rest_delta
+                        seg_stretch[seg_right] = seg_stretch[seg_right] - common_rest_delta
+
+                        body = tendon_link_body[link_idx]
+                        pose = body_q[body]
+                        center = wp.transform_point(pose, tendon_link_offset[link_idx])
+                        normal = wp.transform_vector(pose, tendon_link_axis[link_idx])
+                        r_left = seg_attachment_r[seg_left] - center
+                        r_right = seg_attachment_l[seg_right] - center
+                        r_left = r_left - wp.dot(r_left, normal) * normal
+                        r_right = r_right - wp.dot(r_right, normal) * normal
+                        len_r_left = wp.length(r_left)
+                        len_r_right = wp.length(r_right)
+                        if len_r_left > 1.0e-8 and len_r_right > 1.0e-8:
+                            u_left = r_left / len_r_left
+                            u_right = r_right / len_r_right
+                            signed_wrap_angle = wp.atan2(
+                                wp.dot(wp.cross(u_left, u_right), normal), wp.dot(u_left, u_right)
+                            )
+                            if signed_wrap_angle * float(tendon_link_orientation[link_idx]) < 0.0:
+                                wp.printf(
+                                    "Warning: Tendon %d rolling link %d has an unsupported wrap outside [0, pi]. "
+                                    "Check its orientation or use dynamic routing.\n",
+                                    tendon_id,
+                                    link_idx,
+                                )
 
                 link_first = seg_active_link_r[seg_left]
                 link_last = seg_active_link_l[seg_right]
@@ -672,8 +885,13 @@ def update_tendon_attachments(
                         r_right = r_right - wp.dot(r_right, normal) * normal
                         len_rl = wp.length(r_left)
                         len_rr = wp.length(r_right)
-                        theta = 0.0
-                        if radius > 0.0 and len_rl > 1.0e-8 and len_rr > 1.0e-8:
+                        theta = wp.abs(tendon_link_wrap_angle[link_first])
+                        if (
+                            (tendon_link_flags[link_first] & int(TendonLinkFlags.CONTINUOUS_WRAP)) == 0
+                            and radius > 0.0
+                            and len_rl > 1.0e-8
+                            and len_rr > 1.0e-8
+                        ):
                             u_left = r_left / len_rl
                             u_right = r_right / len_rr
                             theta = wp.abs(wp.atan2(wp.dot(wp.cross(u_left, u_right), normal), wp.dot(u_left, u_right)))
@@ -755,34 +973,25 @@ def update_tendon_attachments(
         # Apply the friction-limited differential transport once after material relaxation so
         # cone sweeps cannot iteratively erode it.
         if apply_rolling_transfer != 0:
-            for i_roll in range(1, num_links - 1):
+            for i_roll in range(num_links):
+                if not closed and (i_roll == 0 or i_roll == num_links - 1):
+                    continue
                 link_idx = link_start + i_roll
                 if tendon_link_type[link_idx] != int(TendonLinkType.ROLLING):
                     continue
                 if not tendon_link_active[link_idx]:
                     continue
 
-                seg_adj_left = seg_offset + i_roll - 1
-                seg_adj_right = seg_offset + i_roll
                 seg_left = int(-1)
                 seg_right = int(-1)
-                if seg_active[seg_adj_left] != 0 and seg_active[seg_adj_right] != 0:
-                    seg_left = seg_adj_left
-                    seg_right = seg_adj_right
-                else:
-                    if seg_active[seg_adj_left] != 0:
-                        seg_left = seg_adj_left
-                    elif i_roll > 1:
-                        previous_seg = seg_adj_left - 1
-                        if seg_active[previous_seg] != 0 and seg_active_link_r[previous_seg] == link_idx:
-                            seg_left = previous_seg
-
-                    if seg_active[seg_adj_right] != 0:
-                        seg_right = seg_adj_right
-                    elif i_roll < num_links - 2:
-                        next_seg = seg_adj_right + 1
-                        if seg_active[next_seg] != 0 and seg_active_link_l[next_seg] == link_idx:
-                            seg_right = next_seg
+                for probe in range(num_segs):
+                    seg = seg_offset + probe
+                    if seg_active[seg] == 0:
+                        continue
+                    if seg_active_link_r[seg] == link_idx:
+                        seg_left = seg
+                    if seg_active_link_l[seg] == link_idx:
+                        seg_right = seg
 
                 if seg_left < 0 or seg_right < 0:
                     continue
@@ -804,8 +1013,12 @@ def update_tendon_attachments(
                 r_right = r_right - wp.dot(r_right, normal) * normal
                 len_rl = wp.length(r_left)
                 len_rr = wp.length(r_right)
-                theta = wp.pi
-                if len_rl > 1.0e-8 and len_rr > 1.0e-8:
+                theta = wp.abs(tendon_link_wrap_angle[link_idx])
+                if (
+                    (tendon_link_flags[link_idx] & int(TendonLinkFlags.CONTINUOUS_WRAP)) == 0
+                    and len_rl > 1.0e-8
+                    and len_rr > 1.0e-8
+                ):
                     u_left = r_left / len_rl
                     u_right = r_right / len_rr
                     theta = wp.abs(wp.atan2(wp.dot(wp.cross(u_left, u_right), normal), wp.dot(u_left, u_right)))

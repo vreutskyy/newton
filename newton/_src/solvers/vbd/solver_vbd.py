@@ -1593,6 +1593,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
         self._initialize_particles(state_in, state_out, dt)
         if self.tendon_seg_lambda is not None and state_in.body_q is not None:
             self._snapshot_tendon_step_state()
+            self._update_tendon_link_active(self.model, state_in.body_q)
             self.tendon_seg_lambda.zero_()
 
         for iter_num in range(self.iterations):
@@ -2323,9 +2324,12 @@ class SolverVBD(TendonStateMixin, SolverBase):
             inputs=[
                 state_in.body_q,
                 model.tendon_start,
+                model.tendon_seg_start,
+                model.tendon_closed,
                 model.tendon_link_body,
                 model.tendon_link_type,
                 model.tendon_link_flags,
+                model.tendon_link_wrap_turns,
                 model.tendon_link_radius,
                 model.tendon_link_orientation,
                 model.tendon_link_mu,
@@ -2336,6 +2340,8 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_seg_stretch,
                 model.tendon_seg_compliance,
                 model.tendon_seg_damping,
+                model.tendon_seg_link_l,
+                model.tendon_seg_link_r,
                 self.tendon_seg_active,
                 self.tendon_seg_active_link_l,
                 self.tendon_seg_active_link_r,
@@ -2343,6 +2349,8 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_seg_active_damping,
                 self.tendon_link_active,
                 self.tendon_link_active_step,
+                self.tendon_link_wrap_angle,
+                self.tendon_link_wrap_angle_step,
                 self.tendon_seg_attachment_l,
                 self.tendon_seg_attachment_r,
                 self.tendon_seg_attachment_l_local,
@@ -2352,6 +2360,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_seg_rolling_delta_l,
                 self.tendon_seg_rolling_delta_r,
                 self.tendon_cone_sweep_count,
+                0,
                 1,
                 1,
                 0,
@@ -2445,16 +2454,22 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 state_in.body_q,
                 model.body_com,
                 model.tendon_start,
+                model.tendon_seg_start,
                 model.tendon_link_body,
                 model.tendon_link_type,
+                model.tendon_link_flags,
                 model.tendon_link_radius,
                 model.tendon_link_mu,
                 self.tendon_link_active,
                 model.tendon_link_offset,
                 model.tendon_link_axis,
+                self.tendon_link_wrap_angle,
                 self.tendon_seg_rest_length,
                 self.tendon_seg_attachment_l,
                 self.tendon_seg_attachment_r,
+                self.tendon_seg_active,
+                self.tendon_seg_active_link_l,
+                self.tendon_seg_active_link_r,
                 self.tendon_seg_active_compliance,
                 self.tendon_seg_delta_lambda,
                 self.rigid_tendon_relaxation,
