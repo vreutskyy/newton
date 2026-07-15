@@ -821,6 +821,58 @@ def build_oriented_dynamic_route(orientation, device):
     return builder.finalize(device=device), candidate, candidate_link
 
 
+def build_consecutive_dynamic_route(device, orientations=(1, 1), candidate_y=None, mu=0.0):
+    """Build neighboring dynamic rollers between fixed endpoints."""
+    builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+    base = builder.add_body(mass=0.0, is_kinematic=True)
+    endpoint = builder.add_body(
+        xform=wp.transform(p=wp.vec3(float(len(orientations) + 1), 0.0, 0.0)),
+        mass=0.0,
+        is_kinematic=True,
+    )
+    if candidate_y is None:
+        candidate_y = tuple(0.3 * orientation for orientation in orientations)
+    candidates = [
+        builder.add_body(
+            xform=wp.transform(p=wp.vec3(float(x), y, 0.0)),
+            mass=0.0,
+            is_kinematic=True,
+        )
+        for x, y in enumerate(candidate_y, start=1)
+    ]
+
+    builder.add_tendon()
+    builder.add_tendon_link(
+        body=base,
+        link_type=int(TendonLinkType.ATTACHMENT),
+        offset=(0.0, 0.0, 0.0),
+        axis=(0.0, 0.0, 1.0),
+    )
+    candidate_links = []
+    for candidate, orientation in zip(candidates, orientations, strict=True):
+        candidate_links.append(
+            builder.add_tendon_link(
+                body=candidate,
+                link_type=int(TendonLinkType.ROLLING),
+                radius=0.1,
+                orientation=orientation,
+                mu=mu,
+                dynamic=True,
+                axis=(0.0, 0.0, 1.0),
+                compliance=1.0e-4,
+                rest_length=-1.0,
+            )
+        )
+    builder.add_tendon_link(
+        body=endpoint,
+        link_type=int(TendonLinkType.ATTACHMENT),
+        axis=(0.0, 0.0, 1.0),
+        compliance=1.0e-4,
+        rest_length=-1.0,
+    )
+    return builder.finalize(device=device), candidates, candidate_links, endpoint
+
+
 def build_dynamic_route_neighbor_matrix_case(device, left_type, right_type, orientation):
     """Build an inactive dynamic roller between the requested link types."""
     builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
@@ -980,29 +1032,6 @@ class TestTendonCapstan(unittest.TestCase):
                 builder.add_tendon()
                 with self.assertRaisesRegex(ValueError, "dynamic routing is only supported for ROLLING tendon links"):
                     builder.add_tendon_link(body=body, link_type=int(link_type), dynamic=True)
-
-    def test_rejects_consecutive_dynamic_rolling_links(self):
-        builder = newton.ModelBuilder()
-        bodies = [builder.add_body(mass=0.0) for _ in range(3)]
-        builder.add_tendon()
-        builder.add_tendon_link(
-            body=bodies[0],
-            link_type=int(TendonLinkType.ATTACHMENT),
-        )
-        builder.add_tendon_link(
-            body=bodies[1],
-            link_type=int(TendonLinkType.ROLLING),
-            radius=0.1,
-            dynamic=True,
-        )
-
-        with self.assertRaisesRegex(ValueError, "Consecutive dynamic ROLLING tendon links"):
-            builder.add_tendon_link(
-                body=bodies[2],
-                link_type=int(TendonLinkType.ROLLING),
-                radius=0.1,
-                dynamic=True,
-            )
 
 
 def _hinge_y_angle(body_q, body_idx):
@@ -1415,6 +1444,226 @@ def test_dynamic_route_neighbor_matrix_conserves_material(test, device):
                         test.assertFalse(solver.tendon_link_active.numpy()[candidate_link])
                         actual_material_length = _route_material_length(solver, model, state_0)
                         test.assertAlmostEqual(actual_material_length, expected_material_length, delta=1.0e-5)
+
+
+def _consecutive_route_candidate_y(pattern, orientations):
+    return tuple(
+        (-0.3 if active else 1.0) * orientation for active, orientation in zip(pattern, orientations, strict=True)
+    )
+
+
+def _apply_consecutive_route_state(
+    test,
+    solver,
+    model,
+    state_0,
+    state_1,
+    candidates,
+    candidate_links,
+    pattern,
+    orientations,
+    expected_material_length,
+):
+    body_q = state_0.body_q.numpy()
+    candidate_y = _consecutive_route_candidate_y(pattern, orientations)
+    for candidate, y in zip(candidates, candidate_y, strict=True):
+        body_q[candidate, :3] = (body_q[candidate, 0], y, 0.0)
+    state_0.body_q.assign(body_q)
+    solver.step(state_0, state_1, model.control(), None, 1.0 / 4800.0)
+
+    actual_active = tuple(bool(solver.tendon_link_active.numpy()[i]) for i in candidate_links)
+    test.assertEqual(actual_active, pattern)
+    test.assertEqual(int(np.sum(solver.tendon_seg_active.numpy())), 1 + sum(pattern))
+    test.assertAlmostEqual(
+        _route_material_length(solver, model, state_1),
+        expected_material_length,
+        delta=1.0e-5,
+    )
+
+    active = solver.tendon_seg_active.numpy().astype(bool)
+    span_length = np.linalg.norm(
+        solver.tendon_seg_attachment_r.numpy() - solver.tendon_seg_attachment_l.numpy(), axis=1
+    )
+    stretch = np.maximum(span_length - solver.tendon_seg_rest_length.numpy(), 0.0)
+    compliance = solver.tendon_seg_active_compliance.numpy()
+    tension = np.zeros_like(stretch)
+    valid = active & (compliance > 0.0)
+    tension[valid] = stretch[valid] / compliance[valid]
+    test.assertTrue(np.all(np.isfinite(tension)))
+    return state_1, state_0, float(np.max(tension))
+
+
+def test_consecutive_dynamic_routes_conserve_material(test, device):
+    """Every two-roller state transition should preserve route topology and material."""
+    with wp.ScopedDevice(device):
+        states = ((False, False), (True, False), (True, True), (False, True))
+        for orientations in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
+            with test.subTest(orientations=orientations):
+                initial_y = _consecutive_route_candidate_y(states[0], orientations)
+                model, candidates, candidate_links, _ = build_consecutive_dynamic_route(device, orientations, initial_y)
+                solver = newton.solvers.SolverXPBD(model, iterations=1, joint_linear_relaxation=1.0)
+                state_0, state_1 = model.state(), model.state()
+                expected_material_length = _route_material_length(solver, model, state_0)
+
+                for source in states:
+                    state_0, state_1, _ = _apply_consecutive_route_state(
+                        test,
+                        solver,
+                        model,
+                        state_0,
+                        state_1,
+                        candidates,
+                        candidate_links,
+                        source,
+                        orientations,
+                        expected_material_length,
+                    )
+                    for target in states:
+                        state_0, state_1, _ = _apply_consecutive_route_state(
+                            test,
+                            solver,
+                            model,
+                            state_0,
+                            state_1,
+                            candidates,
+                            candidate_links,
+                            target,
+                            orientations,
+                            expected_material_length,
+                        )
+                        state_0, state_1, _ = _apply_consecutive_route_state(
+                            test,
+                            solver,
+                            model,
+                            state_0,
+                            state_1,
+                            candidates,
+                            candidate_links,
+                            source,
+                            orientations,
+                            expected_material_length,
+                        )
+
+
+def test_consecutive_dynamic_routes_initial_state_matrix(test, device):
+    """Neighboring rollers should resolve every authored orientation/state combination at initialization."""
+    with wp.ScopedDevice(device):
+        states = ((False, False), (True, False), (True, True), (False, True))
+        for orientations in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
+            for pattern in states:
+                with test.subTest(orientations=orientations, pattern=pattern):
+                    candidate_y = _consecutive_route_candidate_y(pattern, orientations)
+                    model, _, candidate_links, _ = build_consecutive_dynamic_route(device, orientations, candidate_y)
+                    solver = newton.solvers.SolverXPBD(model, iterations=1)
+                    actual = tuple(bool(solver.tendon_link_active.numpy()[i]) for i in candidate_links)
+                    test.assertEqual(actual, pattern)
+                    test.assertEqual(int(np.sum(solver.tendon_seg_active.numpy())), 1 + sum(pattern))
+                    test.assertGreater(_route_material_length(solver, model, model.state()), 0.0)
+
+
+def test_three_consecutive_dynamic_routes_conserve_material(test, device):
+    """A three-roller run should preserve material through all active states."""
+    with wp.ScopedDevice(device):
+        patterns = (
+            (False, False, False),
+            (False, False, True),
+            (False, True, True),
+            (False, True, False),
+            (True, True, False),
+            (True, True, True),
+            (True, False, True),
+            (True, False, False),
+            (False, False, False),
+            (True, True, True),
+            (False, False, False),
+        )
+        for orientations in ((1, 1, 1), (1, -1, 1)):
+            with test.subTest(orientations=orientations):
+                initial_y = _consecutive_route_candidate_y(patterns[0], orientations)
+                model, candidates, candidate_links, _ = build_consecutive_dynamic_route(device, orientations, initial_y)
+                solver = newton.solvers.SolverXPBD(model, iterations=1, joint_linear_relaxation=1.0)
+                state_0, state_1 = model.state(), model.state()
+                expected_material_length = _route_material_length(solver, model, state_0)
+                for pattern in patterns:
+                    state_0, state_1, _ = _apply_consecutive_route_state(
+                        test,
+                        solver,
+                        model,
+                        state_0,
+                        state_1,
+                        candidates,
+                        candidate_links,
+                        pattern,
+                        orientations,
+                        expected_material_length,
+                    )
+
+
+def test_loaded_consecutive_dynamic_routes_conserve_material(test, device):
+    """Neighboring route transitions should conserve material while the tendon is taut."""
+    with wp.ScopedDevice(device):
+        orientations = (1, -1)
+        patterns = ((False, False), (True, True), (True, False), (False, True), (False, False))
+        peak_tension_by_extension = []
+        for extension in (0.05, 0.20):
+            initial_y = _consecutive_route_candidate_y(patterns[0], orientations)
+            model, candidates, candidate_links, endpoint = build_consecutive_dynamic_route(
+                device, orientations, initial_y, mu=0.2
+            )
+            solver = newton.solvers.SolverXPBD(model, iterations=4, joint_linear_relaxation=1.0)
+            state_0, state_1 = model.state(), model.state()
+            expected_material_length = _route_material_length(solver, model, state_0)
+
+            body_q = state_0.body_q.numpy()
+            body_q[endpoint, 0] += extension
+            state_0.body_q.assign(body_q)
+            peak_tensions = []
+            for pattern in patterns:
+                state_0, state_1, peak_tension = _apply_consecutive_route_state(
+                    test,
+                    solver,
+                    model,
+                    state_0,
+                    state_1,
+                    candidates,
+                    candidate_links,
+                    pattern,
+                    orientations,
+                    expected_material_length,
+                )
+                peak_tensions.append(peak_tension)
+
+            test.assertGreater(min(peak_tensions), 1.0e-3)
+            peak_tension_by_extension.append(float(np.mean(peak_tensions)))
+
+        test.assertGreater(peak_tension_by_extension[1], 1.5 * peak_tension_by_extension[0])
+
+
+def test_consecutive_dynamic_route_cuda_graph_capture(test, device):
+    """Neighboring dynamic route state should remain CUDA graph-capturable."""
+    device = wp.get_device(device)
+    if not wp.is_mempool_enabled(device):
+        test.skipTest("CUDA graph capture requires the Warp memory pool")
+
+    with wp.ScopedDevice(device):
+        orientations = (1, -1, 1)
+        active = (True, True, True)
+        candidate_y = _consecutive_route_candidate_y(active, orientations)
+        model, _, candidate_links, _ = build_consecutive_dynamic_route(device, orientations, candidate_y)
+        solver = newton.solvers.SolverXPBD(model, iterations=1)
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        solver.step(state_0, state_1, control, None, 1.0 / 120.0)
+        solver.step(state_1, state_0, control, None, 1.0 / 120.0)
+
+        with wp.ScopedCapture(device=device) as capture:
+            solver.step(state_0, state_1, control, None, 1.0 / 120.0)
+            solver.step(state_1, state_0, control, None, 1.0 / 120.0)
+
+        for _ in range(10):
+            wp.capture_launch(capture.graph)
+        actual = tuple(bool(solver.tendon_link_active.numpy()[i]) for i in candidate_links)
+        test.assertEqual(actual, active)
 
 
 def test_dynamic_route_initial_state_matches_geometry(test, device):
@@ -2685,6 +2934,36 @@ add_test(
     "dynamic_route_neighbor_matrix_conserves_material",
     devices,
     test_dynamic_route_neighbor_matrix_conserves_material,
+)
+add_test(
+    TestTendonCapstan,
+    "consecutive_dynamic_routes_conserve_material",
+    devices,
+    test_consecutive_dynamic_routes_conserve_material,
+)
+add_test(
+    TestTendonCapstan,
+    "consecutive_dynamic_routes_initial_state_matrix",
+    devices,
+    test_consecutive_dynamic_routes_initial_state_matrix,
+)
+add_test(
+    TestTendonCapstan,
+    "three_consecutive_dynamic_routes_conserve_material",
+    devices,
+    test_three_consecutive_dynamic_routes_conserve_material,
+)
+add_test(
+    TestTendonCapstan,
+    "loaded_consecutive_dynamic_routes_conserve_material",
+    devices,
+    test_loaded_consecutive_dynamic_routes_conserve_material,
+)
+add_test(
+    TestTendonCapstan,
+    "consecutive_dynamic_route_cuda_graph_capture",
+    cuda_devices,
+    test_consecutive_dynamic_route_cuda_graph_capture,
 )
 add_test(
     TestTendonCapstan,

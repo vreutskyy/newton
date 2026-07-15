@@ -33,67 +33,6 @@ def _transform_vector_np(pose: np.ndarray, vec: np.ndarray) -> np.ndarray:
     return vec + q[3] * t + np.cross(q[:3], t)
 
 
-def _tangent_point_circle_np(
-    point: np.ndarray,
-    center: np.ndarray,
-    radius: float,
-    plane_normal: np.ndarray,
-    orientation: int,
-) -> np.ndarray:
-    """Compute the tangent point on a circle from an external point."""
-    point = np.asarray(point, dtype=np.float64)
-    center = np.asarray(center, dtype=np.float64)
-    normal = np.asarray(plane_normal, dtype=np.float64)
-    normal = normal / max(float(np.linalg.norm(normal)), 1.0e-12)
-
-    d = center - point
-    d_proj = d - np.dot(d, normal) * normal
-    dist = float(np.linalg.norm(d_proj))
-    if dist <= radius:
-        if dist < 1.0e-8:
-            fallback = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-            fallback -= np.dot(fallback, normal) * normal
-            return center + radius * fallback / max(float(np.linalg.norm(fallback)), 1.0e-12)
-        return center - radius * d_proj / dist
-
-    u = d_proj / dist
-    v = np.cross(normal, u)
-    phi = np.arcsin(min(radius / dist, 1.0))
-    angle = -0.5 * np.pi - phi if orientation > 0 else 0.5 * np.pi + phi
-    return center + radius * (np.cos(angle) * u + np.sin(angle) * v)
-
-
-def _segment_attachment_points_np(
-    center_l: np.ndarray,
-    center_r: np.ndarray,
-    type_l: int,
-    type_r: int,
-    radius_l: float,
-    radius_r: float,
-    orient_l: int,
-    orient_r: int,
-    normal_l: np.ndarray,
-    normal_r: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute free-span endpoints with the same tangent cases as the Warp kernel."""
-    new_l = np.asarray(center_l, dtype=np.float64)
-    new_r = np.asarray(center_r, dtype=np.float64)
-    rolling = int(TendonLinkType.ROLLING)
-
-    if type_l == rolling and type_r == rolling and radius_l > 0.0 and radius_r > 0.0:
-        for _iter in range(10):
-            new_r = _tangent_point_circle_np(new_l, center_r, radius_r, normal_r, orient_r)
-            new_l = _tangent_point_circle_np(new_r, center_l, radius_l, normal_l, -orient_l)
-    elif type_l == rolling and radius_l > 0.0:
-        new_l = _tangent_point_circle_np(center_r, center_l, radius_l, normal_l, -orient_l)
-        new_r = np.asarray(center_r, dtype=np.float64)
-    elif type_r == rolling and radius_r > 0.0:
-        new_l = np.asarray(center_l, dtype=np.float64)
-        new_r = _tangent_point_circle_np(center_l, center_r, radius_r, normal_r, orient_r)
-
-    return new_l, new_r
-
-
 class TendonStateMixin:
     """Mixin that allocates routed-tendon mutable state on a solver instance."""
 
@@ -132,7 +71,6 @@ class TendonStateMixin:
             self.tendon_seg_active_damping = None
             self.tendon_link_active = None
             self.tendon_link_active_step = None
-            self.tendon_link_route_rest_length = None
             self.tendon_link_seg_left = None
             self.tendon_total_cable = None
             return
@@ -164,7 +102,6 @@ class TendonStateMixin:
             )
             self.tendon_link_active = wp.ones(model.tendon_link_count, dtype=bool)
             self.tendon_link_active_step = wp.ones(model.tendon_link_count, dtype=bool)
-            self.tendon_link_route_rest_length = wp.zeros(model.tendon_link_count, dtype=float)
             self.tendon_total_cable = wp.zeros(model.tendon_count, dtype=float)
 
             tendon_start_np = model.tendon_start.numpy()
@@ -209,10 +146,7 @@ class TendonStateMixin:
                 self._update_tendon_link_active(model, model.body_q)
                 wp.copy(self.tendon_link_active_step, self.tendon_link_active)
 
-            route_rest_np, route_seg_mask = self._compute_active_route_rest_lengths(model)
-            self.tendon_link_route_rest_length = wp.array(route_rest_np, dtype=float, device=model.device)
-
-            self._init_tendon_attachment_points(model, auto_mask, route_seg_mask)
+            self._init_tendon_attachment_points(model, auto_mask)
 
     def _snapshot_tendon_step_state(self) -> None:
         """Snapshot mutable tendon material state at the start of a time step."""
@@ -253,66 +187,7 @@ class TendonStateMixin:
             device=model.device,
         )
 
-    def _compute_active_route_rest_lengths(self, model: Model) -> tuple[np.ndarray, np.ndarray]:
-        """Compute bypass material lengths for dynamically routed rolling links."""
-        route_rest = np.zeros(model.tendon_link_count, dtype=np.float32)
-        route_seg_mask = np.zeros(model.tendon_segment_count, dtype=bool)
-        body_q = model.body_q
-        if body_q is None:
-            return route_rest, route_seg_mask
-
-        tendon_start = model.tendon_start.numpy()
-        link_body = model.tendon_link_body.numpy()
-        link_type = model.tendon_link_type.numpy()
-        link_radius = model.tendon_link_radius.numpy()
-        link_orientation = model.tendon_link_orientation.numpy()
-        link_flags = model.tendon_link_flags.numpy()
-        link_active = self.tendon_link_active.numpy()
-        link_offset = model.tendon_link_offset.numpy()
-        link_axis = model.tendon_link_axis.numpy()
-        body_q_np = body_q.numpy()
-
-        seg_base = 0
-        for t in range(model.tendon_count):
-            start = tendon_start[t]
-            end = tendon_start[t + 1]
-            for i in range(start + 1, end - 1):
-                if link_type[i] != int(TendonLinkType.ROLLING) or (link_flags[i] & int(TendonLinkFlags.DYNAMIC)) == 0:
-                    continue
-
-                left_seg = seg_base + (i - start) - 1
-                right_seg = left_seg + 1
-                if not link_active[i]:
-                    route_seg_mask[left_seg] = True
-                    route_seg_mask[right_seg] = True
-
-                link_l = i - 1
-                link_r = i + 1
-                pose_l = body_q_np[link_body[link_l]]
-                pose_r = body_q_np[link_body[link_r]]
-                center_l = _transform_point_np(pose_l, link_offset[link_l]).astype(np.float64)
-                center_r = _transform_point_np(pose_r, link_offset[link_r]).astype(np.float64)
-                normal_l = _transform_vector_np(pose_l, link_axis[link_l])
-                normal_r = _transform_vector_np(pose_r, link_axis[link_r])
-                p0, p1 = _segment_attachment_points_np(
-                    center_l,
-                    center_r,
-                    int(link_type[link_l]),
-                    int(link_type[link_r]),
-                    float(link_radius[link_l]),
-                    float(link_radius[link_r]),
-                    int(link_orientation[link_l]),
-                    int(link_orientation[link_r]),
-                    normal_l,
-                    normal_r,
-                )
-                route_rest[i] = float(np.linalg.norm(p1 - p0))
-
-            seg_base += end - start - 1
-
-        return route_rest, route_seg_mask
-
-    def _init_tendon_attachment_points(self, model: Model, auto_mask: np.ndarray, route_seg_mask: np.ndarray) -> None:
+    def _init_tendon_attachment_points(self, model: Model, auto_mask: np.ndarray) -> None:
         """Compute initial tendon tangent attachments and rest lengths."""
         body_q = model.body_q
         if body_q is None:
@@ -375,7 +250,6 @@ class TendonStateMixin:
                 self.tendon_seg_active_damping,
                 self.tendon_link_active,
                 self.tendon_link_active_step,
-                self.tendon_link_route_rest_length,
                 self.tendon_seg_attachment_l,
                 self.tendon_seg_attachment_r,
                 self.tendon_seg_attachment_l_local,
@@ -397,8 +271,9 @@ class TendonStateMixin:
         att_l_np = self.tendon_seg_attachment_l.numpy()
         att_r_np = self.tendon_seg_attachment_r.numpy()
         rest_np = self.tendon_seg_rest_length.numpy()
+        seg_active_np = self.tendon_seg_active.numpy()
         for i in range(model.tendon_segment_count):
-            if auto_mask[i] and not route_seg_mask[i]:
+            if auto_mask[i] and seg_active_np[i]:
                 rest_np[i] = np.linalg.norm(att_r_np[i] - att_l_np[i])
         self.tendon_seg_rest_length = wp.array(rest_np, dtype=float, device=model.device)
         self._snapshot_tendon_step_state()

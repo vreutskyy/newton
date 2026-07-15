@@ -4533,15 +4533,6 @@ class ModelBuilder:
         tendon_link_start = self.tendon_start[-1]
         if dynamic and link_type != int(TendonLinkType.ROLLING):
             raise ValueError("dynamic routing is only supported for ROLLING tendon links")
-        if (
-            link_idx > tendon_link_start
-            and link_type == int(TendonLinkType.ROLLING)
-            and dynamic
-            and self.tendon_link_type[-1] == int(TendonLinkType.ROLLING)
-            and (self.tendon_link_flags[-1] & int(TendonLinkFlags.DYNAMIC)) != 0
-        ):
-            raise ValueError("Consecutive dynamic ROLLING tendon links are not supported")
-
         self.tendon_link_body.append(body)
         self.tendon_link_type.append(link_type)
         self.tendon_link_radius.append(radius)
