@@ -113,6 +113,7 @@ class TendonStateMixin:
             self.tendon_seg_rest_length = None
             self.tendon_seg_rest_length_step = None
             self.tendon_seg_stretch = None
+            self.tendon_seg_damping_tension = None
             self.tendon_seg_attachment_l = None
             self.tendon_seg_attachment_r = None
             self.tendon_seg_attachment_l_local = None
@@ -152,6 +153,8 @@ class TendonStateMixin:
             )
             self.tendon_seg_rolling_delta_l = wp.zeros(model.tendon_segment_count, dtype=float)
             self.tendon_seg_rolling_delta_r = wp.zeros(model.tendon_segment_count, dtype=float)
+            # Cached instantaneous damping term used by routing and slip projections.
+            self.tendon_seg_damping_tension = wp.zeros(model.tendon_segment_count, dtype=float)
             self.tendon_cone_sweep_count = wp.zeros(model.tendon_count, dtype=wp.int32)
             self.tendon_seg_active = wp.ones(model.tendon_segment_count, dtype=wp.int32)
             self.tendon_seg_active_link_l = wp.zeros(model.tendon_segment_count, dtype=wp.int32)
@@ -354,6 +357,8 @@ class TendonStateMixin:
             dim=model.tendon_count,
             inputs=[
                 body_q,
+                model.body_qd,
+                model.body_com,
                 model.tendon_start,
                 model.tendon_link_body,
                 model.tendon_link_type,
@@ -366,6 +371,7 @@ class TendonStateMixin:
                 self.tendon_seg_rest_length,
                 self.tendon_seg_rest_length_step,
                 self.tendon_seg_stretch,
+                self.tendon_seg_damping_tension,
                 model.tendon_seg_compliance,
                 model.tendon_seg_damping,
                 self.tendon_seg_active,

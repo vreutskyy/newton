@@ -92,15 +92,16 @@ def solve_tendon_stretch(
     diff = x_r - x_l
     d = wp.length(diff)
 
-    # unilateral: only enforce when stretched beyond rest length
+    # Keep signed stretch because positive length rate may activate damping
+    # before geometric stretch becomes positive.
     err = d - rest
-    if err <= 0.0:
+    if d <= 1.0e-8:
         seg_lambda[seg] = 0.0
         seg_delta_lambda[seg] = 0.0
         return
 
     # constraint direction
-    n = diff / wp.max(d, 1.0e-8)
+    n = diff / d
 
     world_com_l = wp.transform_point(pose_l, com_l)
     world_com_r = wp.transform_point(pose_r, com_r)
@@ -160,7 +161,12 @@ def solve_tendon_stretch(
 
     d_lambda = d_lambda * relaxation
 
-    seg_lambda[seg] = lambda_prev + d_lambda
+    # A cable may transmit tension but not compression. Applying the
+    # unilateral bound to the accumulated multiplier also lets positive
+    # length rate activate damping at zero geometric stretch.
+    lambda_new = wp.min(lambda_prev + d_lambda, 0.0)
+    d_lambda = lambda_new - lambda_prev
+    seg_lambda[seg] = lambda_new
     seg_delta_lambda[seg] = d_lambda
 
     # apply positional corrections
@@ -195,6 +201,7 @@ def solve_tendon_slip(
     seg_attachment_l: wp.array[wp.vec3],
     seg_attachment_r: wp.array[wp.vec3],
     seg_compliance: wp.array[float],
+    seg_damping_tension: wp.array[float],
     seg_delta_lambda: wp.array[float],
     relaxation: float,
     # outputs
@@ -257,16 +264,16 @@ def solve_tendon_slip(
         len_r = wp.length(seg_attachment_r[seg_right] - seg_attachment_l[seg_right])
         d_l = len_l - seg_rest_length[seg_left]
         d_r = len_r - seg_rest_length[seg_right]
-        if d_l < 0.0:
-            d_l = 0.0
-        if d_r < 0.0:
-            d_r = 0.0
 
         # Match the material-transfer cone: guard division by zero without changing physical compliance.
-        comp_l = wp.max(seg_compliance[seg_left], 1.0e-30)
-        comp_r = wp.max(seg_compliance[seg_right], 1.0e-30)
-        force_l = d_l / comp_l
-        force_r = d_r / comp_r
+        compliance_l = seg_compliance[seg_left]
+        compliance_r = seg_compliance[seg_right]
+        comp_l = wp.max(compliance_l, 1.0e-30)
+        comp_r = wp.max(compliance_r, 1.0e-30)
+        damping_tension_l = seg_damping_tension[seg_left] if compliance_l > 0.0 else 0.0
+        damping_tension_r = seg_damping_tension[seg_right] if compliance_r > 0.0 else 0.0
+        force_l = wp.max(d_l / comp_l + damping_tension_l, 0.0)
+        force_r = wp.max(d_r / comp_r + damping_tension_r, 0.0)
 
         force_sum = force_l + force_r
         force_diff = wp.abs(force_l - force_r)
