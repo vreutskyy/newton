@@ -2136,6 +2136,121 @@ def test_simple_cable_gravity_tension_independent_of_relaxation(test, device):
             )
 
 
+def test_frictionless_pinhole_equalizes_damped_tension(test, device):
+    """A frictionless route must balance total tension, including axial damping."""
+    with wp.ScopedDevice(device):
+        length_rate = 1.0e-3
+        compliance = 0.1
+        for initial_tension in (0.0, 1.0):
+            for damping in (0.0, 5.0, 100.0, 200.0):
+                with test.subTest(initial_tension=initial_tension, damping=damping):
+                    rest_length = 1.0 - compliance * initial_tension
+                    builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+                    left = builder.add_body(
+                        xform=wp.transform(p=wp.vec3(-1.0, 0.0, 0.0)),
+                        mass=0.0,
+                        is_kinematic=True,
+                    )
+                    pin = builder.add_body(
+                        xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.0)),
+                        mass=0.0,
+                        is_kinematic=True,
+                    )
+                    right = builder.add_body(
+                        xform=wp.transform(p=wp.vec3(1.0, 0.0, 0.0)),
+                        mass=0.0,
+                        is_kinematic=True,
+                    )
+                    builder.add_tendon()
+                    builder.add_tendon_link(
+                        body=left,
+                        link_type=int(TendonLinkType.ATTACHMENT),
+                    )
+                    builder.add_tendon_link(
+                        body=pin,
+                        link_type=int(TendonLinkType.PINHOLE),
+                        compliance=compliance,
+                        damping=damping,
+                        rest_length=rest_length,
+                    )
+                    builder.add_tendon_link(
+                        body=right,
+                        link_type=int(TendonLinkType.ATTACHMENT),
+                        compliance=compliance,
+                        damping=damping,
+                        rest_length=rest_length,
+                    )
+
+                    model = builder.finalize()
+                    solver = newton.solvers.SolverXPBD(
+                        model,
+                        iterations=1,
+                        joint_linear_relaxation=1.0,
+                        tendon_max_sweeps=32,
+                        tendon_settle_tol=1.0e-3,
+                    )
+                    state_0, state_1 = model.state(), model.state()
+                    body_qd = state_0.body_qd.numpy()
+                    body_qd[left, 0] = -length_rate
+                    state_0.body_qd.assign(body_qd)
+                    dt = 0.01
+
+                    solver.step(state_0, state_1, model.control(), None, dt)
+
+                    tension = -solver.tendon_seg_lambda.numpy() / dt
+                    expected_tension = initial_tension + 0.5 * damping * length_rate
+                    test.assertAlmostEqual(
+                        float(tension[0]),
+                        float(tension[1]),
+                        delta=1.0e-5,
+                        msg=f"Frictionless spans should balance damped tension: {tension}",
+                    )
+                    test.assertAlmostEqual(float(tension[0]), expected_tension, delta=1.0e-5)
+                    test.assertLess(int(solver.tendon_cone_sweep_count.numpy()[0]), 32)
+
+
+def test_tendon_damping_does_not_generate_compression(test, device):
+    """Axial damping may reduce cable tension to zero but cannot make it compressive."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        left = builder.add_body(
+            xform=wp.transform(p=wp.vec3(-1.0, 0.0, 0.0)),
+            mass=0.0,
+            is_kinematic=True,
+        )
+        right = builder.add_body(
+            xform=wp.transform(p=wp.vec3(1.0, 0.0, 0.0)),
+            mass=0.0,
+            is_kinematic=True,
+        )
+        builder.add_tendon()
+        builder.add_tendon_link(body=left, link_type=int(TendonLinkType.ATTACHMENT))
+        builder.add_tendon_link(
+            body=right,
+            link_type=int(TendonLinkType.ATTACHMENT),
+            compliance=0.1,
+            damping=2.0,
+            rest_length=1.9,
+        )
+
+        model = builder.finalize()
+        solver = newton.solvers.SolverXPBD(
+            model,
+            iterations=1,
+            joint_linear_relaxation=1.0,
+        )
+        state_0, state_1 = model.state(), model.state()
+        body_qd = state_0.body_qd.numpy()
+        body_qd[left, 0] = 1.0
+        state_0.body_qd.assign(body_qd)
+        dt = 0.01
+
+        solver.step(state_0, state_1, model.control(), None, dt)
+
+        tension = -float(solver.tendon_seg_lambda.numpy()[0]) / dt
+        test.assertAlmostEqual(tension, 0.0, delta=1.0e-6)
+
+
 def test_tendon_slip_uses_true_segment_compliance(test, device):
     """The rolling-slip cone should use the same physical tension as material transfer."""
     with wp.ScopedDevice(device):
@@ -2146,7 +2261,6 @@ def test_tendon_slip_uses_true_segment_compliance(test, device):
         mu = 0.1
 
         body_q = wp.array([wp.transform_identity()], dtype=wp.transform)
-        body_com = wp.zeros(1, dtype=wp.vec3)
         tendon_start = wp.array([0, 3], dtype=int)
         tendon_link_body = wp.array([0, 0, 0], dtype=int)
         tendon_link_type = wp.array(
@@ -2162,6 +2276,7 @@ def test_tendon_slip_uses_true_segment_compliance(test, device):
         seg_attachment_l = wp.array([wp.vec3(-1.0, 0.0, -1.0), wp.vec3(1.0, 0.0, 0.0)], dtype=wp.vec3)
         seg_attachment_r = wp.array([wp.vec3(-1.0, 0.0, 0.0), wp.vec3(1.0, 0.0, -1.0)], dtype=wp.vec3)
         seg_compliance = wp.array([compliance_l, compliance_r], dtype=float)
+        seg_damping_tension = wp.zeros(2, dtype=float)
         seg_delta_lambda = wp.array([-1.0, 0.0], dtype=float)
         body_deltas = wp.zeros(1, dtype=wp.spatial_vector)
 
@@ -2170,7 +2285,6 @@ def test_tendon_slip_uses_true_segment_compliance(test, device):
             dim=1,
             inputs=[
                 body_q,
-                body_com,
                 tendon_start,
                 tendon_link_body,
                 tendon_link_type,
@@ -2183,6 +2297,7 @@ def test_tendon_slip_uses_true_segment_compliance(test, device):
                 seg_attachment_l,
                 seg_attachment_r,
                 seg_compliance,
+                seg_damping_tension,
                 seg_delta_lambda,
                 1.0,
             ],
@@ -2926,6 +3041,18 @@ add_test(
     "simple_cable_gravity_tension_independent_of_relaxation",
     devices,
     test_simple_cable_gravity_tension_independent_of_relaxation,
+)
+add_test(
+    TestTendonCapstan,
+    "frictionless_pinhole_equalizes_damped_tension",
+    devices,
+    test_frictionless_pinhole_equalizes_damped_tension,
+)
+add_test(
+    TestTendonCapstan,
+    "tendon_damping_does_not_generate_compression",
+    devices,
+    test_tendon_damping_does_not_generate_compression,
 )
 add_test(
     TestTendonCapstan,

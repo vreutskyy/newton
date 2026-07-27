@@ -241,9 +241,68 @@ def update_tendon_link_active(
         tendon_link_active[link_idx] = active
 
 
+@wp.func
+def tendon_segment_length_rate(
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    tendon_link_body: wp.array[int],
+    tendon_link_type: wp.array[int],
+    tendon_link_offset: wp.array[wp.vec3],
+    tendon_link_axis: wp.array[wp.vec3],
+    link_l: int,
+    link_r: int,
+    x_l: wp.vec3,
+    x_r: wp.vec3,
+):
+    """Return the free-span length rate used by the stretch constraint."""
+    diff = x_r - x_l
+    length = wp.length(diff)
+    if length <= 1.0e-8:
+        return 0.0
+
+    direction = diff / length
+    body_l = tendon_link_body[link_l]
+    body_r = tendon_link_body[link_r]
+    pose_l = body_q[body_l]
+    pose_r = body_q[body_r]
+    velocity_l = wp.spatial_top(body_qd[body_l])
+    velocity_r = wp.spatial_top(body_qd[body_r])
+    omega_l = wp.spatial_bottom(body_qd[body_l])
+    omega_r = wp.spatial_bottom(body_qd[body_r])
+    world_com_l = wp.transform_point(pose_l, body_com[body_l])
+    world_com_r = wp.transform_point(pose_r, body_com[body_r])
+
+    linear_l = -direction
+    linear_r = direction
+    angular_l = -wp.cross(x_l - world_com_l, direction)
+    angular_r = wp.cross(x_r - world_com_r, direction)
+
+    # Rolling contact does not transmit spin about the roller axis.
+    if tendon_link_type[link_l] == int(TendonLinkType.ROLLING):
+        center_l = wp.transform_point(pose_l, tendon_link_offset[link_l])
+        normal_l = wp.transform_vector(pose_l, tendon_link_axis[link_l])
+        radial_l = x_l - center_l
+        angular_l = angular_l - wp.dot(wp.cross(radial_l, linear_l), normal_l) * normal_l
+    if tendon_link_type[link_r] == int(TendonLinkType.ROLLING):
+        center_r = wp.transform_point(pose_r, tendon_link_offset[link_r])
+        normal_r = wp.transform_vector(pose_r, tendon_link_axis[link_r])
+        radial_r = x_r - center_r
+        angular_r = angular_r - wp.dot(wp.cross(radial_r, linear_r), normal_r) * normal_r
+
+    return (
+        wp.dot(linear_l, velocity_l)
+        + wp.dot(linear_r, velocity_r)
+        + wp.dot(angular_l, omega_l)
+        + wp.dot(angular_r, omega_r)
+    )
+
+
 @wp.kernel
 def update_tendon_attachments(
     body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
     tendon_start: wp.array[int],
     tendon_link_body: wp.array[int],
     tendon_link_type: wp.array[int],
@@ -256,6 +315,7 @@ def update_tendon_attachments(
     seg_rest_length: wp.array[float],
     seg_rest_length_step: wp.array[float],
     seg_stretch: wp.array[float],
+    seg_damping_tension: wp.array[float],
     seg_compliance: wp.array[float],
     seg_damping: wp.array[float],
     seg_active: wp.array[int],
@@ -312,6 +372,7 @@ def update_tendon_attachments(
         seg_active_link_r[seg] = link_r
         seg_active_compliance[seg] = seg_compliance[seg]
         seg_active_damping[seg] = seg_damping[seg]
+        seg_damping_tension[seg] = 0.0
         seg_rolling_delta_l[seg] = 0.0
         seg_rolling_delta_r[seg] = 0.0
         if apply_rolling_transfer != 0 or apply_pinhole_slip != 0:
@@ -504,6 +565,20 @@ def update_tendon_attachments(
                 # raw (signed) stretch: negative when the span is slack -- preserved so the
                 # rebuild below conserves total cable length (rest = len - stretch).
                 seg_stretch[seg] = len_snap - seg_rest_length[seg]
+                if seg_active_damping[seg] != 0.0:
+                    seg_damping_tension[seg] = seg_active_damping[seg] * tendon_segment_length_rate(
+                        body_q,
+                        body_qd,
+                        body_com,
+                        tendon_link_body,
+                        tendon_link_type,
+                        tendon_link_offset,
+                        tendon_link_axis,
+                        seg_active_link_l[seg],
+                        seg_active_link_r[seg],
+                        seg_attachment_l[seg],
+                        seg_attachment_r[seg],
+                    )
 
         material_sweep_count = int(4)
         if adaptive_cone_sweeps != 0:
@@ -671,33 +746,43 @@ def update_tendon_attachments(
 
                 len_l = wp.length(seg_attachment_r[seg_left] - seg_attachment_l[seg_left])
                 len_r = wp.length(seg_attachment_r[seg_right] - seg_attachment_l[seg_right])
-                # work on the precise stretch state instead of recomputing len-rest each sweep.
-                # keep the raw stretch (may be negative when a span is slack) separate from the
-                # clamped value used only in the force ratio -- the transfer is applied to the raw
-                # stretch so slack material is conserved (rest = len - stretch), exactly as the
-                # original code applied delta to seg_rest_length.
+                # Project the same unilateral Kelvin-Voigt tension used by
+                # solve_tendon_stretch, including damping at zero stretch.
                 d_l_raw = seg_stretch[seg_left]
                 d_r_raw = seg_stretch[seg_right]
-                d_l = wp.max(d_l_raw, 0.0)
-                d_r = wp.max(d_r_raw, 0.0)
 
                 # use the true per-segment compliance for the cone: the precise stretch state
                 # above removes the conditioning need for the old 1e-8 floor, and clamping here
                 # would mismatch the cone (d/clamp) against the real tension (d/comp) and inflate
                 # interior tensions across a compliance jump (e.g. c = rest/EA short segments).
-                comp_l = wp.max(seg_active_compliance[seg_left], 1.0e-30)
-                comp_r = wp.max(seg_active_compliance[seg_right], 1.0e-30)
-                force_l = d_l / comp_l
-                force_r = d_r / comp_r
+                compliance_l = seg_active_compliance[seg_left]
+                compliance_r = seg_active_compliance[seg_right]
+                comp_l = wp.max(compliance_l, 1.0e-30)
+                comp_r = wp.max(compliance_r, 1.0e-30)
+                damping_tension_l = seg_damping_tension[seg_left] if compliance_l > 0.0 else 0.0
+                damping_tension_r = seg_damping_tension[seg_right] if compliance_r > 0.0 else 0.0
+                effective_stretch_l = wp.max(
+                    d_l_raw + comp_l * damping_tension_l,
+                    0.0,
+                )
+                effective_stretch_r = wp.max(
+                    d_r_raw + comp_r * damping_tension_r,
+                    0.0,
+                )
+                force_l = effective_stretch_l / comp_l
+                force_r = effective_stretch_r / comp_r
                 delta = float(0.0)
                 max_delta = float(0.0)
 
                 sweep_maxtension = wp.max(sweep_maxtension, wp.max(force_l, force_r))
 
                 if force_l > force_r * cap_ratio:
-                    delta = (comp_r * d_l - cap_ratio * comp_l * d_r) / (comp_r + cap_ratio * comp_l)
+                    delta = (comp_r * effective_stretch_l - cap_ratio * comp_l * effective_stretch_r) / (
+                        comp_r + cap_ratio * comp_l
+                    )
                     if delta < 0.0:
                         delta = 0.0
+                    delta = wp.min(delta, effective_stretch_l)
                     # rest_right -= delta must keep rest_right >= min_rest; rest_right = len_r - d_r_raw
                     max_delta = len_r - d_r_raw - min_rest
                     if max_delta < 0.0:
@@ -709,9 +794,12 @@ def update_tendon_attachments(
                     seg_stretch[seg_right] = d_r_raw + delta
                     sweep_dtension = wp.max(sweep_dtension, wp.max(delta / comp_l, delta / comp_r))
                 elif force_r > force_l * cap_ratio:
-                    delta = (comp_l * d_r - cap_ratio * comp_r * d_l) / (comp_l + cap_ratio * comp_r)
+                    delta = (comp_l * effective_stretch_r - cap_ratio * comp_r * effective_stretch_l) / (
+                        comp_l + cap_ratio * comp_r
+                    )
                     if delta < 0.0:
                         delta = 0.0
+                    delta = wp.min(delta, effective_stretch_r)
                     max_delta = len_l - d_l_raw - min_rest
                     if max_delta < 0.0:
                         max_delta = 0.0
