@@ -337,6 +337,7 @@ def update_tendon_attachments(
     tendon_cone_sweep_count: wp.array[int],
     apply_rolling_transfer: int,
     apply_pinhole_slip: int,
+    report_unsupported_wrap: int,
     adaptive_cone_sweeps: int,
     tendon_max_sweeps: int,
     tendon_settle_tol: float,
@@ -672,12 +673,15 @@ def update_tendon_attachments(
                         u_left = r_left / len_r_left
                         u_right = r_right / len_r_right
                         signed_wrap_angle = wp.atan2(wp.dot(wp.cross(u_left, u_right), normal), wp.dot(u_left, u_right))
-                        if signed_wrap_angle * float(tendon_link_orientation[link_idx]) < 0.0:
+                        oriented_wrap_angle = signed_wrap_angle * float(tendon_link_orientation[link_idx])
+                        if report_unsupported_wrap != 0 and oriented_wrap_angle < 0.0:
                             wp.printf(
-                                "Warning: Tendon %d rolling link %d has an unsupported wrap outside [0, pi]. "
-                                "Check its orientation or use dynamic routing.\n",
+                                "ERROR: Tendon %d ROLLING link %d crossed the supported wrap range [0, pi] "
+                                "(oriented angle %f deg). Cable rest length and tension may be invalid. "
+                                "Correct the link orientation or route geometry, or use dynamic routing.\n",
                                 tendon_id,
                                 link_idx,
+                                oriented_wrap_angle * 180.0 / wp.pi,
                             )
 
                     # The common mode is material exchanged with the changing wrapped arc. Apply
