@@ -29,6 +29,7 @@ from newton.tests.test_tendon_capstan import (
     build_kinematic_pulley_atwood,
     build_motorized_pulley_drive,
     build_pinhole_atwood,
+    build_simple_cable_gravity,
     build_slack_pinhole_route,
 )
 from newton.tests.test_tendon_equilibrium import build_atwood_equal_weights
@@ -41,7 +42,6 @@ TENDON_VBD_SOLVER_KWARGS = {
     "rigid_joint_angular_k_start": 1.0e5,
     "rigid_joint_linear_kd": 5.0e-2,
     "rigid_joint_angular_kd": 2.0e-2,
-    "rigid_tendon_relaxation": 0.7,
 }
 
 
@@ -86,7 +86,7 @@ def _make_example_args(num_frames):
     )()
 
 
-def _install_vbd_example_solver(example):
+def _install_vbd_example_solver(example, solver_overrides=None):
     _set_serial_body_coloring(example.model)
     solver_kwargs = dict(TENDON_VBD_SOLVER_KWARGS)
 
@@ -95,8 +95,9 @@ def _install_vbd_example_solver(example):
         example.model.joint_target_kd[example.p2_dof_start : example.p2_dof_start + 1].fill_(200.0)
         example.model.joint_target_kd[example.p6_dof_start : example.p6_dof_start + 1].fill_(200.0)
         solver_kwargs["iterations"] = 30
-        solver_kwargs["rigid_tendon_relaxation"] = 0.6
 
+    if solver_overrides is not None:
+        solver_kwargs.update(solver_overrides)
     example.solver = newton.solvers.SolverVBD(example.model, **solver_kwargs)
     if is_xy_table:
         example._apply_cable_pretension(0.99995)
@@ -110,10 +111,10 @@ def _assert_example_members_have_no_nans(test, example):
         test.assertFalse(nan_members, f"NaN members found in {member_name}: {nan_members}")
 
 
-def _run_vbd_example_assertions(test, device, example_cls, num_frames):
+def _run_vbd_example_assertions(test, device, example_cls, num_frames, solver_overrides=None):
     with wp.ScopedDevice(device):
         example = example_cls(None, _make_example_args(num_frames))
-        _install_vbd_example_solver(example)
+        _install_vbd_example_solver(example, solver_overrides)
 
         has_post_step = hasattr(example, "test_post_step")
         has_final = hasattr(example, "test_final")
@@ -169,8 +170,8 @@ def build_single_span_tendon():
         rest_length=0.5,
     )
 
+    builder.color()
     model = builder.finalize()
-    _set_serial_body_coloring(model)
     return model, body
 
 
@@ -340,6 +341,234 @@ def test_vbd_tendon_stretch_pulls_toward_anchor(test, device):
 
         test.assertLess(final_x, initial_x - 0.1, f"Tendon should pull endpoint inward: {initial_x} -> {final_x}")
         test.assertTrue(np.isfinite(state_1.body_q.numpy()).all(), "Non-finite VBD single-span state")
+
+
+def test_vbd_tendon_requires_positive_compliance(test, device):
+    """VBD should reject hard routed tendons until they have a native augmented solve."""
+    with wp.ScopedDevice(device):
+        model, _ = build_single_span_tendon()
+        model.tendon_seg_compliance.zero_()
+        with test.assertRaisesRegex(ValueError, "requires positive tendon segment compliance"):
+            _make_tendon_vbd_solver(model)
+
+
+def test_vbd_tendon_rejects_dynamic_routing(test, device):
+    """VBD should reject route switching until its tendon adjacency supports changing endpoints."""
+    with wp.ScopedDevice(device):
+        model, _ = build_single_span_tendon()
+        model.tendon_link_flags.fill_(int(newton.TendonLinkFlags.DYNAMIC))
+        with test.assertRaisesRegex(ValueError, "does not yet support dynamic tendon routing"):
+            _make_tendon_vbd_solver(model)
+
+
+def test_vbd_tendon_coloring_separates_segment_endpoints(test, device):
+    """Rigid-body coloring should include tendon force-element connectivity."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(gravity=0.0)
+        body_0 = builder.add_body(mass=1.0)
+        body_1 = builder.add_body(mass=1.0)
+        builder.add_shape_sphere(body_0, radius=0.01)
+        builder.add_shape_sphere(body_1, radius=0.01)
+        builder.add_tendon()
+        builder.add_tendon_link(body=body_0, link_type=int(TendonLinkType.ATTACHMENT))
+        builder.add_tendon_link(
+            body=body_1,
+            link_type=int(TendonLinkType.ATTACHMENT),
+            compliance=1.0e-3,
+        )
+        builder.color()
+        model = builder.finalize()
+
+        body_colors = np.full(model.body_count, -1, dtype=int)
+        for color, group in enumerate(model.body_color_groups):
+            body_colors[group.numpy()] = color
+        test.assertNotEqual(body_colors[body_0], body_colors[body_1])
+        _make_tendon_vbd_solver(model)
+
+        model.body_color_groups = [wp.array([body_0, body_1], dtype=wp.int32, device=model.device)]
+        with test.assertRaisesRegex(ValueError, "does not separate tendon segment endpoints"):
+            _make_tendon_vbd_solver(model)
+
+
+def test_vbd_tendon_compliance_uses_physical_tension(test, device):
+    """A compliant VBD tendon should settle to the same physical equilibrium at different time steps."""
+    with wp.ScopedDevice(device):
+        results = []
+        for dt in (1.0 / 60.0, 1.0 / 120.0):
+            model, body_idx, mass, compliance, initial_z = build_simple_cable_gravity()
+            model.tendon_seg_damping.fill_(100.0)
+            _set_serial_body_coloring(model)
+            solver = _make_tendon_vbd_solver(model)
+            state_0 = model.state()
+            state_1 = model.state()
+            control = model.control()
+            contacts = model.contacts()
+
+            load = mass * 9.81
+            expected_z = initial_z - load * compliance
+            for _ in range(round(1.5 / dt)):
+                state_0.clear_forces()
+                solver.step(state_0, state_1, control, contacts, dt)
+                state_0, state_1 = state_1, state_0
+
+            attachment_l = solver.tendon_seg_attachment_l.numpy()[0]
+            attachment_r = solver.tendon_seg_attachment_r.numpy()[0]
+            rest_length = float(solver.tendon_seg_rest_length.numpy()[0])
+            stretch = float(np.linalg.norm(attachment_r - attachment_l)) - rest_length
+            material_tension = stretch / compliance
+            lambda_tension = -float(solver.tendon_seg_lambda.numpy()[0]) / dt
+            final_z = float(state_0.body_q.numpy()[body_idx][2])
+            final_vz = float(state_0.body_qd.numpy()[body_idx][2])
+            results.append((material_tension, lambda_tension, final_z, final_vz))
+
+            test.assertAlmostEqual(
+                material_tension,
+                load,
+                delta=0.05 * load,
+                msg=f"VBD material tension should balance the load: {material_tension:.3f} vs {load:.3f}",
+            )
+            test.assertAlmostEqual(
+                lambda_tension,
+                material_tension,
+                delta=0.05 * load,
+                msg=f"VBD lambda tension should match material tension: {lambda_tension:.3f} vs {material_tension:.3f}",
+            )
+            test.assertAlmostEqual(
+                final_z,
+                expected_z,
+                delta=5.0e-3,
+                msg=f"VBD equilibrium position changed: {final_z:.6f} vs {expected_z:.6f}",
+            )
+            test.assertAlmostEqual(final_vz, 0.0, delta=2.0e-2, msg=f"VBD equilibrium velocity changed: {final_vz:.6f}")
+
+        test.assertAlmostEqual(
+            results[0][1],
+            results[1][1],
+            delta=0.05 * mass * 9.81,
+            msg=f"VBD lambda tension should be time-step independent: {results}",
+        )
+
+
+def test_vbd_slack_damped_tendon_remains_force_free(test, device):
+    """Damping must not make a slack tendon transmit tension."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        anchor = builder.add_body(mass=0.0, is_kinematic=True)
+        body = builder.add_body(
+            xform=wp.transform(p=wp.vec3(0.25, 0.0, 0.0)),
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3)),
+        )
+        builder.add_tendon()
+        builder.add_tendon_link(body=anchor, link_type=int(TendonLinkType.ATTACHMENT))
+        builder.add_tendon_link(
+            body=body,
+            link_type=int(TendonLinkType.ATTACHMENT),
+            compliance=1.0e-3,
+            damping=100.0,
+            rest_length=1.0,
+        )
+        builder.color()
+        model = builder.finalize()
+        solver = _make_tendon_vbd_solver(model)
+        state_0 = model.state()
+        state_1 = model.state()
+        state_0.body_qd.assign(
+            [
+                wp.spatial_vector(0.0),
+                wp.spatial_vector(30.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            ]
+        )
+
+        dt = 1.0 / 120.0
+        solver.step(state_0, state_1, model.control(), None, dt)
+
+        final_vx = float(state_1.body_qd.numpy()[body][0])
+        lambda_tension = -float(solver.tendon_seg_lambda.numpy()[0]) / dt
+        test.assertAlmostEqual(final_vx, 30.0, delta=1.0e-4)
+        test.assertAlmostEqual(lambda_tension, 0.0, delta=1.0e-5)
+
+
+def test_vbd_tendon_lambda_matches_final_pose(test, device):
+    """Reported tendon tension should use the completed VBD pose."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        body_l = builder.add_body(
+            xform=wp.transform(p=wp.vec3(-0.5, 0.0, 0.0)),
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3)),
+        )
+        body_r = builder.add_body(
+            xform=wp.transform(p=wp.vec3(0.5, 0.0, 0.0)),
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3)),
+        )
+        compliance = 1.0e-5
+        damping = 1.0
+        initial_length = 1.0
+        rest_length = 0.5
+        builder.add_tendon()
+        builder.add_tendon_link(body=body_l, link_type=int(TendonLinkType.ATTACHMENT))
+        builder.add_tendon_link(
+            body=body_r,
+            link_type=int(TendonLinkType.ATTACHMENT),
+            compliance=compliance,
+            damping=damping,
+            rest_length=rest_length,
+        )
+        builder.color()
+        model = builder.finalize()
+        solver = newton.solvers.SolverVBD(model, iterations=1, rigid_avbd_beta=1.0e6)
+        state_0 = model.state()
+        state_1 = model.state()
+
+        dt = 1.0 / 60.0
+        solver.step(state_0, state_1, model.control(), None, dt)
+
+        body_q = state_1.body_q.numpy()
+        final_length = float(np.linalg.norm(body_q[body_r][:3] - body_q[body_l][:3]))
+        attachment_l = solver.tendon_seg_attachment_l.numpy()[0]
+        attachment_r = solver.tendon_seg_attachment_r.numpy()[0]
+        attachment_length = float(np.linalg.norm(attachment_r - attachment_l))
+        length_rate = (final_length - initial_length) / dt
+        expected_tension = max((final_length - rest_length) / compliance + damping * length_rate, 0.0)
+        lambda_tension = -float(solver.tendon_seg_lambda.numpy()[0]) / dt
+        test.assertLess(final_length, 0.75, "The solve must move the endpoints enough to expose a stale lambda")
+        test.assertAlmostEqual(attachment_length, final_length, delta=1.0e-6)
+        test.assertAlmostEqual(lambda_tension, expected_tension, delta=max(1.0e-3, 1.0e-4 * expected_tension))
+
+
+def test_vbd_tendon_cuda_graph_capture(test, device):
+    """Native VBD tendon force accumulation should remain CUDA graph-capturable."""
+    device = wp.get_device(device)
+    if not device.is_cuda:
+        test.skipTest("CUDA graph capture requires a CUDA device")
+    if not wp.is_mempool_enabled(device):
+        test.skipTest("CUDA graph capture requires the Warp memory pool")
+
+    with wp.ScopedDevice(device):
+        model, body_idx, _, _, initial_z = build_simple_cable_gravity()
+        model.tendon_seg_damping.fill_(100.0)
+        _set_serial_body_coloring(model)
+        solver = _make_tendon_vbd_solver(model)
+        state_0 = model.state()
+        state_1 = model.state()
+        control = model.control()
+        dt = 1.0 / 120.0
+
+        solver.step(state_0, state_1, control, None, dt)
+        state_0, state_1 = state_1, state_0
+
+        with wp.ScopedCapture(device=device) as capture:
+            solver.step(state_0, state_1, control, None, dt)
+            solver.step(state_1, state_0, control, None, dt)
+
+        for _ in range(10):
+            wp.capture_launch(capture.graph)
+
+        body_q = state_0.body_q.numpy()
+        test.assertTrue(np.isfinite(body_q).all(), "Captured VBD tendon steps produced non-finite poses")
+        test.assertLess(float(body_q[body_idx][2]), initial_z, "Captured VBD tendon should respond to gravity")
 
 
 def test_vbd_pinhole_slip_atwood(test, device):
@@ -802,7 +1031,9 @@ def test_vbd_equal_weight_atwood(test, device):
 
 def test_vbd_compound_pulley_stays_balanced(test, device):
     """The VBD compound-pulley render path must not pass while visibly unstable."""
-    _run_vbd_example_assertions(test, device, CompoundPulleyExample, 220)
+    # The stiff mechanism needs more nonlinear iterations after its weights
+    # enter ground contact to satisfy the long-run pulley-windup bound.
+    _run_vbd_example_assertions(test, device, CompoundPulleyExample, 220, {"iterations": 32})
 
 
 def test_vbd_rolling_pulley_revolute_axis_stays_stiff(test, device):
@@ -931,6 +1162,43 @@ if wp.is_cuda_available():
     devices.append("cuda:0")
 
 add_test(TestTendonVBD, "vbd_tendon_stretch_pulls_toward_anchor", devices, test_vbd_tendon_stretch_pulls_toward_anchor)
+add_test(
+    TestTendonVBD,
+    "vbd_tendon_requires_positive_compliance",
+    devices,
+    test_vbd_tendon_requires_positive_compliance,
+)
+add_test(
+    TestTendonVBD,
+    "vbd_tendon_rejects_dynamic_routing",
+    devices,
+    test_vbd_tendon_rejects_dynamic_routing,
+)
+add_test(
+    TestTendonVBD,
+    "vbd_tendon_coloring_separates_segment_endpoints",
+    devices,
+    test_vbd_tendon_coloring_separates_segment_endpoints,
+)
+add_test(
+    TestTendonVBD,
+    "vbd_tendon_compliance_uses_physical_tension",
+    devices,
+    test_vbd_tendon_compliance_uses_physical_tension,
+)
+add_test(
+    TestTendonVBD,
+    "vbd_slack_damped_tendon_remains_force_free",
+    devices,
+    test_vbd_slack_damped_tendon_remains_force_free,
+)
+add_test(
+    TestTendonVBD,
+    "vbd_tendon_lambda_matches_final_pose",
+    devices,
+    test_vbd_tendon_lambda_matches_final_pose,
+)
+add_test(TestTendonVBD, "vbd_tendon_cuda_graph_capture", devices, test_vbd_tendon_cuda_graph_capture)
 add_test(TestTendonVBD, "vbd_pinhole_slip_atwood", devices, test_vbd_pinhole_slip_atwood)
 add_test(
     TestTendonVBD, "vbd_slack_pinhole_does_not_redistribute", devices, test_vbd_slack_pinhole_does_not_redistribute
