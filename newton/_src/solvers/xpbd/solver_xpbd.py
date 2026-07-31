@@ -751,6 +751,7 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                                 1,
                                 self.tendon_max_sweeps,
                                 self.tendon_settle_tol,
+                                0.0,
                             ],
                             device=model.device,
                         )

@@ -276,6 +276,7 @@ def update_tendon_attachments(
     adaptive_cone_sweeps: int,
     tendon_max_sweeps: int,
     tendon_settle_tol: float,
+    compliance_floor: float,
 ):
     """Update routed tendon tangent points and free-span rest-length transfer.
 
@@ -305,7 +306,7 @@ def update_tendon_attachments(
         seg_active[seg] = 1
         seg_active_link_l[seg] = link_l
         seg_active_link_r[seg] = link_r
-        seg_active_compliance[seg] = seg_compliance[seg]
+        seg_active_compliance[seg] = wp.max(seg_compliance[seg], compliance_floor)
         seg_active_damping[seg] = seg_damping[seg]
         seg_rolling_delta_l[seg] = 0.0
         seg_rolling_delta_r[seg] = 0.0
@@ -336,7 +337,9 @@ def update_tendon_attachments(
         seg_active[seg_right] = 0
         seg_active_link_l[seg_left] = prev_link
         seg_active_link_r[seg_left] = next_link
-        seg_active_compliance[seg_left] = seg_compliance[seg_left] + seg_compliance[seg_right]
+        seg_active_compliance[seg_left] = wp.max(seg_compliance[seg_left], compliance_floor) + wp.max(
+            seg_compliance[seg_right], compliance_floor
+        )
         seg_active_damping[seg_left] = seg_damping[seg_left] + seg_damping[seg_right]
 
         merged_rest = seg_rest_length_step[seg_left]
@@ -486,7 +489,7 @@ def update_tendon_attachments(
         if adaptive_cone_sweeps != 0:
             material_sweep_count = wp.min(tendon_max_sweeps, 256)
         else:
-            # Preserve VBD's established fixed policy while XPBD evaluates adaptive convergence.
+            # Preserve the established fixed policy for callers that disable adaptive convergence.
             for i_policy in range(1, num_links - 1):
                 if tendon_link_type[link_start + i_policy] == int(TendonLinkType.PINHOLE):
                     material_sweep_count = int(32)

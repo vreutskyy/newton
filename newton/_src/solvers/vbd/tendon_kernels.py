@@ -7,6 +7,8 @@ from ...sim.tendon import TendonLinkType
 
 wp.set_module_options({"enable_backward": False})
 
+_MIN_TENDON_COMPLIANCE = wp.constant(1.0e-8)
+
 
 @wp.struct
 class TendonForceElementAdjacencyInfo:
@@ -92,9 +94,7 @@ def update_tendon_segment_diagnostics(
     if length <= rest_length:
         return
 
-    compliance = seg_active_compliance[seg]
-    if compliance <= 0.0:
-        return
+    compliance = wp.max(seg_active_compliance[seg], _MIN_TENDON_COMPLIANCE)
 
     length_rate = (length - seg_length_prev[seg]) / dt
 
@@ -155,9 +155,7 @@ def evaluate_tendon_force_hessians(
             continue
         direction = direction / length
 
-        compliance = seg_active_compliance[seg]
-        if compliance <= 0.0:
-            continue
+        compliance = wp.max(seg_active_compliance[seg], _MIN_TENDON_COMPLIANCE)
 
         rest_length = seg_rest_length[seg]
         if length <= rest_length:

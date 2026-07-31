@@ -130,8 +130,9 @@ class SolverVBD(TendonStateMixin, SolverBase):
         See :ref:`Joint feature support` for the full comparison across solvers.
 
     Tendon limitations:
-        - Static authored routes with positive segment compliance are supported.
-        - Zero-compliance segments and dynamic route switching are not supported.
+        - Static authored routes are supported. Zero segment compliance is
+          approximated as ``1.0e-8`` m/N.
+        - Dynamic route switching is not supported.
         - Call :meth:`newton.ModelBuilder.color` after adding tendons so that
           segment endpoints receive different rigid-body colors.
 
@@ -249,6 +250,8 @@ class SolverVBD(TendonStateMixin, SolverBase):
         rigid_joint_linear_kd: float = 0.0,  # Rayleigh damping for non-cable linear joint constraints
         rigid_joint_angular_kd: float = 0.0,  # Rayleigh damping for non-cable angular joint constraints
         rigid_tendon_relaxation: float = 0.7,  # Compatibility parameter; ignored
+        tendon_max_sweeps: int = 256,
+        tendon_settle_tol: float = 1.0e-3,
         rigid_enable_dahl_friction: bool | None = None,  # Deprecated: auto-detected from model attributes
     ):
         """
@@ -359,6 +362,8 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 Negative values are clamped to 0.
             rigid_tendon_relaxation: Compatibility parameter retained for existing callers. Native VBD tendon
                 force elements do not use XPBD relaxation.
+            tendon_max_sweeps: Maximum capstan material-relaxation sweeps per VBD iteration.
+            tendon_settle_tol: Relative tension-change tolerance for stopping capstan material relaxation.
             rigid_enable_dahl_friction: Deprecated and ignored. Dahl friction is auto-detected
                 from ``model.vbd.dahl_eps_max`` / ``model.vbd.dahl_tau``.
 
@@ -396,6 +401,8 @@ class SolverVBD(TendonStateMixin, SolverBase):
         # Common parameters
         self.iterations = iterations
         self.friction_epsilon = friction_epsilon
+        self.tendon_max_sweeps = tendon_max_sweeps
+        self.tendon_settle_tol = tendon_settle_tol
         # Rigid integration mode: when True, rigid bodies are integrated by an external
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
         # participate in particle-rigid interaction on the particle side.
@@ -420,12 +427,6 @@ class SolverVBD(TendonStateMixin, SolverBase):
         )
 
         if model.tendon_segment_count > 0:
-            hard_segments = np.flatnonzero(model.tendon_seg_compliance.numpy() <= 0.0)
-            if hard_segments.size > 0:
-                raise ValueError(
-                    "SolverVBD requires positive tendon segment compliance; "
-                    f"zero-compliance tendon segments are not yet supported: {hard_segments.tolist()}"
-                )
             dynamic_links = np.flatnonzero((model.tendon_link_flags.numpy() & int(TendonLinkFlags.DYNAMIC)) != 0)
             if dynamic_links.size > 0:
                 raise ValueError(
@@ -1662,6 +1663,10 @@ class SolverVBD(TendonStateMixin, SolverBase):
             and not self.integrate_with_external_rigid_solver
         )
         if update_tendon_diagnostics:
+            # The final body update changes tendon geometry after the last
+            # in-iteration material solve. Accept its route state before
+            # reporting tension or carrying rest lengths into the next step.
+            self._update_tendon_routing(state_in)
             self._snapshot_tendon_segment_length_reference()
 
         # Snapshot solved rigid contact state for next-frame warm-start.
@@ -2422,9 +2427,10 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_cone_sweep_count,
                 1,
                 1,
-                0,
+                1,
                 self.tendon_max_sweeps,
                 self.tendon_settle_tol,
+                1.0e-8,
             ],
             device=self.device,
         )

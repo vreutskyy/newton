@@ -37,6 +37,7 @@ from newton.tests.unittest_utils import find_nan_members, sanitize_identifier
 
 TENDON_VBD_SOLVER_KWARGS = {
     "iterations": 20,
+    "tendon_max_sweeps": 32,
     "rigid_avbd_beta": 1.0e6,
     "rigid_joint_linear_k_start": 1.0e7,
     "rigid_joint_angular_k_start": 1.0e5,
@@ -173,6 +174,51 @@ def build_single_span_tendon():
     builder.color()
     model = builder.finalize()
     return model, body
+
+
+def build_fixed_rolling_chain(compliance=1.0e-5):
+    builder = newton.ModelBuilder(gravity=0.0)
+    positions = [(-1.0, 0.0, 0.0), (0.0, 0.25, 0.0), (1.0, -0.25, 0.0), (2.0, 0.25, 0.0)]
+    bodies = [
+        builder.add_body(mass=0.0, is_kinematic=True),
+        builder.add_body(mass=0.0, is_kinematic=True),
+        builder.add_body(mass=0.0, is_kinematic=True),
+        builder.add_body(
+            xform=wp.transform(p=wp.vec3(*positions[-1])),
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3)),
+        ),
+    ]
+
+    builder.add_tendon()
+    builder.add_tendon_link(
+        body=bodies[0],
+        link_type=int(TendonLinkType.ATTACHMENT),
+        offset=positions[0],
+    )
+    builder.add_tendon_link(
+        body=bodies[1],
+        link_type=int(TendonLinkType.ROLLING),
+        radius=0.1,
+        orientation=1,
+        offset=positions[1],
+        compliance=compliance,
+    )
+    builder.add_tendon_link(
+        body=bodies[2],
+        link_type=int(TendonLinkType.ROLLING),
+        radius=0.1,
+        orientation=-1,
+        offset=positions[2],
+        compliance=compliance,
+    )
+    builder.add_tendon_link(
+        body=bodies[3],
+        link_type=int(TendonLinkType.ATTACHMENT),
+        compliance=compliance,
+    )
+    builder.color()
+    return builder.finalize(), bodies[-1]
 
 
 def run_vbd_model(model, num_frames=80, substeps=12, fps=60):
@@ -343,13 +389,59 @@ def test_vbd_tendon_stretch_pulls_toward_anchor(test, device):
         test.assertTrue(np.isfinite(state_1.body_q.numpy()).all(), "Non-finite VBD single-span state")
 
 
-def test_vbd_tendon_requires_positive_compliance(test, device):
-    """VBD should reject hard routed tendons until they have a native augmented solve."""
+def test_vbd_tendon_zero_compliance_uses_floor(test, device):
+    """VBD should approximate zero tendon compliance with its stiffness floor."""
     with wp.ScopedDevice(device):
-        model, _ = build_single_span_tendon()
-        model.tendon_seg_compliance.zero_()
-        with test.assertRaisesRegex(ValueError, "requires positive tendon segment compliance"):
-            _make_tendon_vbd_solver(model)
+        results = []
+        for compliance in (0.0, 1.0e-8):
+            model, body_idx = build_single_span_tendon()
+            model.tendon_seg_compliance.fill_(compliance)
+            solver = _make_tendon_vbd_solver(model)
+            state_0 = model.state()
+            state_1 = model.state()
+            solver.step(state_0, state_1, model.control(), None, 1.0 / 60.0)
+            results.append(
+                (
+                    state_1.body_q.numpy()[body_idx].copy(),
+                    float(solver.tendon_seg_lambda.numpy()[0]),
+                    float(solver.tendon_seg_active_compliance.numpy()[0]),
+                )
+            )
+
+        test.assertTrue(np.isfinite(results[0][0]).all())
+        np.testing.assert_allclose(results[0][0], results[1][0], rtol=0.0, atol=1.0e-6)
+        test.assertAlmostEqual(results[0][1], results[1][1], delta=1.0e-6)
+        test.assertEqual(results[0][2], results[1][2])
+
+
+def test_vbd_rolling_chain_tension_matches_accepted_pose(test, device):
+    """VBD material relaxation should converge at the final accepted rigid pose."""
+    with wp.ScopedDevice(device):
+        model, slider = build_fixed_rolling_chain()
+        solver = _make_tendon_vbd_solver(model)
+        state_0 = model.state()
+        state_1 = model.state()
+
+        direction = solver.tendon_seg_attachment_r.numpy()[-1] - solver.tendon_seg_attachment_l.numpy()[-1]
+        direction /= np.linalg.norm(direction)
+        body_f = np.zeros((model.body_count, 6), dtype=np.float32)
+        body_f[slider, :3] = 10.0 * direction
+        state_0.body_f.assign(wp.array(body_f, dtype=wp.spatial_vector))
+        solver.step(state_0, state_1, model.control(), None, 1.0 / 60.0)
+
+        lengths = np.linalg.norm(
+            solver.tendon_seg_attachment_r.numpy() - solver.tendon_seg_attachment_l.numpy(), axis=1
+        )
+        tension = np.maximum(lengths - solver.tendon_seg_rest_length.numpy(), 0.0) / np.maximum(
+            solver.tendon_seg_active_compliance.numpy(), 1.0e-30
+        )
+        test.assertGreater(np.min(tension), 1.0, f"Every rolling-chain span should carry load: {tension}")
+        test.assertLess(np.ptp(tension), 5.0e-3, f"Frictionless rolling-chain tensions did not converge: {tension}")
+        test.assertGreater(
+            int(solver.tendon_cone_sweep_count.numpy()[0]),
+            4,
+            "The regression must exercise adaptive material relaxation beyond the legacy VBD sweep count",
+        )
 
 
 def test_vbd_tendon_rejects_dynamic_routing(test, device):
@@ -1164,9 +1256,15 @@ if wp.is_cuda_available():
 add_test(TestTendonVBD, "vbd_tendon_stretch_pulls_toward_anchor", devices, test_vbd_tendon_stretch_pulls_toward_anchor)
 add_test(
     TestTendonVBD,
-    "vbd_tendon_requires_positive_compliance",
+    "vbd_tendon_zero_compliance_uses_floor",
     devices,
-    test_vbd_tendon_requires_positive_compliance,
+    test_vbd_tendon_zero_compliance_uses_floor,
+)
+add_test(
+    TestTendonVBD,
+    "vbd_rolling_chain_tension_matches_accepted_pose",
+    devices,
+    test_vbd_rolling_chain_tension_matches_accepted_pose,
 )
 add_test(
     TestTendonVBD,
