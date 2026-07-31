@@ -4513,10 +4513,10 @@ class ModelBuilder:
             radius: Contact radius [m] for ROLLING links (pulley radius).
             orientation: Winding direction, +1 or -1.
             mu: Coulomb friction coefficient at this contact.
-            dynamic: Whether :class:`~newton.solvers.SolverXPBD` should treat
-                this ROLLING link as a one-sided obstacle selected by
-                ``orientation``. The initial state is resolved from the route
-                geometry before tendon rest lengths are measured.
+            dynamic: Whether the tendon solver should treat this ROLLING link
+                as a one-sided obstacle selected by ``orientation``. The initial
+                state is resolved from the route geometry before tendon rest
+                lengths are measured.
             offset: Local-frame position of the cable plane center on the body [m].
             axis: Local-frame normal of the cable plane on the body.
             compliance: Compliance [m/N] for the segment ending at this link
@@ -9225,6 +9225,10 @@ class ModelBuilder:
             )
             for link_idx in range(link_start, link_end - 1):
                 tendon_edges.append((self.tendon_link_body[link_idx], self.tendon_link_body[link_idx + 1]))
+            # An inactive dynamic roller replaces its two authored spans with a direct bypass span.
+            for link_idx in range(link_start + 1, link_end - 1):
+                if (self.tendon_link_flags[link_idx] & int(TendonLinkFlags.DYNAMIC)) != 0:
+                    tendon_edges.append((self.tendon_link_body[link_idx - 1], self.tendon_link_body[link_idx + 1]))
 
         # Also color rigid bodies based on joint and tendon connectivity.
         self.body_color_groups = color_rigid_bodies(

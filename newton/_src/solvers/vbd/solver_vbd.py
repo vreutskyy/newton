@@ -130,9 +130,8 @@ class SolverVBD(TendonStateMixin, SolverBase):
         See :ref:`Joint feature support` for the full comparison across solvers.
 
     Tendon limitations:
-        - Static authored routes are supported. Zero segment compliance is
-          approximated as ``1.0e-8`` m/N.
-        - Dynamic route switching is not supported.
+        - Static routes and isolated dynamic ROLLING links are supported. Zero
+          segment compliance is approximated as ``1.0e-8`` m/N.
         - Call :meth:`newton.ModelBuilder.color` after adding tendons so that
           segment endpoints receive different rigid-body colors.
 
@@ -425,14 +424,6 @@ class SolverVBD(TendonStateMixin, SolverBase):
             particle_external_vertex_contact_filtering_map,
             particle_external_edge_contact_filtering_map,
         )
-
-        if model.tendon_segment_count > 0:
-            dynamic_links = np.flatnonzero((model.tendon_link_flags.numpy() & int(TendonLinkFlags.DYNAMIC)) != 0)
-            if dynamic_links.size > 0:
-                raise ValueError(
-                    "SolverVBD does not yet support dynamic tendon routing; "
-                    f"dynamic tendon links are not supported: {dynamic_links.tolist()}"
-                )
 
         # Routed tendon geometry and material state are shared with XPBD; VBD
         # evaluates their force and Hessian contributions natively.
@@ -1465,16 +1456,18 @@ class SolverVBD(TendonStateMixin, SolverBase):
         return adjacency
 
     def _compute_tendon_force_element_adjacency(self, model: Model) -> TendonForceElementAdjacencyInfo:
-        """Build CSR adjacency between rigid bodies and authored tendon segments."""
+        """Build CSR adjacency for authored and possible dynamic bypass segments."""
         adjacency = TendonForceElementAdjacencyInfo()
-        body_segments = [[] for _ in range(model.body_count)]
+        body_segments = [set() for _ in range(model.body_count)]
         body_colors = np.full(model.body_count, -1, dtype=np.int32)
         for color, group in enumerate(model.body_color_groups):
             body_colors[group.numpy()] = color
 
         if model.tendon_segment_count > 0:
             link_bodies = model.tendon_link_body.numpy()
+            link_flags = model.tendon_link_flags.numpy()
             segment_left_links = self.tendon_seg_link_l.numpy()
+            link_left_segments = self.tendon_link_seg_left.numpy()
             for segment, left_link in enumerate(segment_left_links):
                 body_l = int(link_bodies[left_link])
                 body_r = int(link_bodies[left_link + 1])
@@ -1483,15 +1476,33 @@ class SolverVBD(TendonStateMixin, SolverBase):
                         "model.body_color_groups does not separate tendon segment endpoints; "
                         "call ModelBuilder.color() after adding tendons"
                     )
-                body_segments[body_l].append(segment)
-                if body_r != body_l:
-                    body_segments[body_r].append(segment)
+                body_segments[body_l].add(segment)
+                body_segments[body_r].add(segment)
+
+                right_link = left_link + 1
+                # Deactivation reuses the left authored segment for the bypass to the following link.
+                if (link_flags[right_link] & int(TendonLinkFlags.DYNAMIC)) != 0 and link_left_segments[
+                    right_link
+                ] == segment:
+                    bypass_body = int(link_bodies[right_link + 1])
+                    if (
+                        bypass_body != body_l
+                        and len(model.body_color_groups) > 0
+                        and body_colors[bypass_body] == body_colors[body_l]
+                    ):
+                        raise ValueError(
+                            "model.body_color_groups does not separate dynamic tendon bypass endpoints; "
+                            "call ModelBuilder.color() after adding tendons"
+                        )
+                    body_segments[bypass_body].add(segment)
 
         offsets = np.zeros(model.body_count + 1, dtype=np.int32)
         for body, segments in enumerate(body_segments):
             offsets[body + 1] = offsets[body] + len(segments)
 
-        flat_segments = np.asarray([segment for segments in body_segments for segment in segments], dtype=np.int32)
+        flat_segments = np.asarray(
+            [segment for segments in body_segments for segment in sorted(segments)], dtype=np.int32
+        )
         with wp.ScopedDevice("cpu"):
             adjacency.body_adj_segments = wp.array(flat_segments, dtype=wp.int32)
             adjacency.body_adj_segments_offsets = wp.array(offsets, dtype=wp.int32)
@@ -1649,6 +1660,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
         self._initialize_particles(state_in, state_out, dt)
         if self.tendon_seg_lambda is not None and state_in.body_q is not None:
             self._snapshot_tendon_step_state()
+            self._update_tendon_link_active(self.model, state_in.body_q)
             if self.iterations == 0 or self.integrate_with_external_rigid_solver:
                 self.tendon_seg_lambda.zero_()
 

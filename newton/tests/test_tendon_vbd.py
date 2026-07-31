@@ -18,6 +18,7 @@ from newton.examples.cable.example_tendon_capstan_kinematic import Example as Ki
 from newton.examples.cable.example_tendon_compound_pulley import Example as CompoundPulleyExample
 from newton.examples.cable.example_tendon_equilibrium import Example as EquilibriumExample
 from newton.examples.cable.example_tendon_gear_pulley import Example as GearPulleyExample
+from newton.examples.cable.example_tendon_mujoco_switch import Example as MujocoSwitchExample
 from newton.examples.cable.example_tendon_pinhole import Example as PinholeExample
 from newton.examples.cable.example_tendon_pulley import Example as PulleyExample
 from newton.examples.cable.example_tendon_rolling_pulley import Example as RollingPulleyExample
@@ -219,6 +220,47 @@ def build_fixed_rolling_chain(compliance=1.0e-5):
     )
     builder.color()
     return builder.finalize(), bodies[-1]
+
+
+def build_dynamic_rolling_route():
+    builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+    lower = builder.add_body(
+        xform=wp.transform(p=wp.vec3(0.0, 0.0, -0.5)),
+        mass=0.0,
+        is_kinematic=True,
+    )
+    upper = builder.add_body(
+        xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.5)),
+        mass=1.0,
+        inertia=wp.mat33(np.eye(3)),
+    )
+    candidate = builder.add_body(
+        xform=wp.transform(p=wp.vec3(0.25, 0.0, 0.0)),
+        mass=0.0,
+        is_kinematic=True,
+    )
+
+    builder.add_tendon()
+    builder.add_tendon_link(body=lower, link_type=int(TendonLinkType.ATTACHMENT), axis=(0.0, 1.0, 0.0))
+    candidate_link = builder.add_tendon_link(
+        body=candidate,
+        link_type=int(TendonLinkType.ROLLING),
+        radius=0.1,
+        orientation=1,
+        dynamic=True,
+        axis=(0.0, 1.0, 0.0),
+        compliance=1.0e-4,
+        rest_length=-1.0,
+    )
+    builder.add_tendon_link(
+        body=upper,
+        link_type=int(TendonLinkType.ATTACHMENT),
+        axis=(0.0, 1.0, 0.0),
+        compliance=1.0e-4,
+        rest_length=-1.0,
+    )
+    builder.color()
+    return builder.finalize(), candidate, candidate_link, lower, upper
 
 
 def run_vbd_model(model, num_frames=80, substeps=12, fps=60):
@@ -444,13 +486,43 @@ def test_vbd_rolling_chain_tension_matches_accepted_pose(test, device):
         )
 
 
-def test_vbd_tendon_rejects_dynamic_routing(test, device):
-    """VBD should reject route switching until its tendon adjacency supports changing endpoints."""
+def test_vbd_dynamic_tendon_route_switches_inside_solver(test, device):
+    """VBD should update dynamic routing and its active segment endpoints inside ``step``."""
     with wp.ScopedDevice(device):
-        model, _ = build_single_span_tendon()
-        model.tendon_link_flags.fill_(int(newton.TendonLinkFlags.DYNAMIC))
-        with test.assertRaisesRegex(ValueError, "does not yet support dynamic tendon routing"):
-            _make_tendon_vbd_solver(model)
+        model, candidate, candidate_link, lower, upper = build_dynamic_rolling_route()
+        solver = _make_tendon_vbd_solver(model)
+        state_0 = model.state()
+        state_1 = model.state()
+        control = model.control()
+
+        rest_length = solver.tendon_seg_rest_length.numpy()
+        rest_length[0] -= 0.02
+        solver.tendon_seg_rest_length.assign(rest_length)
+
+        body_colors = np.full(model.body_count, -1, dtype=np.int32)
+        for color, group in enumerate(model.body_color_groups):
+            body_colors[group.numpy()] = color
+        test.assertNotEqual(body_colors[lower], body_colors[upper], "The possible bypass span must be colored")
+
+        body_q = state_0.body_q.numpy()
+        active_history = []
+        segment_history = []
+        first_upper_z = None
+        for x in (0.25, 0.05, -0.25, 0.25):
+            body_q[candidate, :3] = (x, 0.0, 0.0)
+            state_0.body_q.assign(body_q)
+            solver.step(state_0, state_1, control, None, 1.0 / 120.0)
+            active_history.append(bool(solver.tendon_link_active.numpy()[candidate_link]))
+            segment_history.append(solver.tendon_seg_active.numpy().tolist())
+            if first_upper_z is None:
+                first_upper_z = float(state_1.body_q.numpy()[upper][2])
+            state_0, state_1 = state_1, state_0
+            body_q = state_0.body_q.numpy()
+
+        test.assertEqual(active_history, [False, True, True, False])
+        test.assertEqual(segment_history, [[1, 0], [1, 1], [1, 1], [1, 0]])
+        test.assertLess(first_upper_z, 0.499, "The inactive bypass span must load its new right endpoint")
+        test.assertTrue(np.isfinite(state_0.body_q.numpy()).all())
 
 
 def test_vbd_tendon_coloring_separates_segment_endpoints(test, device):
@@ -661,6 +733,54 @@ def test_vbd_tendon_cuda_graph_capture(test, device):
         body_q = state_0.body_q.numpy()
         test.assertTrue(np.isfinite(body_q).all(), "Captured VBD tendon steps produced non-finite poses")
         test.assertLess(float(body_q[body_idx][2]), initial_z, "Captured VBD tendon should respond to gravity")
+
+
+def test_vbd_dynamic_tendon_cuda_graph_capture(test, device):
+    """VBD dynamic active-set updates should remain CUDA graph-capturable."""
+    device = wp.get_device(device)
+    if not device.is_cuda:
+        test.skipTest("CUDA graph capture requires a CUDA device")
+    if not wp.is_mempool_enabled(device):
+        test.skipTest("CUDA graph capture requires the Warp memory pool")
+
+    with wp.ScopedDevice(device):
+        warm_model, _, _, _, _ = build_dynamic_rolling_route()
+        warm_solver = _make_tendon_vbd_solver(warm_model)
+        warm_0 = warm_model.state()
+        warm_1 = warm_model.state()
+        warm_solver.step(warm_0, warm_1, warm_model.control(), None, 1.0 / 120.0)
+
+        model, candidate, candidate_link, _, _ = build_dynamic_rolling_route()
+        solver = _make_tendon_vbd_solver(model)
+        state_0 = model.state()
+        state_1 = model.state()
+        control = model.control()
+        for state in (state_0, state_1):
+            body_q = state.body_q.numpy()
+            body_q[candidate, :3] = (0.05, 0.0, 0.0)
+            state.body_q.assign(body_q)
+
+        with wp.ScopedCapture(device=device) as capture:
+            solver.step(state_0, state_1, control, None, 1.0 / 120.0)
+            solver.step(state_1, state_0, control, None, 1.0 / 120.0)
+
+        wp.capture_launch(capture.graph)
+        test.assertTrue(solver.tendon_link_active.numpy()[candidate_link])
+
+
+def test_vbd_dynamic_tendon_switch_example(test, device):
+    """VBD should reproduce the existing dynamic-switch example active-set behavior."""
+    device = wp.get_device(device)
+    if not device.is_cuda:
+        test.skipTest("The full dynamic-switch example regression runs on CUDA")
+
+    with wp.ScopedDevice(device):
+        example = MujocoSwitchExample(None, None)
+        _set_serial_body_coloring(example.model)
+        example.solver = _make_tendon_vbd_solver(example.model)
+        for _ in range(220):
+            example.step()
+        example.test_final()
 
 
 def test_vbd_pinhole_slip_atwood(test, device):
@@ -1268,9 +1388,9 @@ add_test(
 )
 add_test(
     TestTendonVBD,
-    "vbd_tendon_rejects_dynamic_routing",
+    "vbd_dynamic_tendon_route_switches_inside_solver",
     devices,
-    test_vbd_tendon_rejects_dynamic_routing,
+    test_vbd_dynamic_tendon_route_switches_inside_solver,
 )
 add_test(
     TestTendonVBD,
@@ -1297,6 +1417,8 @@ add_test(
     test_vbd_tendon_lambda_matches_final_pose,
 )
 add_test(TestTendonVBD, "vbd_tendon_cuda_graph_capture", devices, test_vbd_tendon_cuda_graph_capture)
+add_test(TestTendonVBD, "vbd_dynamic_tendon_cuda_graph_capture", devices, test_vbd_dynamic_tendon_cuda_graph_capture)
+add_test(TestTendonVBD, "vbd_dynamic_tendon_switch_example", devices, test_vbd_dynamic_tendon_switch_example)
 add_test(TestTendonVBD, "vbd_pinhole_slip_atwood", devices, test_vbd_pinhole_slip_atwood)
 add_test(
     TestTendonVBD, "vbd_slack_pinhole_does_not_redistribute", devices, test_vbd_slack_pinhole_does_not_redistribute
