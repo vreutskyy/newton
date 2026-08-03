@@ -118,6 +118,10 @@ class SolverXPBD(TendonStateMixin, SolverBase):
         tendon_max_sweeps: int = 256,
         tendon_settle_tol: float = 1.0e-3,
         tendon_activation_tol: float = 2.0e-3,
+        tendon_sigmoid_ea_low: float = 0.0,
+        tendon_sigmoid_ea_ratio: float = 1.0,
+        tendon_sigmoid_transition_strain: float = 0.0,
+        tendon_sigmoid_transition_width: float = 1.0,
     ):
         super().__init__(model=model)
         self.iterations = iterations
@@ -130,6 +134,12 @@ class SolverXPBD(TendonStateMixin, SolverBase):
         # Inactive dynamic rollers activate only after entering this fraction of their radius.
         # Active rollers still deactivate at zero clearance.
         self.tendon_activation_tol = tendon_activation_tol
+        # Experimental solver-wide nonlinear tendon material. A non-positive
+        # low-strain EA keeps the established per-segment compliance path.
+        self.tendon_sigmoid_ea_low = tendon_sigmoid_ea_low
+        self.tendon_sigmoid_ea_ratio = tendon_sigmoid_ea_ratio
+        self.tendon_sigmoid_transition_strain = tendon_sigmoid_transition_strain
+        self.tendon_sigmoid_transition_width = tendon_sigmoid_transition_width
 
         self.soft_body_relaxation = soft_body_relaxation
         self.soft_contact_relaxation = soft_contact_relaxation
@@ -763,6 +773,10 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                                 self.tendon_max_sweeps,
                                 self.tendon_settle_tol,
                                 0.0,
+                                self.tendon_sigmoid_ea_low,
+                                self.tendon_sigmoid_ea_ratio,
+                                self.tendon_sigmoid_transition_strain,
+                                self.tendon_sigmoid_transition_width,
                             ],
                             device=model.device,
                         )
@@ -802,6 +816,10 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                                 1.0 / dt,
                                 self.joint_linear_relaxation,
                                 dt,
+                                self.tendon_sigmoid_ea_low,
+                                self.tendon_sigmoid_ea_ratio,
+                                self.tendon_sigmoid_transition_strain,
+                                self.tendon_sigmoid_transition_width,
                             ],
                             outputs=[body_deltas],
                             device=model.device,
@@ -834,6 +852,10 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                                 self.tendon_seg_damping_tension,
                                 self.tendon_seg_delta_lambda,
                                 self.joint_linear_relaxation,
+                                self.tendon_sigmoid_ea_low,
+                                self.tendon_sigmoid_ea_ratio,
+                                self.tendon_sigmoid_transition_strain,
+                                self.tendon_sigmoid_transition_width,
                             ],
                             outputs=[body_deltas],
                             device=model.device,

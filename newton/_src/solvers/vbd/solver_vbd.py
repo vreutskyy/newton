@@ -253,6 +253,10 @@ class SolverVBD(TendonStateMixin, SolverBase):
         tendon_settle_tol: float = 1.0e-3,
         rigid_enable_dahl_friction: bool | None = None,  # Deprecated: auto-detected from model attributes
         tendon_activation_tol: float = 2.0e-3,
+        tendon_sigmoid_ea_low: float = 0.0,
+        tendon_sigmoid_ea_ratio: float = 1.0,
+        tendon_sigmoid_transition_strain: float = 0.0,
+        tendon_sigmoid_transition_width: float = 1.0,
     ):
         """
         Args:
@@ -367,6 +371,11 @@ class SolverVBD(TendonStateMixin, SolverBase):
             rigid_enable_dahl_friction: Deprecated and ignored. Dahl friction is auto-detected
                 from ``model.vbd.dahl_eps_max`` / ``model.vbd.dahl_tau``.
             tendon_activation_tol: Relative radius gap that inactive dynamic rollers must cross before activation.
+            tendon_sigmoid_ea_low: Experimental low-strain axial stiffness for the solver-wide sigmoid tendon law.
+                A non-positive value disables the experimental law.
+            tendon_sigmoid_ea_ratio: Experimental high/low axial-stiffness ratio.
+            tendon_sigmoid_transition_strain: Experimental sigmoid transition strain.
+            tendon_sigmoid_transition_width: Experimental sigmoid transition width.
 
         Note:
             - The `integrate_with_external_rigid_solver` argument enables one-way coupling between rigid body and soft body
@@ -405,6 +414,10 @@ class SolverVBD(TendonStateMixin, SolverBase):
         self.tendon_max_sweeps = tendon_max_sweeps
         self.tendon_settle_tol = tendon_settle_tol
         self.tendon_activation_tol = tendon_activation_tol
+        self.tendon_sigmoid_ea_low = tendon_sigmoid_ea_low
+        self.tendon_sigmoid_ea_ratio = tendon_sigmoid_ea_ratio
+        self.tendon_sigmoid_transition_strain = tendon_sigmoid_transition_strain
+        self.tendon_sigmoid_transition_width = tendon_sigmoid_transition_width
         # Rigid integration mode: when True, rigid bodies are integrated by an external
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
         # participate in particle-rigid interaction on the particle side.
@@ -2460,6 +2473,10 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_max_sweeps,
                 self.tendon_settle_tol,
                 1.0e-8,
+                self.tendon_sigmoid_ea_low,
+                self.tendon_sigmoid_ea_ratio,
+                self.tendon_sigmoid_transition_strain,
+                self.tendon_sigmoid_transition_width,
             ],
             device=self.device,
         )
@@ -2723,6 +2740,10 @@ class SolverVBD(TendonStateMixin, SolverBase):
                     self.tendon_seg_active,
                     self.tendon_seg_active_link_l,
                     self.tendon_seg_active_link_r,
+                    self.tendon_sigmoid_ea_low,
+                    self.tendon_sigmoid_ea_ratio,
+                    self.tendon_sigmoid_transition_strain,
+                    self.tendon_sigmoid_transition_width,
                 ],
                 outputs=[
                     state_in.body_q,

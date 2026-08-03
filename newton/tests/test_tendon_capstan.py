@@ -26,6 +26,13 @@ from newton.examples.cable.example_tendon_mujoco_switch_matrix import Example as
 from newton.examples.cable.example_tendon_mujoco_wrap import Example as MujocoWrapExample
 from newton.tests.unittest_utils import sanitize_identifier
 
+SIGMOID_TENDON_MATERIAL = {
+    "tendon_sigmoid_ea_low": 2000.0,
+    "tendon_sigmoid_ea_ratio": 16.0,
+    "tendon_sigmoid_transition_strain": 0.005,
+    "tendon_sigmoid_transition_width": 0.0008,
+}
+
 
 def add_test(cls, name, devices, test_fn):
     for device in devices:
@@ -231,6 +238,83 @@ def build_frictionless_zero_span_route(compliance=1.0e-3, mu=0.0, points=None, r
     )
 
     return builder.finalize(), np.asarray(rest_lengths, dtype=np.float32), compliance
+
+
+def build_sigmoid_pinhole_route(
+    mu=0.1,
+    compliance=1.0e-4,
+    damping=0.0,
+    initial_strains=(0.006, 0.004),
+):
+    """Build a fixed two-span route whose initial strains straddle a sigmoid transition."""
+    builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+    points = [(-1.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)]
+    bodies = [builder.add_body(xform=wp.transform(p=wp.vec3(*point)), mass=0.0, is_kinematic=True) for point in points]
+    initial_strains = np.asarray(initial_strains, dtype=np.float32)
+    initial_rest = 1.0 / (1.0 + initial_strains)
+
+    builder.add_tendon()
+    builder.add_tendon_link(body=bodies[0], link_type=int(TendonLinkType.ATTACHMENT))
+    builder.add_tendon_link(
+        body=bodies[1],
+        link_type=int(TendonLinkType.PINHOLE),
+        mu=mu,
+        compliance=compliance,
+        damping=damping,
+        rest_length=float(initial_rest[0]),
+    )
+    builder.add_tendon_link(
+        body=bodies[2],
+        link_type=int(TendonLinkType.ATTACHMENT),
+        compliance=compliance,
+        damping=damping,
+        rest_length=float(initial_rest[1]),
+    )
+    builder.color()
+    return builder.finalize(), initial_rest
+
+
+def sigmoid_tendon_tension(length, rest_length, material=SIGMOID_TENDON_MATERIAL):
+    strain = np.maximum(length - rest_length, 0.0) / rest_length
+    transition = np.tanh(
+        (strain - material["tendon_sigmoid_transition_strain"]) / material["tendon_sigmoid_transition_width"]
+    )
+    ea = material["tendon_sigmoid_ea_low"] * (
+        1.0 + (material["tendon_sigmoid_ea_ratio"] - 1.0) * 0.5 * (1.0 + transition)
+    )
+    return ea * strain
+
+
+def sigmoid_tendon_tangent(length, rest_length, material=SIGMOID_TENDON_MATERIAL):
+    strain = np.maximum(length - rest_length, 0.0) / rest_length
+    transition_width = material["tendon_sigmoid_transition_width"]
+    transition = np.tanh((strain - material["tendon_sigmoid_transition_strain"]) / transition_width)
+    ea_low = material["tendon_sigmoid_ea_low"]
+    ea_ratio = material["tendon_sigmoid_ea_ratio"]
+    ea = ea_low * (1.0 + (ea_ratio - 1.0) * 0.5 * (1.0 + transition))
+    dea_dstrain = ea_low * (ea_ratio - 1.0) * 0.5 * (1.0 - transition**2) / transition_width
+    return (ea + strain * dea_dstrain) / rest_length
+
+
+def build_sigmoid_single_span(strain=0.006, compliance=0.0):
+    builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+    anchor = builder.add_body(mass=0.0, is_kinematic=True)
+    body = builder.add_body(
+        xform=wp.transform(p=wp.vec3(1.0, 0.0, 0.0)),
+        mass=1.0,
+        inertia=wp.mat33(np.eye(3)),
+    )
+    rest_length = 1.0 / (1.0 + strain)
+    builder.add_tendon()
+    builder.add_tendon_link(body=anchor, link_type=int(TendonLinkType.ATTACHMENT))
+    builder.add_tendon_link(
+        body=body,
+        link_type=int(TendonLinkType.ATTACHMENT),
+        compliance=compliance,
+        rest_length=rest_length,
+    )
+    builder.color()
+    return builder.finalize(), body, rest_length
 
 
 def build_dynamic_pulley_atwood(
@@ -2890,6 +2974,82 @@ def test_stiff_pinhole_capstan_matches_euler_eytelwein(test, device):
         )
 
 
+def test_sigmoid_material_projection_matches_capstan_cone(test, device):
+    """Material transfer must evaluate the same nonlinear law as the stretch solve."""
+    with wp.ScopedDevice(device):
+        mu = 0.1
+        material = SIGMOID_TENDON_MATERIAL
+        model, initial_rest = build_sigmoid_pinhole_route(mu)
+        solver = newton.solvers.SolverXPBD(model, iterations=1, tendon_max_sweeps=32, **material)
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+
+        solver.step(state_0, state_1, model.control(), None, 1.0 / 60.0)
+
+        lengths = np.linalg.norm(
+            solver.tendon_seg_attachment_r.numpy() - solver.tendon_seg_attachment_l.numpy(), axis=1
+        )
+        rest = solver.tendon_seg_rest_length.numpy()
+        tension = sigmoid_tendon_tension(lengths, rest, material)
+        target_ratio = math.exp(mu * math.pi / 2.0)
+
+        np.testing.assert_allclose(np.sum(rest), np.sum(initial_rest), rtol=1.0e-6, atol=1.0e-6)
+        test.assertAlmostEqual(float(tension[0] / tension[1]), target_ratio, delta=0.01)
+
+
+def test_sigmoid_material_projection_includes_zero_compliance_damping(test, device):
+    """The nonlinear law must not use compliance as a damping-enabled flag."""
+    with wp.ScopedDevice(device):
+        mu = 0.1
+        damping = 20.0
+        material = SIGMOID_TENDON_MATERIAL
+        model, initial_rest = build_sigmoid_pinhole_route(
+            mu,
+            compliance=0.0,
+            damping=damping,
+            initial_strains=(0.005, 0.005),
+        )
+        solver = newton.solvers.SolverXPBD(model, iterations=1, tendon_max_sweeps=32, **material)
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+        body_qd = np.zeros((model.body_count, 6), dtype=np.float32)
+        body_qd[0, 0] = -1.0
+        state_0.body_qd.assign(wp.array(body_qd, dtype=wp.spatial_vector, device=device))
+
+        solver.step(state_0, state_1, model.control(), None, 1.0e-6)
+
+        lengths = np.linalg.norm(
+            solver.tendon_seg_attachment_r.numpy() - solver.tendon_seg_attachment_l.numpy(), axis=1
+        )
+        rest = solver.tendon_seg_rest_length.numpy()
+        damping_tension = solver.tendon_seg_damping_tension.numpy()
+        tension = sigmoid_tendon_tension(lengths, rest, material) + np.maximum(damping_tension, 0.0)
+        target_ratio = math.exp(mu * math.pi / 2.0)
+
+        np.testing.assert_allclose(damping_tension, [damping, 0.0], rtol=1.0e-5, atol=1.0e-5)
+        np.testing.assert_allclose(np.sum(rest), np.sum(initial_rest), rtol=1.0e-6, atol=1.0e-6)
+        test.assertAlmostEqual(float(tension[0] / tension[1]), target_ratio, delta=0.01)
+
+
+def test_xpbd_sigmoid_stretch_uses_material_tangent(test, device):
+    """One XPBD iteration should match the nonlinear implicit impulse equation."""
+    with wp.ScopedDevice(device):
+        material = SIGMOID_TENDON_MATERIAL
+        model, body, rest_length = build_sigmoid_single_span()
+        solver = newton.solvers.SolverXPBD(model, iterations=1, joint_linear_relaxation=1.0, **material)
+        state_0, state_1 = model.state(), model.state()
+        dt = 1.0 / 60.0
+
+        solver.step(state_0, state_1, model.control(), None, dt)
+
+        tension = sigmoid_tendon_tension(1.0, rest_length, material)
+        tangent = sigmoid_tendon_tangent(1.0, rest_length, material)
+        inv_mass = float(model.body_inv_mass.numpy()[body])
+        expected_lambda = -dt * tension / (1.0 + dt * dt * tangent * inv_mass)
+
+        test.assertAlmostEqual(float(solver.tendon_seg_lambda.numpy()[0]), expected_lambda, delta=1.0e-5)
+
+
 def test_settle_tol_early_out_matches_full_sweeps(test, device):
     """The settle-based cone early-out must not change the converged capstan result.
 
@@ -3212,6 +3372,24 @@ add_test(
     "stiff_pinhole_capstan_matches_euler_eytelwein",
     devices,
     test_stiff_pinhole_capstan_matches_euler_eytelwein,
+)
+add_test(
+    TestTendonCapstan,
+    "sigmoid_material_projection_matches_capstan_cone",
+    devices,
+    test_sigmoid_material_projection_matches_capstan_cone,
+)
+add_test(
+    TestTendonCapstan,
+    "sigmoid_material_projection_includes_zero_compliance_damping",
+    devices,
+    test_sigmoid_material_projection_includes_zero_compliance_damping,
+)
+add_test(
+    TestTendonCapstan,
+    "xpbd_sigmoid_stretch_uses_material_tangent",
+    devices,
+    test_xpbd_sigmoid_stretch_uses_material_tangent,
 )
 add_test(
     TestTendonCapstan,

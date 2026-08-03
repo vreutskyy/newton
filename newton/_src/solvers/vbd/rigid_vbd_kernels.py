@@ -2963,6 +2963,10 @@ def solve_rigid_body(
     tendon_seg_active: wp.array[int],
     tendon_seg_active_link_l: wp.array[int],
     tendon_seg_active_link_r: wp.array[int],
+    tendon_sigmoid_ea_low: float,
+    tendon_sigmoid_ea_ratio: float,
+    tendon_sigmoid_transition_strain: float,
+    tendon_sigmoid_transition_width: float,
     # Output
     body_q_new: wp.array[wp.transform],
 ):
@@ -3106,6 +3110,10 @@ def solve_rigid_body(
         tendon_seg_active,
         tendon_seg_active_link_l,
         tendon_seg_active_link_r,
+        tendon_sigmoid_ea_low,
+        tendon_sigmoid_ea_ratio,
+        tendon_sigmoid_transition_strain,
+        tendon_sigmoid_transition_width,
     )
     f_force = f_force + tendon_force
     f_torque = f_torque + tendon_torque

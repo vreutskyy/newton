@@ -107,6 +107,14 @@ class TendonStateMixin:
             self.tendon_settle_tol = 1.0e-3
         if not hasattr(self, "tendon_activation_tol"):
             self.tendon_activation_tol = 2.0e-3
+        if not hasattr(self, "tendon_sigmoid_ea_low"):
+            self.tendon_sigmoid_ea_low = 0.0
+        if not hasattr(self, "tendon_sigmoid_ea_ratio"):
+            self.tendon_sigmoid_ea_ratio = 1.0
+        if not hasattr(self, "tendon_sigmoid_transition_strain"):
+            self.tendon_sigmoid_transition_strain = 0.0
+        if not hasattr(self, "tendon_sigmoid_transition_width"):
+            self.tendon_sigmoid_transition_width = 1.0
         if not 1 <= self.tendon_max_sweeps <= 256:
             raise ValueError(f"tendon_max_sweeps must be between 1 and 256, got {self.tendon_max_sweeps}")
         if self.tendon_settle_tol < 0.0:
@@ -116,6 +124,20 @@ class TendonStateMixin:
                 f"tendon_activation_tol must be between 0 (inclusive) and 1 (exclusive), "
                 f"got {self.tendon_activation_tol}"
             )
+        if self.tendon_sigmoid_ea_low < 0.0:
+            raise ValueError(f"tendon_sigmoid_ea_low must be non-negative, got {self.tendon_sigmoid_ea_low}")
+        if self.tendon_sigmoid_ea_low > 0.0:
+            if self.tendon_sigmoid_ea_ratio < 1.0:
+                raise ValueError(f"tendon_sigmoid_ea_ratio must be at least 1, got {self.tendon_sigmoid_ea_ratio}")
+            if self.tendon_sigmoid_transition_strain < 0.0:
+                raise ValueError(
+                    "tendon_sigmoid_transition_strain must be non-negative, "
+                    f"got {self.tendon_sigmoid_transition_strain}"
+                )
+            if self.tendon_sigmoid_transition_width <= 0.0:
+                raise ValueError(
+                    f"tendon_sigmoid_transition_width must be positive, got {self.tendon_sigmoid_transition_width}"
+                )
         if model.tendon_segment_count == 0:
             self.tendon_seg_rest_length = None
             self.tendon_seg_rest_length_step = None
@@ -409,6 +431,10 @@ class TendonStateMixin:
                 self.tendon_max_sweeps,
                 self.tendon_settle_tol,
                 0.0,
+                self.tendon_sigmoid_ea_low,
+                self.tendon_sigmoid_ea_ratio,
+                self.tendon_sigmoid_transition_strain,
+                self.tendon_sigmoid_transition_width,
             ],
             device=model.device,
         )

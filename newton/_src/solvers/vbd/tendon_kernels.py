@@ -4,7 +4,11 @@
 import warp as wp
 
 from ...sim.tendon import TendonLinkType
-from ..tendon_kernels import tendon_segment_length_rate_from_poses
+from ..tendon_kernels import (
+    tendon_material_tangent,
+    tendon_material_tension,
+    tendon_segment_length_rate_from_poses,
+)
 
 wp.set_module_options({"enable_backward": False})
 
@@ -141,6 +145,10 @@ def evaluate_tendon_force_hessians(
     seg_active: wp.array[int],
     seg_active_link_l: wp.array[int],
     seg_active_link_r: wp.array[int],
+    sigmoid_ea_low: float,
+    sigmoid_ea_ratio: float,
+    sigmoid_transition_strain: float,
+    sigmoid_transition_width: float,
 ):
     """Evaluate unilateral tendon spring-damper forces for one VBD body."""
     force = wp.vec3(0.0)
@@ -197,6 +205,28 @@ def evaluate_tendon_force_hessians(
         stiffness = 1.0 / compliance
         damping = seg_active_damping[seg]
         tension = stiffness * (length - rest_length) + damping * length_rate
+        if sigmoid_ea_low > 0.0:
+            stiffness = tendon_material_tangent(
+                length,
+                rest_length,
+                compliance,
+                sigmoid_ea_low,
+                sigmoid_ea_ratio,
+                sigmoid_transition_strain,
+                sigmoid_transition_width,
+            )
+            tension = (
+                tendon_material_tension(
+                    length,
+                    rest_length,
+                    compliance,
+                    sigmoid_ea_low,
+                    sigmoid_ea_ratio,
+                    sigmoid_transition_strain,
+                    sigmoid_transition_width,
+                )
+                + damping * length_rate
+            )
         tension = wp.max(tension, 0.0)
 
         if tension <= 0.0 or body_l == body_r:

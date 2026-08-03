@@ -10,6 +10,111 @@ from ..sim.tendon import TendonLinkFlags, TendonLinkType
 
 
 @wp.func
+def tendon_material_tension(
+    length: float,
+    rest_length: float,
+    compliance: float,
+    sigmoid_ea_low: float,
+    sigmoid_ea_ratio: float,
+    sigmoid_transition_strain: float,
+    sigmoid_transition_width: float,
+) -> float:
+    """Evaluate linear tension or the experimental sigmoid secant-stiffness law."""
+    stretch = wp.max(length - rest_length, 0.0)
+    if sigmoid_ea_low <= 0.0:
+        return stretch / wp.max(compliance, 1.0e-30)
+
+    strain = stretch / wp.max(rest_length, 1.0e-8)
+    transition = wp.tanh((strain - sigmoid_transition_strain) / sigmoid_transition_width)
+    ea = sigmoid_ea_low * (1.0 + (sigmoid_ea_ratio - 1.0) * 0.5 * (1.0 + transition))
+    return ea * strain
+
+
+@wp.func
+def tendon_material_tangent(
+    length: float,
+    rest_length: float,
+    compliance: float,
+    sigmoid_ea_low: float,
+    sigmoid_ea_ratio: float,
+    sigmoid_transition_strain: float,
+    sigmoid_transition_width: float,
+) -> float:
+    """Evaluate dT/dlength for the selected tendon material law."""
+    if sigmoid_ea_low <= 0.0:
+        return 1.0 / wp.max(compliance, 1.0e-30)
+
+    strain = wp.max(length - rest_length, 0.0) / wp.max(rest_length, 1.0e-8)
+    transition = wp.tanh((strain - sigmoid_transition_strain) / sigmoid_transition_width)
+    ea = sigmoid_ea_low * (1.0 + (sigmoid_ea_ratio - 1.0) * 0.5 * (1.0 + transition))
+    dea_dstrain = (
+        sigmoid_ea_low * (sigmoid_ea_ratio - 1.0) * 0.5 * (1.0 - transition * transition) / sigmoid_transition_width
+    )
+    return (ea + strain * dea_dstrain) / wp.max(rest_length, 1.0e-8)
+
+
+@wp.func
+def tendon_material_transfer_delta(
+    length_high: float,
+    stretch_high: float,
+    compliance_high: float,
+    damping_tension_high: float,
+    length_low: float,
+    stretch_low: float,
+    compliance_low: float,
+    damping_tension_low: float,
+    cap_ratio: float,
+    min_rest_length: float,
+    sigmoid_ea_low: float,
+    sigmoid_ea_ratio: float,
+    sigmoid_transition_strain: float,
+    sigmoid_transition_width: float,
+) -> float:
+    """Find a conservative rest-length transfer that reaches the nonlinear capstan bound."""
+    max_delta = wp.min(
+        wp.max(stretch_high, 0.0),
+        wp.max(length_low - stretch_low - min_rest_length, 0.0),
+    )
+    lo = float(0.0)
+    hi = max_delta
+    # This resolves the feasible transfer interval to 2^-12, below the default
+    # 1e-3 relative material-settling tolerance.
+    for _iteration in range(12):
+        mid = 0.5 * (lo + hi)
+        trial_force_high = wp.max(
+            tendon_material_tension(
+                length_high,
+                length_high - stretch_high + mid,
+                compliance_high,
+                sigmoid_ea_low,
+                sigmoid_ea_ratio,
+                sigmoid_transition_strain,
+                sigmoid_transition_width,
+            )
+            + damping_tension_high,
+            0.0,
+        )
+        trial_force_low = wp.max(
+            tendon_material_tension(
+                length_low,
+                length_low - stretch_low - mid,
+                compliance_low,
+                sigmoid_ea_low,
+                sigmoid_ea_ratio,
+                sigmoid_transition_strain,
+                sigmoid_transition_width,
+            )
+            + damping_tension_low,
+            0.0,
+        )
+        if trial_force_high > cap_ratio * trial_force_low:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+@wp.func
 def tangent_point_circle(
     p: wp.vec3,
     center: wp.vec3,
@@ -446,6 +551,10 @@ def update_tendon_attachments(
     tendon_max_sweeps: int,
     tendon_settle_tol: float,
     compliance_floor: float,
+    sigmoid_ea_low: float,
+    sigmoid_ea_ratio: float,
+    sigmoid_transition_strain: float,
+    sigmoid_transition_width: float,
 ):
     """Update routed tendon tangent points and free-span rest-length transfer.
 
@@ -891,55 +1000,169 @@ def update_tendon_attachments(
                 compliance_r = seg_active_compliance[seg_right]
                 comp_l = wp.max(compliance_l, 1.0e-30)
                 comp_r = wp.max(compliance_r, 1.0e-30)
-                damping_tension_l = seg_damping_tension[seg_left] if compliance_l > 0.0 else 0.0
-                damping_tension_r = seg_damping_tension[seg_right] if compliance_r > 0.0 else 0.0
-                effective_stretch_l = wp.max(
-                    d_l_raw + comp_l * damping_tension_l,
-                    0.0,
-                )
-                effective_stretch_r = wp.max(
-                    d_r_raw + comp_r * damping_tension_r,
-                    0.0,
-                )
+                nonlinear_material = sigmoid_ea_low > 0.0
+                damping_tension_l = seg_damping_tension[seg_left] if nonlinear_material or compliance_l > 0.0 else 0.0
+                damping_tension_r = seg_damping_tension[seg_right] if nonlinear_material or compliance_r > 0.0 else 0.0
+                effective_stretch_l = wp.max(d_l_raw + comp_l * damping_tension_l, 0.0)
+                effective_stretch_r = wp.max(d_r_raw + comp_r * damping_tension_r, 0.0)
                 force_l = effective_stretch_l / comp_l
                 force_r = effective_stretch_r / comp_r
+                if nonlinear_material:
+                    force_l = (
+                        tendon_material_tension(
+                            len_l,
+                            len_l - d_l_raw,
+                            compliance_l,
+                            sigmoid_ea_low,
+                            sigmoid_ea_ratio,
+                            sigmoid_transition_strain,
+                            sigmoid_transition_width,
+                        )
+                        + damping_tension_l
+                    )
+                    force_r = (
+                        tendon_material_tension(
+                            len_r,
+                            len_r - d_r_raw,
+                            compliance_r,
+                            sigmoid_ea_low,
+                            sigmoid_ea_ratio,
+                            sigmoid_transition_strain,
+                            sigmoid_transition_width,
+                        )
+                        + damping_tension_r
+                    )
+                    force_l = wp.max(force_l, 0.0)
+                    force_r = wp.max(force_r, 0.0)
                 delta = float(0.0)
                 max_delta = float(0.0)
 
                 sweep_maxtension = wp.max(sweep_maxtension, wp.max(force_l, force_r))
 
                 if force_l > force_r * cap_ratio:
-                    delta = (comp_r * effective_stretch_l - cap_ratio * comp_l * effective_stretch_r) / (
-                        comp_r + cap_ratio * comp_l
-                    )
-                    if delta < 0.0:
-                        delta = 0.0
-                    delta = wp.min(delta, effective_stretch_l)
-                    # rest_right -= delta must keep rest_right >= min_rest; rest_right = len_r - d_r_raw
-                    max_delta = len_r - d_r_raw - min_rest
-                    if max_delta < 0.0:
-                        max_delta = 0.0
-                    if delta > max_delta:
-                        delta = max_delta
+                    if nonlinear_material:
+                        delta = tendon_material_transfer_delta(
+                            len_l,
+                            d_l_raw,
+                            compliance_l,
+                            damping_tension_l,
+                            len_r,
+                            d_r_raw,
+                            compliance_r,
+                            damping_tension_r,
+                            cap_ratio,
+                            min_rest,
+                            sigmoid_ea_low,
+                            sigmoid_ea_ratio,
+                            sigmoid_transition_strain,
+                            sigmoid_transition_width,
+                        )
+                    else:
+                        # rest_right -= delta must keep rest_right >= min_rest.
+                        max_delta = wp.max(len_r - d_r_raw - min_rest, 0.0)
+                        max_delta = wp.min(max_delta, effective_stretch_l)
+                        delta = (comp_r * effective_stretch_l - cap_ratio * comp_l * effective_stretch_r) / (
+                            comp_r + cap_ratio * comp_l
+                        )
+                        delta = wp.max(delta, 0.0)
+                        delta = wp.min(delta, max_delta)
                     # rest_left += delta => d_l -= delta ; rest_right -= delta => d_r += delta
                     seg_stretch[seg_left] = d_l_raw - delta
                     seg_stretch[seg_right] = d_r_raw + delta
-                    sweep_dtension = wp.max(sweep_dtension, wp.max(delta / comp_l, delta / comp_r))
+                    if nonlinear_material:
+                        new_force_l = (
+                            tendon_material_tension(
+                                len_l,
+                                len_l - d_l_raw + delta,
+                                compliance_l,
+                                sigmoid_ea_low,
+                                sigmoid_ea_ratio,
+                                sigmoid_transition_strain,
+                                sigmoid_transition_width,
+                            )
+                            + damping_tension_l
+                        )
+                        new_force_r = (
+                            tendon_material_tension(
+                                len_r,
+                                len_r - d_r_raw - delta,
+                                compliance_r,
+                                sigmoid_ea_low,
+                                sigmoid_ea_ratio,
+                                sigmoid_transition_strain,
+                                sigmoid_transition_width,
+                            )
+                            + damping_tension_r
+                        )
+                        new_force_l = wp.max(new_force_l, 0.0)
+                        new_force_r = wp.max(new_force_r, 0.0)
+                        sweep_dtension = wp.max(
+                            sweep_dtension,
+                            wp.max(wp.abs(new_force_l - force_l), wp.abs(new_force_r - force_r)),
+                        )
+                    else:
+                        sweep_dtension = wp.max(sweep_dtension, wp.max(delta / comp_l, delta / comp_r))
                 elif force_r > force_l * cap_ratio:
-                    delta = (comp_l * effective_stretch_r - cap_ratio * comp_r * effective_stretch_l) / (
-                        comp_l + cap_ratio * comp_r
-                    )
-                    if delta < 0.0:
-                        delta = 0.0
-                    delta = wp.min(delta, effective_stretch_r)
-                    max_delta = len_l - d_l_raw - min_rest
-                    if max_delta < 0.0:
-                        max_delta = 0.0
-                    if delta > max_delta:
-                        delta = max_delta
+                    if nonlinear_material:
+                        delta = tendon_material_transfer_delta(
+                            len_r,
+                            d_r_raw,
+                            compliance_r,
+                            damping_tension_r,
+                            len_l,
+                            d_l_raw,
+                            compliance_l,
+                            damping_tension_l,
+                            cap_ratio,
+                            min_rest,
+                            sigmoid_ea_low,
+                            sigmoid_ea_ratio,
+                            sigmoid_transition_strain,
+                            sigmoid_transition_width,
+                        )
+                    else:
+                        max_delta = wp.max(len_l - d_l_raw - min_rest, 0.0)
+                        max_delta = wp.min(max_delta, effective_stretch_r)
+                        delta = (comp_l * effective_stretch_r - cap_ratio * comp_r * effective_stretch_l) / (
+                            comp_l + cap_ratio * comp_r
+                        )
+                        delta = wp.max(delta, 0.0)
+                        delta = wp.min(delta, max_delta)
                     seg_stretch[seg_left] = d_l_raw + delta
                     seg_stretch[seg_right] = d_r_raw - delta
-                    sweep_dtension = wp.max(sweep_dtension, wp.max(delta / comp_l, delta / comp_r))
+                    if nonlinear_material:
+                        new_force_l = (
+                            tendon_material_tension(
+                                len_l,
+                                len_l - d_l_raw - delta,
+                                compliance_l,
+                                sigmoid_ea_low,
+                                sigmoid_ea_ratio,
+                                sigmoid_transition_strain,
+                                sigmoid_transition_width,
+                            )
+                            + damping_tension_l
+                        )
+                        new_force_r = (
+                            tendon_material_tension(
+                                len_r,
+                                len_r - d_r_raw + delta,
+                                compliance_r,
+                                sigmoid_ea_low,
+                                sigmoid_ea_ratio,
+                                sigmoid_transition_strain,
+                                sigmoid_transition_width,
+                            )
+                            + damping_tension_r
+                        )
+                        new_force_l = wp.max(new_force_l, 0.0)
+                        new_force_r = wp.max(new_force_r, 0.0)
+                        sweep_dtension = wp.max(
+                            sweep_dtension,
+                            wp.max(wp.abs(new_force_l - force_l), wp.abs(new_force_r - force_r)),
+                        )
+                    else:
+                        sweep_dtension = wp.max(sweep_dtension, wp.max(delta / comp_l, delta / comp_r))
 
             # Keep the normalization scale fixed so an unloading cable can settle as both the
             # tension and its change approach zero. A per-sweep scale would shrink with the

@@ -15,6 +15,8 @@ from ..tendon_kernels import (  # noqa: F401
     advance_point_on_circle,
     signed_arc_length,
     tangent_point_circle,
+    tendon_material_tangent,
+    tendon_material_tension,
     update_tendon_attachments,
 )
 
@@ -45,6 +47,10 @@ def solve_tendon_stretch(
     compliance_lambda_scale: float,
     relaxation: float,
     dt: float,
+    sigmoid_ea_low: float,
+    sigmoid_ea_ratio: float,
+    sigmoid_transition_strain: float,
+    sigmoid_transition_width: float,
     # outputs
     body_deltas: wp.array[wp.spatial_vector],
 ):
@@ -150,14 +156,36 @@ def solve_tendon_stretch(
         denom += wp.dot(rot_ang_l, I_inv_l * rot_ang_l)
         denom += wp.dot(rot_ang_r, I_inv_r * rot_ang_r)
 
-    alpha = compliance * compliance_lambda_scale
-    gamma = compliance * damping
-
     lambda_prev = seg_lambda[seg]
-    d_lambda = -(err + alpha * lambda_prev + gamma * derr)
-    denom = (dt + gamma) * denom + compliance / dt
-    if denom > 0.0:
-        d_lambda = d_lambda / denom
+    if sigmoid_ea_low > 0.0:
+        tension = tendon_material_tension(
+            d,
+            rest,
+            compliance,
+            sigmoid_ea_low,
+            sigmoid_ea_ratio,
+            sigmoid_transition_strain,
+            sigmoid_transition_width,
+        )
+        tangent = tendon_material_tangent(
+            d,
+            rest,
+            compliance,
+            sigmoid_ea_low,
+            sigmoid_ea_ratio,
+            sigmoid_transition_strain,
+            sigmoid_transition_width,
+        )
+        d_lambda = -(lambda_prev + dt * (tension + damping * derr))
+        nonlinear_denom = 1.0 + (dt * dt * tangent + dt * damping) * denom
+        d_lambda = d_lambda / nonlinear_denom
+    else:
+        alpha = compliance * compliance_lambda_scale
+        gamma = compliance * damping
+        d_lambda = -(err + alpha * lambda_prev + gamma * derr)
+        linear_denom = (dt + gamma) * denom + compliance / dt
+        if linear_denom > 0.0:
+            d_lambda = d_lambda / linear_denom
 
     d_lambda = d_lambda * relaxation
 
@@ -204,6 +232,10 @@ def solve_tendon_slip(
     seg_damping_tension: wp.array[float],
     seg_delta_lambda: wp.array[float],
     relaxation: float,
+    sigmoid_ea_low: float,
+    sigmoid_ea_ratio: float,
+    sigmoid_transition_strain: float,
+    sigmoid_transition_width: float,
     # outputs
     body_deltas: wp.array[wp.spatial_vector],
 ):
@@ -262,18 +294,39 @@ def solve_tendon_slip(
 
         len_l = wp.length(seg_attachment_r[seg_left] - seg_attachment_l[seg_left])
         len_r = wp.length(seg_attachment_r[seg_right] - seg_attachment_l[seg_right])
-        d_l = len_l - seg_rest_length[seg_left]
-        d_r = len_r - seg_rest_length[seg_right]
 
-        # Match the material-transfer cone: guard division by zero without changing physical compliance.
+        # Match the material-transfer cone's constitutive tension.
         compliance_l = seg_compliance[seg_left]
         compliance_r = seg_compliance[seg_right]
-        comp_l = wp.max(compliance_l, 1.0e-30)
-        comp_r = wp.max(compliance_r, 1.0e-30)
-        damping_tension_l = seg_damping_tension[seg_left] if compliance_l > 0.0 else 0.0
-        damping_tension_r = seg_damping_tension[seg_right] if compliance_r > 0.0 else 0.0
-        force_l = wp.max(d_l / comp_l + damping_tension_l, 0.0)
-        force_r = wp.max(d_r / comp_r + damping_tension_r, 0.0)
+        nonlinear_material = sigmoid_ea_low > 0.0
+        damping_tension_l = seg_damping_tension[seg_left] if nonlinear_material or compliance_l > 0.0 else 0.0
+        damping_tension_r = seg_damping_tension[seg_right] if nonlinear_material or compliance_r > 0.0 else 0.0
+        force_l = wp.max(
+            tendon_material_tension(
+                len_l,
+                seg_rest_length[seg_left],
+                compliance_l,
+                sigmoid_ea_low,
+                sigmoid_ea_ratio,
+                sigmoid_transition_strain,
+                sigmoid_transition_width,
+            )
+            + damping_tension_l,
+            0.0,
+        )
+        force_r = wp.max(
+            tendon_material_tension(
+                len_r,
+                seg_rest_length[seg_right],
+                compliance_r,
+                sigmoid_ea_low,
+                sigmoid_ea_ratio,
+                sigmoid_transition_strain,
+                sigmoid_transition_width,
+            )
+            + damping_tension_r,
+            0.0,
+        )
 
         force_sum = force_l + force_r
         force_diff = wp.abs(force_l - force_r)

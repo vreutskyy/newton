@@ -25,14 +25,19 @@ from newton.examples.cable.example_tendon_rolling_pulley import Example as Rolli
 from newton.examples.cable.example_tendon_xy_table import Example as XYTableExample
 from newton.examples.cable.example_tendon_xy_table import _desired_table_xy
 from newton.tests.test_tendon_capstan import (
+    SIGMOID_TENDON_MATERIAL,
     _moving_rolling_route_material_error,
     build_dynamic_pulley_atwood,
     build_kinematic_pulley_atwood,
     build_kinematic_rolling_transport,
     build_motorized_pulley_drive,
     build_pinhole_atwood,
+    build_sigmoid_pinhole_route,
+    build_sigmoid_single_span,
     build_simple_cable_gravity,
     build_slack_pinhole_route,
+    sigmoid_tendon_tangent,
+    sigmoid_tendon_tension,
 )
 from newton.tests.test_tendon_equilibrium import build_atwood_equal_weights
 from newton.tests.unittest_utils import find_nan_members, sanitize_identifier
@@ -603,6 +608,54 @@ def test_vbd_tendon_compliance_uses_physical_tension(test, device):
             delta=0.05 * mass * 9.81,
             msg=f"VBD material tension should be time-step independent: {results}",
         )
+
+
+def test_vbd_sigmoid_material_projection_matches_capstan_cone(test, device):
+    """VBD material transfer must use the nonlinear law selected for its body solve."""
+    with wp.ScopedDevice(device):
+        mu = 0.1
+        material = SIGMOID_TENDON_MATERIAL
+        model, initial_rest = build_sigmoid_pinhole_route(mu)
+        solver = newton.solvers.SolverVBD(
+            model,
+            iterations=1,
+            tendon_max_sweeps=32,
+            rigid_avbd_beta=1.0e6,
+            **material,
+        )
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+
+        solver.step(state_0, state_1, model.control(), None, 1.0 / 60.0)
+
+        lengths = np.linalg.norm(
+            solver.tendon_seg_attachment_r.numpy() - solver.tendon_seg_attachment_l.numpy(), axis=1
+        )
+        rest = solver.tendon_seg_rest_length.numpy()
+        tension = sigmoid_tendon_tension(lengths, rest, material)
+        target_ratio = np.exp(mu * np.pi / 2.0)
+
+        np.testing.assert_allclose(np.sum(rest), np.sum(initial_rest), rtol=1.0e-6, atol=1.0e-6)
+        test.assertAlmostEqual(float(tension[0] / tension[1]), target_ratio, delta=0.01)
+
+
+def test_vbd_sigmoid_stretch_uses_material_tangent(test, device):
+    """One VBD iteration should match the nonlinear force and tangent solve."""
+    with wp.ScopedDevice(device):
+        material = SIGMOID_TENDON_MATERIAL
+        model, body, rest_length = build_sigmoid_single_span()
+        solver = newton.solvers.SolverVBD(model, iterations=1, rigid_avbd_beta=1.0e6, **material)
+        state_0, state_1 = model.state(), model.state()
+        dt = 1.0 / 60.0
+
+        solver.step(state_0, state_1, model.control(), None, dt)
+
+        tension = sigmoid_tendon_tension(1.0, rest_length, material)
+        tangent = sigmoid_tendon_tangent(1.0, rest_length, material)
+        mass = float(model.body_mass.numpy()[body])
+        expected_x = 1.0 - tension / (mass / (dt * dt) + tangent)
+
+        test.assertAlmostEqual(float(state_1.body_q.numpy()[body][0]), expected_x, delta=1.0e-5)
 
 
 def test_vbd_slack_damped_tendon_remains_force_free(test, device):
@@ -1484,6 +1537,18 @@ add_test(
     "vbd_tendon_compliance_uses_physical_tension",
     devices,
     test_vbd_tendon_compliance_uses_physical_tension,
+)
+add_test(
+    TestTendonVBD,
+    "vbd_sigmoid_material_projection_matches_capstan_cone",
+    devices,
+    test_vbd_sigmoid_material_projection_matches_capstan_cone,
+)
+add_test(
+    TestTendonVBD,
+    "vbd_sigmoid_stretch_uses_material_tangent",
+    devices,
+    test_vbd_sigmoid_stretch_uses_material_tangent,
 )
 add_test(
     TestTendonVBD,
