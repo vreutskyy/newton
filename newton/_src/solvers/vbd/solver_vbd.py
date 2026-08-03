@@ -252,6 +252,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
         tendon_max_sweeps: int = 256,
         tendon_settle_tol: float = 1.0e-3,
         rigid_enable_dahl_friction: bool | None = None,  # Deprecated: auto-detected from model attributes
+        tendon_activation_tol: float = 2.0e-3,
     ):
         """
         Args:
@@ -365,6 +366,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
             tendon_settle_tol: Relative tension-change tolerance for stopping capstan material relaxation.
             rigid_enable_dahl_friction: Deprecated and ignored. Dahl friction is auto-detected
                 from ``model.vbd.dahl_eps_max`` / ``model.vbd.dahl_tau``.
+            tendon_activation_tol: Relative radius gap that inactive dynamic rollers must cross before activation.
 
         Note:
             - The `integrate_with_external_rigid_solver` argument enables one-way coupling between rigid body and soft body
@@ -402,6 +404,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
         self.friction_epsilon = friction_epsilon
         self.tendon_max_sweeps = tendon_max_sweeps
         self.tendon_settle_tol = tendon_settle_tol
+        self.tendon_activation_tol = tendon_activation_tol
         # Rigid integration mode: when True, rigid bodies are integrated by an external
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
         # participate in particle-rigid interaction on the particle side.
@@ -1686,7 +1689,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
             # in-iteration material solve. Accept its route state before
             # reporting tension or carrying rest lengths into the next step.
             self._update_tendon_routing(state_in, dt, False)
-            self._snapshot_tendon_segment_length_reference()
+            self._snapshot_tendon_segment_length_reference(state_in.body_q, dt)
 
         # Snapshot solved rigid contact state for next-frame warm-start.
         self._snapshot_rigid_contact_history(contacts)
@@ -2461,7 +2464,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
             device=self.device,
         )
 
-    def _snapshot_tendon_segment_length_reference(self) -> None:
+    def _snapshot_tendon_segment_length_reference(self, body_q: wp.array[wp.transform], dt: float) -> None:
         """Preserve previous-pose segment lengths through rigid finalization."""
         model = self.model
         # Native VBD does not accumulate XPBD delta lambdas, so this existing
@@ -2470,8 +2473,14 @@ class SolverVBD(TendonStateMixin, SolverBase):
             kernel=snapshot_tendon_segment_length_reference,
             dim=model.tendon_segment_count,
             inputs=[
+                dt,
+                body_q,
                 self.body_q_prev,
+                model.body_com,
                 model.tendon_link_body,
+                model.tendon_link_type,
+                model.tendon_link_offset,
+                model.tendon_link_axis,
                 self.tendon_seg_attachment_l_local,
                 self.tendon_seg_attachment_r_local,
                 self.tendon_seg_active,
@@ -2483,7 +2492,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
         )
 
     def _update_tendon_segment_diagnostics(self, state_out: State, dt: float) -> None:
-        """Update tendon geometry and multipliers from the accepted rigid pose."""
+        """Update tendon geometry and damping from the accepted rigid pose."""
         model = self.model
         wp.launch(
             kernel=update_tendon_segment_diagnostics,
@@ -2492,10 +2501,8 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 dt,
                 state_out.body_q,
                 model.tendon_link_body,
-                self.tendon_seg_rest_length,
                 self.tendon_seg_attachment_l_local,
                 self.tendon_seg_attachment_r_local,
-                self.tendon_seg_active_compliance,
                 self.tendon_seg_active_damping,
                 self.tendon_seg_active,
                 self.tendon_seg_active_link_l,
@@ -2505,6 +2512,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
             outputs=[
                 self.tendon_seg_attachment_l,
                 self.tendon_seg_attachment_r,
+                self.tendon_seg_damping_tension,
                 self.tendon_seg_lambda,
             ],
             device=self.device,

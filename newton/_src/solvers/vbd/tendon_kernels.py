@@ -4,6 +4,7 @@
 import warp as wp
 
 from ...sim.tendon import TendonLinkType
+from ..tendon_kernels import tendon_segment_length_rate_from_poses
 
 wp.set_module_options({"enable_backward": False})
 
@@ -30,8 +31,14 @@ class TendonForceElementAdjacencyInfo:
 
 @wp.kernel
 def snapshot_tendon_segment_length_reference(
+    dt: float,
+    body_q: wp.array[wp.transform],
     body_q_prev: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
     tendon_link_body: wp.array[int],
+    tendon_link_type: wp.array[int],
+    tendon_link_offset: wp.array[wp.vec3],
+    tendon_link_axis: wp.array[wp.vec3],
     seg_attachment_l_local: wp.array[wp.vec3],
     seg_attachment_r_local: wp.array[wp.vec3],
     seg_active: wp.array[int],
@@ -49,9 +56,25 @@ def snapshot_tendon_segment_length_reference(
     link_r = seg_active_link_r[seg]
     body_l = tendon_link_body[link_l]
     body_r = tendon_link_body[link_r]
-    attachment_l_prev = wp.transform_point(body_q_prev[body_l], seg_attachment_l_local[seg])
-    attachment_r_prev = wp.transform_point(body_q_prev[body_r], seg_attachment_r_local[seg])
-    seg_length_prev[seg] = wp.length(attachment_r_prev - attachment_l_prev)
+    attachment_l = wp.transform_point(body_q[body_l], seg_attachment_l_local[seg])
+    attachment_r = wp.transform_point(body_q[body_r], seg_attachment_r_local[seg])
+    length_rate = tendon_segment_length_rate_from_poses(
+        dt,
+        body_q,
+        body_q_prev,
+        body_com,
+        tendon_link_body,
+        tendon_link_type,
+        tendon_link_offset,
+        tendon_link_axis,
+        link_l,
+        link_r,
+        seg_attachment_l_local[seg],
+        seg_attachment_r_local[seg],
+        attachment_l,
+        attachment_r,
+    )
+    seg_length_prev[seg] = wp.length(attachment_r - attachment_l) - dt * length_rate
 
 
 @wp.kernel
@@ -59,10 +82,8 @@ def update_tendon_segment_diagnostics(
     dt: float,
     body_q: wp.array[wp.transform],
     tendon_link_body: wp.array[int],
-    seg_rest_length: wp.array[float],
     seg_attachment_l_local: wp.array[wp.vec3],
     seg_attachment_r_local: wp.array[wp.vec3],
-    seg_active_compliance: wp.array[float],
     seg_active_damping: wp.array[float],
     seg_active: wp.array[int],
     seg_active_link_l: wp.array[int],
@@ -70,12 +91,15 @@ def update_tendon_segment_diagnostics(
     seg_length_prev: wp.array[float],
     seg_attachment_l: wp.array[wp.vec3],
     seg_attachment_r: wp.array[wp.vec3],
+    seg_damping_tension: wp.array[float],
     seg_lambda: wp.array[float],
 ):
-    """Update tendon geometry and multipliers from the accepted VBD pose."""
+    """Update tendon geometry and damping from the accepted VBD pose."""
     seg = wp.tid()
     seg_attachment_l[seg] = wp.vec3(0.0)
     seg_attachment_r[seg] = wp.vec3(0.0)
+    seg_damping_tension[seg] = 0.0
+    # Native VBD does not solve XPBD constraint multipliers.
     seg_lambda[seg] = 0.0
     if seg_active[seg] == 0:
         return
@@ -90,16 +114,8 @@ def update_tendon_segment_diagnostics(
     seg_attachment_l[seg] = attachment_l
     seg_attachment_r[seg] = attachment_r
     length = wp.length(attachment_r - attachment_l)
-    rest_length = seg_rest_length[seg]
-    if length <= rest_length:
-        return
-
-    compliance = wp.max(seg_active_compliance[seg], _MIN_TENDON_COMPLIANCE)
-
     length_rate = (length - seg_length_prev[seg]) / dt
-
-    tension = (length - rest_length) / compliance + seg_active_damping[seg] * length_rate
-    seg_lambda[seg] = -wp.max(tension, 0.0) * dt
+    seg_damping_tension[seg] = seg_active_damping[seg] * length_rate
 
 
 @wp.func
@@ -161,10 +177,22 @@ def evaluate_tendon_force_hessians(
         if length <= rest_length:
             continue
 
-        attachment_l_prev = wp.transform_point(body_q_prev[body_l], seg_attachment_l_local[seg])
-        attachment_r_prev = wp.transform_point(body_q_prev[body_r], seg_attachment_r_local[seg])
-        length_prev = wp.length(attachment_r_prev - attachment_l_prev)
-        length_rate = (length - length_prev) / dt
+        length_rate = tendon_segment_length_rate_from_poses(
+            dt,
+            body_q,
+            body_q_prev,
+            body_com,
+            tendon_link_body,
+            tendon_link_type,
+            tendon_link_offset,
+            tendon_link_axis,
+            link_l,
+            link_r,
+            seg_attachment_l_local[seg],
+            seg_attachment_r_local[seg],
+            attachment_l,
+            attachment_r,
+        )
 
         stiffness = 1.0 / compliance
         damping = seg_active_damping[seg]

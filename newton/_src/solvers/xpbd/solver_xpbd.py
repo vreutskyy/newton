@@ -720,6 +720,7 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                             inputs=[
                                 body_q,
                                 body_qd,
+                                body_q,
                                 model.body_com,
                                 model.tendon_start,
                                 model.tendon_link_body,
@@ -753,6 +754,8 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                                 self.tendon_seg_rolling_delta_l,
                                 self.tendon_seg_rolling_delta_r,
                                 self.tendon_cone_sweep_count,
+                                0,
+                                dt,
                                 1,
                                 1,
                                 int(i == 0),

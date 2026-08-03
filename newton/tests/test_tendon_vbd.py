@@ -28,6 +28,7 @@ from newton.tests.test_tendon_capstan import (
     _moving_rolling_route_material_error,
     build_dynamic_pulley_atwood,
     build_kinematic_pulley_atwood,
+    build_kinematic_rolling_transport,
     build_motorized_pulley_drive,
     build_pinhole_atwood,
     build_simple_cable_gravity,
@@ -445,15 +446,13 @@ def test_vbd_tendon_zero_compliance_uses_floor(test, device):
             results.append(
                 (
                     state_1.body_q.numpy()[body_idx].copy(),
-                    float(solver.tendon_seg_lambda.numpy()[0]),
                     float(solver.tendon_seg_active_compliance.numpy()[0]),
                 )
             )
 
         test.assertTrue(np.isfinite(results[0][0]).all())
         np.testing.assert_allclose(results[0][0], results[1][0], rtol=0.0, atol=1.0e-6)
-        test.assertAlmostEqual(results[0][1], results[1][1], delta=1.0e-6)
-        test.assertEqual(results[0][2], results[1][2])
+        test.assertEqual(results[0][1], results[1][1])
 
 
 def test_vbd_rolling_chain_tension_matches_accepted_pose(test, device):
@@ -580,22 +579,15 @@ def test_vbd_tendon_compliance_uses_physical_tension(test, device):
             rest_length = float(solver.tendon_seg_rest_length.numpy()[0])
             stretch = float(np.linalg.norm(attachment_r - attachment_l)) - rest_length
             material_tension = stretch / compliance
-            lambda_tension = -float(solver.tendon_seg_lambda.numpy()[0]) / dt
             final_z = float(state_0.body_q.numpy()[body_idx][2])
             final_vz = float(state_0.body_qd.numpy()[body_idx][2])
-            results.append((material_tension, lambda_tension, final_z, final_vz))
+            results.append((material_tension, final_z, final_vz))
 
             test.assertAlmostEqual(
                 material_tension,
                 load,
                 delta=0.05 * load,
                 msg=f"VBD material tension should balance the load: {material_tension:.3f} vs {load:.3f}",
-            )
-            test.assertAlmostEqual(
-                lambda_tension,
-                material_tension,
-                delta=0.05 * load,
-                msg=f"VBD lambda tension should match material tension: {lambda_tension:.3f} vs {material_tension:.3f}",
             )
             test.assertAlmostEqual(
                 final_z,
@@ -606,10 +598,10 @@ def test_vbd_tendon_compliance_uses_physical_tension(test, device):
             test.assertAlmostEqual(final_vz, 0.0, delta=2.0e-2, msg=f"VBD equilibrium velocity changed: {final_vz:.6f}")
 
         test.assertAlmostEqual(
-            results[0][1],
-            results[1][1],
+            results[0][0],
+            results[1][0],
             delta=0.05 * mass * 9.81,
-            msg=f"VBD lambda tension should be time-step independent: {results}",
+            msg=f"VBD material tension should be time-step independent: {results}",
         )
 
 
@@ -648,13 +640,13 @@ def test_vbd_slack_damped_tendon_remains_force_free(test, device):
         solver.step(state_0, state_1, model.control(), None, dt)
 
         final_vx = float(state_1.body_qd.numpy()[body][0])
-        lambda_tension = -float(solver.tendon_seg_lambda.numpy()[0]) / dt
+        reported_lambda = float(solver.tendon_seg_lambda.numpy()[0])
         test.assertAlmostEqual(final_vx, 30.0, delta=1.0e-4)
-        test.assertAlmostEqual(lambda_tension, 0.0, delta=1.0e-5)
+        test.assertEqual(reported_lambda, 0.0, "VBD must not report a synthetic XPBD multiplier")
 
 
-def test_vbd_tendon_lambda_matches_final_pose(test, device):
-    """Reported tendon tension should use the completed VBD pose."""
+def test_vbd_tendon_diagnostics_match_final_pose(test, device):
+    """Reported tendon geometry and damping should use the completed VBD pose."""
     with wp.ScopedDevice(device):
         builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
         body_l = builder.add_body(
@@ -695,11 +687,100 @@ def test_vbd_tendon_lambda_matches_final_pose(test, device):
         attachment_r = solver.tendon_seg_attachment_r.numpy()[0]
         attachment_length = float(np.linalg.norm(attachment_r - attachment_l))
         length_rate = (final_length - initial_length) / dt
-        expected_tension = max((final_length - rest_length) / compliance + damping * length_rate, 0.0)
-        lambda_tension = -float(solver.tendon_seg_lambda.numpy()[0]) / dt
-        test.assertLess(final_length, 0.75, "The solve must move the endpoints enough to expose a stale lambda")
+        material_tension = max((final_length - rest_length) / compliance + damping * length_rate, 0.0)
+        reported_lambda = float(solver.tendon_seg_lambda.numpy()[0])
+        routing_damping_tension = float(solver.tendon_seg_damping_tension.numpy()[0])
+        test.assertLess(final_length, 0.75, "The solve must move the endpoints enough to expose stale diagnostics")
+        test.assertGreater(material_tension, 0.0, "The regression must exercise a loaded tendon")
         test.assertAlmostEqual(attachment_length, final_length, delta=1.0e-6)
-        test.assertAlmostEqual(lambda_tension, expected_tension, delta=max(1.0e-3, 1.0e-4 * expected_tension))
+        test.assertAlmostEqual(
+            routing_damping_tension,
+            damping * length_rate,
+            delta=max(1.0e-3, 1.0e-4 * abs(damping * length_rate)),
+            msg="VBD material routing must use the same pose-difference damping rate as its force evaluation",
+        )
+        test.assertEqual(reported_lambda, 0.0, "VBD must not report a synthetic XPBD multiplier")
+
+
+def test_vbd_nonrolling_rotation_uses_discrete_length_rate(test, device):
+    """Non-rolling damping should use the discrete free-span length change."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        rotating = builder.add_body(mass=0.0, is_kinematic=True)
+        fixed = builder.add_body(
+            xform=wp.transform(p=wp.vec3(2.0, 1.0, 0.0)),
+            mass=0.0,
+            is_kinematic=True,
+        )
+        damping = 10.0
+        builder.add_tendon()
+        builder.add_tendon_link(
+            body=rotating,
+            link_type=int(TendonLinkType.ATTACHMENT),
+            offset=(1.0, 0.0, 0.0),
+        )
+        builder.add_tendon_link(
+            body=fixed,
+            link_type=int(TendonLinkType.ATTACHMENT),
+            compliance=1.0e-3,
+            damping=damping,
+            rest_length=-1.0,
+        )
+        builder.color()
+        model = builder.finalize()
+        solver = _make_tendon_vbd_solver(model)
+        state_0 = model.state()
+        state_1 = model.state()
+
+        body_q = state_0.body_q.numpy()
+        angle = 0.5 * np.pi
+        body_q[rotating, 3:] = np.array([0.0, 0.0, np.sin(0.5 * angle), np.cos(0.5 * angle)])
+        state_0.body_q.assign(body_q)
+
+        dt = 1.0 / 60.0
+        solver.step(state_0, state_1, model.control(), None, dt)
+
+        initial_length = np.sqrt(2.0)
+        final_length = 2.0
+        expected_damping_tension = damping * (final_length - initial_length) / dt
+        test.assertAlmostEqual(
+            float(solver.tendon_seg_damping_tension.numpy()[0]),
+            expected_damping_tension,
+            delta=1.0e-3,
+        )
+
+
+def test_vbd_rolling_spin_does_not_add_damping_tension(test, device):
+    """Pure roller-axis spin should transport material without stretching the free spans."""
+    with wp.ScopedDevice(device):
+        model, pulley = build_kinematic_rolling_transport(mu=10.0)
+        model.tendon_seg_damping.fill_(100.0)
+        _set_serial_body_coloring(model)
+        solver = _make_tendon_vbd_solver(model)
+        state_0 = model.state()
+        state_1 = model.state()
+        initial_rest = solver.tendon_seg_rest_length.numpy().copy()
+
+        body_q = state_0.body_q.numpy()
+        angle = 0.4
+        body_q[pulley, 3:] = np.array([0.0, 0.0, np.sin(0.5 * angle), np.cos(0.5 * angle)], dtype=np.float32)
+        state_0.body_q.assign(body_q)
+
+        solver.step(state_0, state_1, model.control(), None, 1.0 / 60.0)
+
+        rest_delta = solver.tendon_seg_rest_length.numpy() - initial_rest
+        damping_tension = solver.tendon_seg_damping_tension.numpy()
+        test.assertGreater(
+            float(np.max(np.abs(rest_delta))),
+            1.0e-4,
+            f"Prescribed rolling spin should still transport material: delta={rest_delta}",
+        )
+        np.testing.assert_allclose(
+            damping_tension,
+            0.0,
+            atol=1.0e-4,
+            err_msg="Roller-axis spin must not change free-span length or create damping tension",
+        )
 
 
 def test_vbd_tendon_cuda_graph_capture(test, device):
@@ -1412,9 +1493,21 @@ add_test(
 )
 add_test(
     TestTendonVBD,
-    "vbd_tendon_lambda_matches_final_pose",
+    "vbd_tendon_diagnostics_match_final_pose",
     devices,
-    test_vbd_tendon_lambda_matches_final_pose,
+    test_vbd_tendon_diagnostics_match_final_pose,
+)
+add_test(
+    TestTendonVBD,
+    "vbd_nonrolling_rotation_uses_discrete_length_rate",
+    devices,
+    test_vbd_nonrolling_rotation_uses_discrete_length_rate,
+)
+add_test(
+    TestTendonVBD,
+    "vbd_rolling_spin_does_not_add_damping_tension",
+    devices,
+    test_vbd_rolling_spin_does_not_add_damping_tension,
 )
 add_test(TestTendonVBD, "vbd_tendon_cuda_graph_capture", devices, test_vbd_tendon_cuda_graph_capture)
 add_test(TestTendonVBD, "vbd_dynamic_tendon_cuda_graph_capture", devices, test_vbd_dynamic_tendon_cuda_graph_capture)

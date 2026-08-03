@@ -5,6 +5,7 @@
 
 import warp as wp
 
+from ..math import quat_velocity
 from ..sim.tendon import TendonLinkFlags, TendonLinkType
 
 
@@ -242,9 +243,8 @@ def update_tendon_link_active(
 
 
 @wp.func
-def tendon_segment_length_rate(
+def _tendon_segment_length_rate_from_twists(
     body_q: wp.array[wp.transform],
-    body_qd: wp.array[wp.spatial_vector],
     body_com: wp.array[wp.vec3],
     tendon_link_body: wp.array[int],
     tendon_link_type: wp.array[int],
@@ -254,8 +254,12 @@ def tendon_segment_length_rate(
     link_r: int,
     x_l: wp.vec3,
     x_r: wp.vec3,
+    velocity_l: wp.vec3,
+    velocity_r: wp.vec3,
+    omega_l: wp.vec3,
+    omega_r: wp.vec3,
 ):
-    """Return the free-span length rate used by the stretch constraint."""
+    """Return free-span length rate from endpoint body twists."""
     diff = x_r - x_l
     length = wp.length(diff)
     if length <= 1.0e-8:
@@ -266,10 +270,6 @@ def tendon_segment_length_rate(
     body_r = tendon_link_body[link_r]
     pose_l = body_q[body_l]
     pose_r = body_q[body_r]
-    velocity_l = wp.spatial_top(body_qd[body_l])
-    velocity_r = wp.spatial_top(body_qd[body_r])
-    omega_l = wp.spatial_bottom(body_qd[body_l])
-    omega_r = wp.spatial_bottom(body_qd[body_r])
     world_com_l = wp.transform_point(pose_l, body_com[body_l])
     world_com_r = wp.transform_point(pose_r, body_com[body_r])
 
@@ -298,10 +298,112 @@ def tendon_segment_length_rate(
     )
 
 
+@wp.func
+def tendon_segment_length_rate(
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    tendon_link_body: wp.array[int],
+    tendon_link_type: wp.array[int],
+    tendon_link_offset: wp.array[wp.vec3],
+    tendon_link_axis: wp.array[wp.vec3],
+    link_l: int,
+    link_r: int,
+    x_l: wp.vec3,
+    x_r: wp.vec3,
+):
+    """Return the free-span length rate used by the stretch constraint."""
+    body_l = tendon_link_body[link_l]
+    body_r = tendon_link_body[link_r]
+    return _tendon_segment_length_rate_from_twists(
+        body_q,
+        body_com,
+        tendon_link_body,
+        tendon_link_type,
+        tendon_link_offset,
+        tendon_link_axis,
+        link_l,
+        link_r,
+        x_l,
+        x_r,
+        wp.spatial_top(body_qd[body_l]),
+        wp.spatial_top(body_qd[body_r]),
+        wp.spatial_bottom(body_qd[body_l]),
+        wp.spatial_bottom(body_qd[body_r]),
+    )
+
+
+@wp.func
+def tendon_segment_length_rate_from_poses(
+    dt: float,
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    tendon_link_body: wp.array[int],
+    tendon_link_type: wp.array[int],
+    tendon_link_offset: wp.array[wp.vec3],
+    tendon_link_axis: wp.array[wp.vec3],
+    link_l: int,
+    link_r: int,
+    x_l_local: wp.vec3,
+    x_r_local: wp.vec3,
+    x_l: wp.vec3,
+    x_r: wp.vec3,
+):
+    """Return free-span length rate from the current and previous body poses."""
+    body_l = tendon_link_body[link_l]
+    body_r = tendon_link_body[link_r]
+    pose_l = body_q[body_l]
+    pose_r = body_q[body_r]
+    pose_l_prev = body_q_prev[body_l]
+    pose_r_prev = body_q_prev[body_r]
+    # Preserve VBD's discrete damping except where rolling contact requires removing roller-axis spin.
+    if tendon_link_type[link_l] != int(TendonLinkType.ROLLING) and tendon_link_type[link_r] != int(
+        TendonLinkType.ROLLING
+    ):
+        x_l_prev = wp.transform_point(pose_l_prev, x_l_local)
+        x_r_prev = wp.transform_point(pose_r_prev, x_r_local)
+        return (wp.length(x_r - x_l) - wp.length(x_r_prev - x_l_prev)) / dt
+
+    world_com_l = wp.transform_point(pose_l, body_com[body_l])
+    world_com_r = wp.transform_point(pose_r, body_com[body_r])
+    world_com_l_prev = wp.transform_point(pose_l_prev, body_com[body_l])
+    world_com_r_prev = wp.transform_point(pose_r_prev, body_com[body_r])
+    velocity_l = (world_com_l - world_com_l_prev) / dt
+    velocity_r = (world_com_r - world_com_r_prev) / dt
+    omega_l = quat_velocity(
+        wp.transform_get_rotation(pose_l),
+        wp.transform_get_rotation(pose_l_prev),
+        dt,
+    )
+    omega_r = quat_velocity(
+        wp.transform_get_rotation(pose_r),
+        wp.transform_get_rotation(pose_r_prev),
+        dt,
+    )
+    return _tendon_segment_length_rate_from_twists(
+        body_q,
+        body_com,
+        tendon_link_body,
+        tendon_link_type,
+        tendon_link_offset,
+        tendon_link_axis,
+        link_l,
+        link_r,
+        x_l,
+        x_r,
+        velocity_l,
+        velocity_r,
+        omega_l,
+        omega_r,
+    )
+
+
 @wp.kernel
 def update_tendon_attachments(
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
+    body_q_prev: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
     tendon_start: wp.array[int],
     tendon_link_body: wp.array[int],
@@ -335,6 +437,8 @@ def update_tendon_attachments(
     seg_rolling_delta_l: wp.array[float],
     seg_rolling_delta_r: wp.array[float],
     tendon_cone_sweep_count: wp.array[int],
+    damping_from_pose_delta: int,
+    dt: float,
     apply_rolling_transfer: int,
     apply_pinhole_slip: int,
     report_unsupported_wrap: int,
@@ -349,6 +453,9 @@ def update_tendon_attachments(
     Gauss-Seidel passes and stops when the tension change relative to the first
     sweep's peak tension falls below ``tendon_settle_tol``. Otherwise, the
     established fixed 4/32-sweep policy is used.
+
+    XPBD derives damping from body velocities. VBD sets ``damping_from_pose_delta``
+    to use the current and previous accepted poses, matching its force evaluation.
     """
     tendon_id = wp.tid()
     link_start = tendon_start[tendon_id]
@@ -570,19 +677,37 @@ def update_tendon_attachments(
                 # rebuild below conserves total cable length (rest = len - stretch).
                 seg_stretch[seg] = len_snap - seg_rest_length[seg]
                 if seg_active_damping[seg] != 0.0:
-                    seg_damping_tension[seg] = seg_active_damping[seg] * tendon_segment_length_rate(
-                        body_q,
-                        body_qd,
-                        body_com,
-                        tendon_link_body,
-                        tendon_link_type,
-                        tendon_link_offset,
-                        tendon_link_axis,
-                        seg_active_link_l[seg],
-                        seg_active_link_r[seg],
-                        seg_attachment_l[seg],
-                        seg_attachment_r[seg],
-                    )
+                    if damping_from_pose_delta != 0:
+                        seg_damping_tension[seg] = seg_active_damping[seg] * tendon_segment_length_rate_from_poses(
+                            dt,
+                            body_q,
+                            body_q_prev,
+                            body_com,
+                            tendon_link_body,
+                            tendon_link_type,
+                            tendon_link_offset,
+                            tendon_link_axis,
+                            seg_active_link_l[seg],
+                            seg_active_link_r[seg],
+                            seg_attachment_l_local[seg],
+                            seg_attachment_r_local[seg],
+                            seg_attachment_l[seg],
+                            seg_attachment_r[seg],
+                        )
+                    else:
+                        seg_damping_tension[seg] = seg_active_damping[seg] * tendon_segment_length_rate(
+                            body_q,
+                            body_qd,
+                            body_com,
+                            tendon_link_body,
+                            tendon_link_type,
+                            tendon_link_offset,
+                            tendon_link_axis,
+                            seg_active_link_l[seg],
+                            seg_active_link_r[seg],
+                            seg_attachment_l[seg],
+                            seg_attachment_r[seg],
+                        )
 
         material_sweep_count = int(4)
         if adaptive_cone_sweeps != 0:
