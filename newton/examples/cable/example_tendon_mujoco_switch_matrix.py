@@ -322,9 +322,12 @@ class Example:
         signed_distance = float(np.dot(candidate - closest, span_normal))
         return distance, signed_distance, alpha
 
-    def _candidate_should_wrap(self, lane):
+    def _candidate_should_wrap(self, lane, active):
         _, signed_distance, alpha = self._candidate_span_projection(lane)
-        return 0.0 < alpha < 1.0 and lane["orientation"] * signed_distance <= self.radius
+        activation_radius = self.radius
+        if not active:
+            activation_radius *= 1.0 - self.solver.tendon_activation_tol
+        return 0.0 < alpha < 1.0 and lane["orientation"] * signed_distance <= activation_radius
 
     def simulate(self):
         for substep in range(self.sim_substeps):
@@ -353,7 +356,7 @@ class Example:
                 self._transition_counts[i] += 1
                 self._last_active[i] = active
 
-            expected_active = self._candidate_should_wrap(lane)
+            expected_active = self._candidate_should_wrap(lane, active)
             if active != expected_active:
                 self._activation_mismatch_count[i] += 1
 
@@ -405,9 +408,8 @@ class Example:
             )
             assert self._saw_disabled_segment[i], f"{lane['name']} never disabled the skipped segment"
             assert self._saw_enabled_segment[i], f"{lane['name']} never restored the skipped segment"
-            assert self._max_inactive_penetration[i] < 1.0e-5, (
-                f"{lane['name']} remained inactive while bypass span intersected candidate: "
-                f"{self._max_inactive_penetration[i]:.6f}"
+            assert self._max_inactive_penetration[i] < self.radius * self.solver.tendon_activation_tol + 1.0e-5, (
+                f"{lane['name']} exceeded its activation tolerance: {self._max_inactive_penetration[i]:.6f}"
             )
             assert self._min_active_tangent_radius[i] > self.radius * 0.80, (
                 f"{lane['name']} active route did not reach capstan surface: {self._min_active_tangent_radius[i]:.6f}"

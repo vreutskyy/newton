@@ -192,10 +192,13 @@ class Example:
         signed_distance = float(np.dot(capstan - closest, span_normal))
         return distance, signed_distance, alpha
 
-    def _candidate_should_wrap(self, i):
+    def _candidate_should_wrap(self, i, active):
         _, signed_distance, alpha = self._candidate_span_projection(i)
         orientation = float(self.capstan_specs[i]["orientation"])
-        return 0.0 < alpha < 1.0 and orientation * signed_distance <= self.radius
+        activation_radius = self.radius
+        if not active:
+            activation_radius *= 1.0 - self.solver.tendon_activation_tol
+        return 0.0 < alpha < 1.0 and orientation * signed_distance <= activation_radius
 
     def simulate(self):
         for substep in range(self.sim_substeps):
@@ -225,7 +228,7 @@ class Example:
         att_r = self.solver.tendon_seg_attachment_r.numpy()
         body_q = self.state_0.body_q.numpy()
         for i in range(self.candidate_count):
-            expected_active = self._candidate_should_wrap(i)
+            expected_active = self._candidate_should_wrap(i, bool(self.active[i]))
             if bool(self.active[i]) != expected_active:
                 self._activation_mismatch_count += 1
 

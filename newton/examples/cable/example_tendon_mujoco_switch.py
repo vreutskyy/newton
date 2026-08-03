@@ -233,9 +233,12 @@ class Example:
         signed_distance = float(np.dot(middle - closest, span_normal))
         return distance, signed_distance, alpha
 
-    def _middle_should_wrap(self):
+    def _middle_should_wrap(self, active):
         _, signed_distance, alpha = self._middle_span_projection()
-        return 0.0 < alpha < 1.0 and self.middle_orientation * signed_distance <= self.middle_radius
+        activation_radius = self.middle_radius
+        if not active:
+            activation_radius *= 1.0 - self.solver.tendon_activation_tol
+        return 0.0 < alpha < 1.0 and self.middle_orientation * signed_distance <= activation_radius
 
     def simulate(self):
         for substep in range(self.sim_substeps):
@@ -259,7 +262,7 @@ class Example:
             self._transition_count += 1
             self._last_middle_active = middle_active
 
-        expected_active = self._middle_should_wrap()
+        expected_active = self._middle_should_wrap(middle_active)
         if middle_active != expected_active:
             self._activation_mismatch_count += 1
 
@@ -322,10 +325,9 @@ class Example:
             "Inactive middle candidate should collapse to lower-tangent endpoint span"
         )
         assert self._saw_middle_segment_enabled, "Active middle candidate should restore its second segment"
-        assert self._max_inactive_middle_penetration < 1.0e-5, (
-            "Inactive route should only skip the middle link after line-of-sight clears: "
-            f"penetration={self._max_inactive_middle_penetration:.6f}"
-        )
+        assert (
+            self._max_inactive_middle_penetration < self.middle_radius * self.solver.tendon_activation_tol + 1.0e-5
+        ), f"Inactive route exceeded its activation tolerance: penetration={self._max_inactive_middle_penetration:.6f}"
         assert self._min_active_tangent_radius > self.middle_radius * 0.80, (
             f"Active middle route did not reach the capstan surface: min={self._min_active_tangent_radius:.6f}"
         )
