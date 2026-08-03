@@ -117,15 +117,19 @@ class SolverXPBD(TendonStateMixin, SolverBase):
         enable_restitution: bool = False,
         tendon_max_sweeps: int = 256,
         tendon_settle_tol: float = 1.0e-3,
+        tendon_activation_tol: float = 2.0e-3,
     ):
         super().__init__(model=model)
         self.iterations = iterations
         # Routed-cable capstan cone relaxation: up to tendon_max_sweeps Gauss-Seidel passes, stopping
-        # early once the relaxation has settled -- the max per-sweep relative tension change (largest
-        # tension change / peak tension, dimensionless) falls below tendon_settle_tol. Already-converged
-        # cables stop almost immediately; stiff/transient ones run up to the cap.
+        # early once the relaxation has settled -- the max per-sweep tension change relative to the
+        # first sweep's peak tension falls below tendon_settle_tol. Already-converged cables stop almost
+        # immediately; stiff/transient ones run up to the cap.
         self.tendon_max_sweeps = tendon_max_sweeps
         self.tendon_settle_tol = tendon_settle_tol
+        # Inactive dynamic rollers activate only after entering this fraction of their radius.
+        # Active rollers still deactivate at zero clearance.
+        self.tendon_activation_tol = tendon_activation_tol
 
         self.soft_body_relaxation = soft_body_relaxation
         self.soft_contact_relaxation = soft_contact_relaxation
@@ -715,6 +719,8 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                             dim=model.tendon_count,
                             inputs=[
                                 body_q,
+                                body_qd,
+                                model.body_com,
                                 model.tendon_start,
                                 model.tendon_link_body,
                                 model.tendon_link_type,
@@ -727,6 +733,7 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                                 self.tendon_seg_rest_length,
                                 self.tendon_seg_rest_length_step,
                                 self.tendon_seg_stretch,
+                                self.tendon_seg_damping_tension,
                                 model.tendon_seg_compliance,
                                 model.tendon_seg_damping,
                                 self.tendon_seg_active,
@@ -748,6 +755,7 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                                 self.tendon_cone_sweep_count,
                                 1,
                                 1,
+                                int(i == 0),
                                 1,
                                 self.tendon_max_sweeps,
                                 self.tendon_settle_tol,
@@ -774,6 +782,7 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                                 self.body_inv_inertia_effective,
                                 model.tendon_link_body,
                                 model.tendon_link_type,
+                                model.tendon_link_offset,
                                 model.tendon_link_axis,
                                 self.tendon_seg_rest_length,
                                 self.tendon_seg_attachment_l,
@@ -807,7 +816,6 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                             dim=model.tendon_count,
                             inputs=[
                                 body_q,
-                                model.body_com,
                                 model.tendon_start,
                                 model.tendon_link_body,
                                 model.tendon_link_type,
@@ -820,6 +828,7 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                                 self.tendon_seg_attachment_l,
                                 self.tendon_seg_attachment_r,
                                 self.tendon_seg_active_compliance,
+                                self.tendon_seg_damping_tension,
                                 self.tendon_seg_delta_lambda,
                                 self.joint_linear_relaxation,
                             ],

@@ -1665,7 +1665,14 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_seg_lambda.zero_()
 
         for iter_num in range(self.iterations):
-            self._solve_rigid_body_iteration(state_in, state_out, control, contacts, dt)
+            self._solve_rigid_body_iteration(
+                state_in,
+                state_out,
+                control,
+                contacts,
+                dt,
+                report_unsupported_wrap=iter_num == 0,
+            )
             self._solve_particle_iteration(state_in, state_out, contacts, dt, iter_num)
 
         update_tendon_diagnostics = (
@@ -1678,7 +1685,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
             # The final body update changes tendon geometry after the last
             # in-iteration material solve. Accept its route state before
             # reporting tension or carrying rest lengths into the next step.
-            self._update_tendon_routing(state_in)
+            self._update_tendon_routing(state_in, dt, False)
             self._snapshot_tendon_segment_length_reference()
 
         # Snapshot solved rigid contact state for next-frame warm-start.
@@ -2395,7 +2402,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
 
         wp.copy(state_out.particle_q, state_in.particle_q)
 
-    def _update_tendon_routing(self, state_in: State) -> None:
+    def _update_tendon_routing(self, state_in: State, dt: float, report_unsupported_wrap: bool) -> None:
         """Update VBD routed-tendon geometry and rolling rest transfer for this iteration."""
         model = self.model
         if model.tendon_segment_count == 0 or state_in.body_q is None:
@@ -2406,6 +2413,9 @@ class SolverVBD(TendonStateMixin, SolverBase):
             dim=model.tendon_count,
             inputs=[
                 state_in.body_q,
+                state_in.body_qd,
+                self.body_q_prev,
+                model.body_com,
                 model.tendon_start,
                 model.tendon_link_body,
                 model.tendon_link_type,
@@ -2418,6 +2428,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_seg_rest_length,
                 self.tendon_seg_rest_length_step,
                 self.tendon_seg_stretch,
+                self.tendon_seg_damping_tension,
                 model.tendon_seg_compliance,
                 model.tendon_seg_damping,
                 self.tendon_seg_active,
@@ -2438,7 +2449,10 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_seg_rolling_delta_r,
                 self.tendon_cone_sweep_count,
                 1,
+                dt,
                 1,
+                1,
+                int(report_unsupported_wrap),
                 1,
                 self.tendon_max_sweeps,
                 self.tendon_settle_tol,
@@ -2497,7 +2511,13 @@ class SolverVBD(TendonStateMixin, SolverBase):
         )
 
     def _solve_rigid_body_iteration(
-        self, state_in: State, state_out: State, control: Control, contacts: Contacts | None, dt: float
+        self,
+        state_in: State,
+        state_out: State,
+        control: Control,
+        contacts: Contacts | None,
+        dt: float,
+        report_unsupported_wrap: bool,
     ):
         """Solve one AVBD iteration for rigid bodies (per-iteration phase).
 
@@ -2542,7 +2562,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
         self.body_hessian_al.zero_()
         self.body_hessian_ll.zero_()
 
-        self._update_tendon_routing(state_in)
+        self._update_tendon_routing(state_in, dt, report_unsupported_wrap)
 
         body_color_groups = model.body_color_groups
 

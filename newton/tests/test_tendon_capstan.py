@@ -18,6 +18,7 @@ import warp as wp
 import newton
 from newton._src.sim.builder import Axis
 from newton._src.sim.tendon import TendonLinkFlags, TendonLinkType
+from newton._src.solvers.xpbd.tendon_kernels import solve_tendon_slip
 from newton.examples.cable.cable import get_tendon_cable_lines
 from newton.examples.cable.example_tendon_capstan_friction import Example as DynamicCapstanExample
 from newton.examples.cable.example_tendon_mujoco_switch import Example as MujocoSwitchExample
@@ -821,6 +822,59 @@ def build_oriented_dynamic_route(orientation, device):
     return builder.finalize(device=device), candidate, candidate_link
 
 
+def build_dynamic_route_neighbor_matrix_case(device, left_type, right_type, orientation):
+    """Build an inactive dynamic roller between the requested link types."""
+    builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+    base = builder.add_body(mass=0.0, is_kinematic=True)
+    inactive_position = (0.05, 0.03 * orientation, 0.0)
+    active_position = (0.05, 0.0025 * orientation, 0.0)
+    candidate = builder.add_body(
+        xform=wp.transform(p=wp.vec3(inactive_position)),
+        mass=0.0,
+        is_kinematic=True,
+    )
+
+    axis = (0.0, 0.0, 1.0)
+    builder.add_tendon()
+
+    def add_link(link_type, x, link_orientation):
+        return builder.add_tendon_link(
+            body=base,
+            link_type=int(link_type),
+            radius=0.005 if link_type == TendonLinkType.ROLLING else 0.0,
+            orientation=link_orientation,
+            mu=0.0,
+            offset=(x, 0.0, 0.0),
+            axis=axis,
+            compliance=5.0e-6,
+            damping=5.0,
+            rest_length=-1.0,
+        )
+
+    if left_type != TendonLinkType.ATTACHMENT:
+        add_link(TendonLinkType.ATTACHMENT, 0.0, orientation)
+    add_link(left_type, 0.025, -orientation)
+
+    candidate_link = builder.add_tendon_link(
+        body=candidate,
+        link_type=int(TendonLinkType.ROLLING),
+        radius=0.005,
+        orientation=orientation,
+        mu=0.0,
+        dynamic=True,
+        axis=axis,
+        compliance=5.0e-6,
+        damping=5.0,
+        rest_length=-1.0,
+    )
+
+    add_link(right_type, 0.075, orientation)
+    if right_type != TendonLinkType.ATTACHMENT:
+        add_link(TendonLinkType.ATTACHMENT, 0.10, orientation)
+
+    return builder.finalize(device=device), candidate, candidate_link, inactive_position, active_position
+
+
 def build_loaded_dynamic_route(dynamic: bool, device):
     """Build a force-loaded route with an active roller before the optional roller."""
     builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
@@ -1064,6 +1118,43 @@ def _loaded_route_material_length(solver, model):
     return material_length
 
 
+def _route_material_length(solver, model, state):
+    """Measure active free-span rest length plus rolling-link arcs."""
+    active_segments = solver.tendon_seg_active.numpy().astype(bool)
+    material_length = float(np.sum(solver.tendon_seg_rest_length.numpy()[active_segments]))
+    body_q = state.body_q.numpy()
+    link_type = model.tendon_link_type.numpy()
+    link_body = model.tendon_link_body.numpy()
+    link_offset = model.tendon_link_offset.numpy()
+    link_axis = model.tendon_link_axis.numpy()
+    link_radius = model.tendon_link_radius.numpy()
+    link_active = solver.tendon_link_active.numpy()
+    active_link_l = solver.tendon_seg_active_link_l.numpy()
+    active_link_r = solver.tendon_seg_active_link_r.numpy()
+    att_l = solver.tendon_seg_attachment_l.numpy()
+    att_r = solver.tendon_seg_attachment_r.numpy()
+
+    for link_idx in range(1, model.tendon_link_count - 1):
+        if link_type[link_idx] != int(TendonLinkType.ROLLING) or not link_active[link_idx]:
+            continue
+        left_segments = np.flatnonzero(active_segments & (active_link_r == link_idx))
+        right_segments = np.flatnonzero(active_segments & (active_link_l == link_idx))
+        if len(left_segments) != 1 or len(right_segments) != 1:
+            continue
+        left_seg = int(left_segments[0])
+        right_seg = int(right_segments[0])
+        center = body_q[link_body[link_idx]][:3] + link_offset[link_idx]
+        normal = link_axis[link_idx]
+        radius_l = att_r[left_seg] - center
+        radius_r = att_l[right_seg] - center
+        radius_l -= np.dot(radius_l, normal) * normal
+        radius_r -= np.dot(radius_r, normal) * normal
+        theta = abs(np.atan2(np.dot(np.cross(radius_l, radius_r), normal), np.dot(radius_l, radius_r)))
+        material_length += float(theta * link_radius[link_idx])
+
+    return material_length
+
+
 def _run_loaded_dynamic_route(dynamic, device):
     model, _, anchor_joint, candidate = build_loaded_dynamic_route(dynamic, device)
     solver = newton.solvers.SolverXPBD(model, iterations=12, joint_linear_relaxation=0.9)
@@ -1291,6 +1382,42 @@ def test_force_driven_dynamic_route_updates_inside_solver(test, device):
         )
 
 
+def test_dynamic_route_neighbor_matrix_conserves_material(test, device):
+    """Route transitions should conserve material for every supported neighbor-type pair."""
+    with wp.ScopedDevice(device):
+        neighbor_types = (TendonLinkType.ATTACHMENT, TendonLinkType.PINHOLE, TendonLinkType.ROLLING)
+        for orientation in (-1, 1):
+            for left_type in neighbor_types:
+                for right_type in neighbor_types:
+                    with test.subTest(orientation=orientation, left_type=left_type, right_type=right_type):
+                        model, candidate, candidate_link, inactive_position, active_position = (
+                            build_dynamic_route_neighbor_matrix_case(device, left_type, right_type, orientation)
+                        )
+                        solver = newton.solvers.SolverXPBD(model, iterations=1, joint_linear_relaxation=1.0)
+                        state_0, state_1 = model.state(), model.state()
+
+                        test.assertFalse(solver.tendon_link_active.numpy()[candidate_link])
+                        expected_material_length = _route_material_length(solver, model, state_0)
+
+                        body_q = state_0.body_q.numpy()
+                        body_q[candidate, :3] = active_position
+                        state_0.body_q.assign(body_q)
+                        solver.step(state_0, state_1, model.control(), None, 1.0 / 4800.0)
+
+                        test.assertTrue(solver.tendon_link_active.numpy()[candidate_link])
+                        actual_material_length = _route_material_length(solver, model, state_1)
+                        test.assertAlmostEqual(actual_material_length, expected_material_length, delta=1.0e-5)
+
+                        body_q = state_1.body_q.numpy()
+                        body_q[candidate, :3] = inactive_position
+                        state_1.body_q.assign(body_q)
+                        solver.step(state_1, state_0, model.control(), None, 1.0 / 4800.0)
+
+                        test.assertFalse(solver.tendon_link_active.numpy()[candidate_link])
+                        actual_material_length = _route_material_length(solver, model, state_0)
+                        test.assertAlmostEqual(actual_material_length, expected_material_length, delta=1.0e-5)
+
+
 def test_dynamic_route_initial_state_matches_geometry(test, device):
     """Dynamic links should resolve their initial state before measuring rest lengths."""
     with wp.ScopedDevice(device):
@@ -1343,6 +1470,35 @@ def test_dynamic_route_uses_oriented_signed_distance(test, device):
                 ],
                 f"orientation={orientation}",
             )
+
+
+def test_dynamic_route_activation_tolerance_preserves_boundary_state(test, device):
+    """Dynamic routing should not chatter inside the activation tolerance."""
+    with wp.ScopedDevice(device):
+        radius = 0.1
+        activation_tol = 1.0e-3
+        activation_gap = activation_tol * radius
+        for orientation in (-1, 1):
+            model, candidate, candidate_link = build_oriented_dynamic_route(orientation, device)
+            solver = newton.solvers.SolverXPBD(
+                model,
+                iterations=1,
+                tendon_activation_tol=activation_tol,
+            )
+            body_q = model.body_q.numpy()
+
+            transitions = (
+                (radius - 0.5 * activation_gap, False),
+                (radius - 1.5 * activation_gap, True),
+                (radius - 0.5 * activation_gap, True),
+                (radius + 0.5 * activation_gap, False),
+            )
+            for distance, expected_active in transitions:
+                body_q[candidate, :3] = (distance * orientation, 0.0, 0.0)
+                model.body_q.assign(body_q)
+                solver._update_tendon_link_active(model, model.body_q)
+                actual_active = bool(solver.tendon_link_active.numpy()[candidate_link])
+                test.assertEqual(actual_active, expected_active)
 
 
 def test_dynamic_route_requires_projection_on_bypass_span(test, device):
@@ -1980,6 +2136,311 @@ def test_simple_cable_gravity_tension_independent_of_relaxation(test, device):
             )
 
 
+def test_frictionless_pinhole_equalizes_damped_tension(test, device):
+    """A frictionless route must balance total tension, including axial damping."""
+    with wp.ScopedDevice(device):
+        length_rate = 1.0e-3
+        compliance = 0.1
+        for initial_tension in (0.0, 1.0):
+            for damping in (0.0, 5.0, 100.0, 200.0):
+                with test.subTest(initial_tension=initial_tension, damping=damping):
+                    rest_length = 1.0 - compliance * initial_tension
+                    builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+                    left = builder.add_body(
+                        xform=wp.transform(p=wp.vec3(-1.0, 0.0, 0.0)),
+                        mass=0.0,
+                        is_kinematic=True,
+                    )
+                    pin = builder.add_body(
+                        xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.0)),
+                        mass=0.0,
+                        is_kinematic=True,
+                    )
+                    right = builder.add_body(
+                        xform=wp.transform(p=wp.vec3(1.0, 0.0, 0.0)),
+                        mass=0.0,
+                        is_kinematic=True,
+                    )
+                    builder.add_tendon()
+                    builder.add_tendon_link(
+                        body=left,
+                        link_type=int(TendonLinkType.ATTACHMENT),
+                    )
+                    builder.add_tendon_link(
+                        body=pin,
+                        link_type=int(TendonLinkType.PINHOLE),
+                        compliance=compliance,
+                        damping=damping,
+                        rest_length=rest_length,
+                    )
+                    builder.add_tendon_link(
+                        body=right,
+                        link_type=int(TendonLinkType.ATTACHMENT),
+                        compliance=compliance,
+                        damping=damping,
+                        rest_length=rest_length,
+                    )
+
+                    model = builder.finalize()
+                    solver = newton.solvers.SolverXPBD(
+                        model,
+                        iterations=1,
+                        joint_linear_relaxation=1.0,
+                        tendon_max_sweeps=32,
+                        tendon_settle_tol=1.0e-3,
+                    )
+                    state_0, state_1 = model.state(), model.state()
+                    body_qd = state_0.body_qd.numpy()
+                    body_qd[left, 0] = -length_rate
+                    state_0.body_qd.assign(body_qd)
+                    dt = 0.01
+
+                    solver.step(state_0, state_1, model.control(), None, dt)
+
+                    tension = -solver.tendon_seg_lambda.numpy() / dt
+                    expected_tension = initial_tension + 0.5 * damping * length_rate
+                    test.assertAlmostEqual(
+                        float(tension[0]),
+                        float(tension[1]),
+                        delta=1.0e-5,
+                        msg=f"Frictionless spans should balance damped tension: {tension}",
+                    )
+                    test.assertAlmostEqual(float(tension[0]), expected_tension, delta=1.0e-5)
+                    test.assertLess(int(solver.tendon_cone_sweep_count.numpy()[0]), 32)
+
+
+def test_tendon_damping_does_not_generate_compression(test, device):
+    """Axial damping may reduce cable tension to zero but cannot make it compressive."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        left = builder.add_body(
+            xform=wp.transform(p=wp.vec3(-1.0, 0.0, 0.0)),
+            mass=0.0,
+            is_kinematic=True,
+        )
+        right = builder.add_body(
+            xform=wp.transform(p=wp.vec3(1.0, 0.0, 0.0)),
+            mass=0.0,
+            is_kinematic=True,
+        )
+        builder.add_tendon()
+        builder.add_tendon_link(body=left, link_type=int(TendonLinkType.ATTACHMENT))
+        builder.add_tendon_link(
+            body=right,
+            link_type=int(TendonLinkType.ATTACHMENT),
+            compliance=0.1,
+            damping=2.0,
+            rest_length=1.9,
+        )
+
+        model = builder.finalize()
+        solver = newton.solvers.SolverXPBD(
+            model,
+            iterations=1,
+            joint_linear_relaxation=1.0,
+        )
+        state_0, state_1 = model.state(), model.state()
+        body_qd = state_0.body_qd.numpy()
+        body_qd[left, 0] = 1.0
+        state_0.body_qd.assign(body_qd)
+        dt = 0.01
+
+        solver.step(state_0, state_1, model.control(), None, dt)
+
+        tension = -float(solver.tendon_seg_lambda.numpy()[0]) / dt
+        test.assertAlmostEqual(tension, 0.0, delta=1.0e-6)
+
+
+def test_tendon_slip_uses_true_segment_compliance(test, device):
+    """The rolling-slip cone should use the same physical tension as material transfer."""
+    with wp.ScopedDevice(device):
+        compliance_l = 1.0e-9
+        compliance_r = 1.0e-7
+        rest_l = 1.0 - 1.0e-6
+        rest_r = 1.0 - 1.0e-4
+        mu = 0.1
+
+        body_q = wp.array([wp.transform_identity()], dtype=wp.transform)
+        tendon_start = wp.array([0, 3], dtype=int)
+        tendon_link_body = wp.array([0, 0, 0], dtype=int)
+        tendon_link_type = wp.array(
+            [int(TendonLinkType.ATTACHMENT), int(TendonLinkType.ROLLING), int(TendonLinkType.ATTACHMENT)],
+            dtype=int,
+        )
+        tendon_link_radius = wp.array([0.0, 1.0, 0.0], dtype=float)
+        tendon_link_mu = wp.array([0.0, mu, 0.0], dtype=float)
+        tendon_link_active = wp.ones(3, dtype=bool)
+        tendon_link_offset = wp.zeros(3, dtype=wp.vec3)
+        tendon_link_axis = wp.array([wp.vec3(0.0, 1.0, 0.0)] * 3, dtype=wp.vec3)
+        seg_rest_length = wp.array([rest_l, rest_r], dtype=float)
+        seg_attachment_l = wp.array([wp.vec3(-1.0, 0.0, -1.0), wp.vec3(1.0, 0.0, 0.0)], dtype=wp.vec3)
+        seg_attachment_r = wp.array([wp.vec3(-1.0, 0.0, 0.0), wp.vec3(1.0, 0.0, -1.0)], dtype=wp.vec3)
+        seg_compliance = wp.array([compliance_l, compliance_r], dtype=float)
+        seg_damping_tension = wp.zeros(2, dtype=float)
+        seg_delta_lambda = wp.array([-1.0, 0.0], dtype=float)
+        body_deltas = wp.zeros(1, dtype=wp.spatial_vector)
+
+        wp.launch(
+            solve_tendon_slip,
+            dim=1,
+            inputs=[
+                body_q,
+                tendon_start,
+                tendon_link_body,
+                tendon_link_type,
+                tendon_link_radius,
+                tendon_link_mu,
+                tendon_link_active,
+                tendon_link_offset,
+                tendon_link_axis,
+                seg_rest_length,
+                seg_attachment_l,
+                seg_attachment_r,
+                seg_compliance,
+                seg_damping_tension,
+                seg_delta_lambda,
+                1.0,
+            ],
+            outputs=[body_deltas],
+        )
+
+        rest = seg_rest_length.numpy()
+        compliance = seg_compliance.numpy()
+        force_l = (1.0 - float(rest[0])) / float(compliance[0])
+        force_r = (1.0 - float(rest[1])) / float(compliance[1])
+        cap_ratio = math.exp(mu * math.pi)
+        beta = (cap_ratio - 1.0) / (cap_ratio + 1.0)
+        scale = min(1.0, beta * (force_l + force_r) / max(abs(force_l - force_r), 1.0e-8))
+        expected_spin_y = -scale * beta
+
+        test.assertAlmostEqual(float(body_deltas.numpy()[0, 4]), expected_spin_y, delta=1.0e-6)
+
+
+def test_same_body_tendon_segment_reports_constitutive_tension(test, device):
+    """A segment internal to one rigid body should not acquire effective mass."""
+    with wp.ScopedDevice(device):
+        length = 1.0e-3
+        compliance = 1.0e-8
+        rest_length = 0.99 * length
+
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        body = builder.add_body(
+            mass=1.0,
+            inertia=wp.mat33(
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+            ),
+            lock_inertia=True,
+        )
+        builder.add_tendon()
+        builder.add_tendon_link(
+            body=body,
+            link_type=int(TendonLinkType.ATTACHMENT),
+            offset=(-0.5 * length, 0.0, 0.0),
+        )
+        builder.add_tendon_link(
+            body=body,
+            link_type=int(TendonLinkType.ATTACHMENT),
+            offset=(0.5 * length, 0.0, 0.0),
+            compliance=compliance,
+            rest_length=rest_length,
+        )
+
+        model = builder.finalize()
+        solver = newton.solvers.SolverXPBD(model, iterations=1, joint_linear_relaxation=1.0)
+        state_0, state_1 = model.state(), model.state()
+        initial_pose = state_0.body_q.numpy().copy()
+        dt = 1.0 / 120.0
+
+        state_0.clear_forces()
+        solver.step(state_0, state_1, model.control(), None, dt)
+
+        span_length = float(
+            np.linalg.norm(solver.tendon_seg_attachment_r.numpy()[0] - solver.tendon_seg_attachment_l.numpy()[0])
+        )
+        expected_tension = (span_length - rest_length) / compliance
+        lambda_tension = float(-solver.tendon_seg_lambda.numpy()[0] / dt)
+
+        test.assertAlmostEqual(lambda_tension, expected_tension, delta=0.1)
+        np.testing.assert_allclose(state_1.body_q.numpy(), initial_pose, rtol=0.0, atol=1.0e-7)
+
+
+def test_rolling_link_body_preserves_center_motion_jacobian(test, device):
+    """A rolling endpoint must retain torque caused by motion of its center."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        anchor = builder.add_body(xform=wp.transform(p=wp.vec3(0.5, -1.5, 0.0)), mass=0.0)
+        link = builder.add_link(
+            mass=1.0,
+            inertia=wp.mat33(
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+            ),
+            lock_inertia=True,
+        )
+        joint = builder.add_joint_revolute(
+            parent=-1,
+            child=link,
+            axis=Axis.Z,
+            target_ke=0.0,
+            target_kd=0.0,
+        )
+        builder.add_articulation([joint])
+
+        builder.add_tendon()
+        builder.add_tendon_link(body=anchor, link_type=int(TendonLinkType.ATTACHMENT))
+        builder.add_tendon_link(
+            body=link,
+            link_type=int(TendonLinkType.ROLLING),
+            radius=0.2,
+            orientation=-1,
+            mu=0.0,
+            offset=(2.5, 2.5, 0.0),
+            compliance=1.0e-3,
+            rest_length=-1.0,
+        )
+        builder.add_tendon_link(
+            body=link,
+            link_type=int(TendonLinkType.ATTACHMENT),
+            offset=(1.5, -2.5, 0.0),
+            compliance=1.0e-3,
+            rest_length=-1.0,
+        )
+
+        model = builder.finalize()
+        solver = newton.solvers.SolverXPBD(model, iterations=8, joint_linear_relaxation=1.0)
+        span_lengths = np.linalg.norm(
+            solver.tendon_seg_attachment_r.numpy() - solver.tendon_seg_attachment_l.numpy(), axis=1
+        )
+        solver.tendon_seg_rest_length.assign(span_lengths - 0.01)
+
+        # The total routed length increases with positive joint rotation in this
+        # geometry, so tension must drive the joint in the negative direction.
+        state_0, state_1 = model.state(), model.state()
+        for _ in range(4):
+            state_0.clear_forces()
+            solver.step(state_0, state_1, model.control(), None, 1.0 / 120.0)
+            state_0, state_1 = state_1, state_0
+
+        newton.eval_ik(model, state_0, model.joint_q, model.joint_qd)
+        joint_q = int(model.joint_q_start.numpy()[joint])
+        test.assertLess(float(model.joint_q.numpy()[joint_q]), -1.0e-3)
+
+
 def test_motorized_pulley_drives_slider(test, device):
     """A rolling drive pulley must convert rotation into cable sliding."""
     with wp.ScopedDevice(device):
@@ -2483,6 +2944,45 @@ def test_settle_tol_early_out_matches_full_sweeps(test, device):
         test.assertLess(early, 0.81, f"early-out over-shoots capstan bound: {early:.4f}, target={target:.4f}")
 
 
+def test_slack_tendon_settles_without_chasing_vanishing_tension(test, device):
+    """An almost-slack tendon should not chase a vanishing relative tension scale."""
+    with wp.ScopedDevice(device):
+
+        def run(settle_tol, max_sweeps):
+            model, initial_rest, _ = build_frictionless_zero_span_route(
+                compliance=1.0e-4,
+                points=[
+                    (0.0, 0.0, 0.0),
+                    (1.0, 0.0, 0.0),
+                    (2.0, 0.0, 0.0),
+                    (3.0, 0.0, 0.0),
+                ],
+                rest_lengths=[1.001, 0.9999999, 1.001],
+            )
+            solver = newton.solvers.SolverXPBD(
+                model,
+                iterations=1,
+                tendon_max_sweeps=max_sweeps,
+                tendon_settle_tol=settle_tol,
+            )
+            state_0, state_1 = model.state(), model.state()
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+            solver.step(state_0, state_1, model.control(), None, 1.0 / 60.0)
+            return (
+                solver.tendon_seg_rest_length.numpy(),
+                int(solver.tendon_cone_sweep_count.numpy()[0]),
+                initial_rest,
+            )
+
+        early_rest, early_sweeps, initial_rest = run(1.0e-3, 16)
+        full_rest, full_sweeps, _ = run(0.0, 64)
+
+        test.assertLess(early_sweeps, 16, f"Slack tendon should settle before the budget, got {early_sweeps} sweeps")
+        test.assertEqual(full_sweeps, 64, "Zero tolerance should run the requested full sweep budget")
+        np.testing.assert_allclose(early_rest, full_rest, rtol=1.0e-6, atol=1.0e-6)
+        np.testing.assert_allclose(np.sum(early_rest), np.sum(initial_rest), rtol=1.0e-6, atol=1.0e-6)
+
+
 devices = ["cpu"]
 if wp.is_cuda_available():
     devices.append("cuda:0")
@@ -2544,6 +3044,30 @@ add_test(
 )
 add_test(
     TestTendonCapstan,
+    "frictionless_pinhole_equalizes_damped_tension",
+    devices,
+    test_frictionless_pinhole_equalizes_damped_tension,
+)
+add_test(
+    TestTendonCapstan,
+    "tendon_damping_does_not_generate_compression",
+    devices,
+    test_tendon_damping_does_not_generate_compression,
+)
+add_test(
+    TestTendonCapstan,
+    "same_body_tendon_segment_reports_constitutive_tension",
+    devices,
+    test_same_body_tendon_segment_reports_constitutive_tension,
+)
+add_test(
+    TestTendonCapstan,
+    "rolling_link_body_preserves_center_motion_jacobian",
+    devices,
+    test_rolling_link_body_preserves_center_motion_jacobian,
+)
+add_test(
+    TestTendonCapstan,
     "mujoco_wrap_straight_bypass_activates_and_deactivates",
     devices,
     test_mujoco_wrap_straight_bypass_activates_and_deactivates,
@@ -2556,6 +3080,12 @@ add_test(
 )
 add_test(
     TestTendonCapstan,
+    "dynamic_route_neighbor_matrix_conserves_material",
+    devices,
+    test_dynamic_route_neighbor_matrix_conserves_material,
+)
+add_test(
+    TestTendonCapstan,
     "dynamic_route_initial_state_matches_geometry",
     devices,
     test_dynamic_route_initial_state_matches_geometry,
@@ -2565,6 +3095,12 @@ add_test(
     "dynamic_route_uses_oriented_signed_distance",
     devices,
     test_dynamic_route_uses_oriented_signed_distance,
+)
+add_test(
+    TestTendonCapstan,
+    "dynamic_route_activation_tolerance_preserves_boundary_state",
+    devices,
+    test_dynamic_route_activation_tolerance_preserves_boundary_state,
 )
 add_test(
     TestTendonCapstan,
@@ -2615,6 +3151,12 @@ add_test(
     "mujoco_switch_matrix_uses_tangent_bypass_geometry",
     devices,
     test_mujoco_switch_matrix_uses_tangent_bypass_geometry,
+)
+add_test(
+    TestTendonCapstan,
+    "tendon_slip_uses_true_segment_compliance",
+    devices,
+    test_tendon_slip_uses_true_segment_compliance,
 )
 add_test(TestTendonCapstan, "motorized_pulley_drives_slider", devices, test_motorized_pulley_drives_slider)
 add_test(
@@ -2676,6 +3218,12 @@ add_test(
     "settle_tol_early_out_matches_full_sweeps",
     devices,
     test_settle_tol_early_out_matches_full_sweeps,
+)
+add_test(
+    TestTendonCapstan,
+    "slack_tendon_settles_without_chasing_vanishing_tension",
+    devices,
+    test_slack_tendon_settles_without_chasing_vanishing_tension,
 )
 
 

@@ -105,14 +105,22 @@ class TendonStateMixin:
             self.tendon_max_sweeps = 256
         if not hasattr(self, "tendon_settle_tol"):
             self.tendon_settle_tol = 1.0e-3
+        if not hasattr(self, "tendon_activation_tol"):
+            self.tendon_activation_tol = 2.0e-3
         if not 1 <= self.tendon_max_sweeps <= 256:
             raise ValueError(f"tendon_max_sweeps must be between 1 and 256, got {self.tendon_max_sweeps}")
         if self.tendon_settle_tol < 0.0:
             raise ValueError(f"tendon_settle_tol must be non-negative, got {self.tendon_settle_tol}")
+        if not 0.0 <= self.tendon_activation_tol < 1.0:
+            raise ValueError(
+                f"tendon_activation_tol must be between 0 (inclusive) and 1 (exclusive), "
+                f"got {self.tendon_activation_tol}"
+            )
         if model.tendon_segment_count == 0:
             self.tendon_seg_rest_length = None
             self.tendon_seg_rest_length_step = None
             self.tendon_seg_stretch = None
+            self.tendon_seg_damping_tension = None
             self.tendon_seg_attachment_l = None
             self.tendon_seg_attachment_r = None
             self.tendon_seg_attachment_l_local = None
@@ -152,6 +160,8 @@ class TendonStateMixin:
             )
             self.tendon_seg_rolling_delta_l = wp.zeros(model.tendon_segment_count, dtype=float)
             self.tendon_seg_rolling_delta_r = wp.zeros(model.tendon_segment_count, dtype=float)
+            # Cached instantaneous damping term used by routing and slip projections.
+            self.tendon_seg_damping_tension = wp.zeros(model.tendon_segment_count, dtype=float)
             self.tendon_cone_sweep_count = wp.zeros(model.tendon_count, dtype=wp.int32)
             self.tendon_seg_active = wp.ones(model.tendon_segment_count, dtype=wp.int32)
             self.tendon_seg_active_link_l = wp.zeros(model.tendon_segment_count, dtype=wp.int32)
@@ -248,6 +258,7 @@ class TendonStateMixin:
                 model.tendon_link_orientation,
                 model.tendon_link_offset,
                 model.tendon_link_axis,
+                self.tendon_activation_tol,
                 self.tendon_link_active,
             ],
             device=model.device,
@@ -354,6 +365,8 @@ class TendonStateMixin:
             dim=model.tendon_count,
             inputs=[
                 body_q,
+                model.body_qd,
+                model.body_com,
                 model.tendon_start,
                 model.tendon_link_body,
                 model.tendon_link_type,
@@ -366,6 +379,7 @@ class TendonStateMixin:
                 self.tendon_seg_rest_length,
                 self.tendon_seg_rest_length_step,
                 self.tendon_seg_stretch,
+                self.tendon_seg_damping_tension,
                 model.tendon_seg_compliance,
                 model.tendon_seg_damping,
                 self.tendon_seg_active,
@@ -385,6 +399,7 @@ class TendonStateMixin:
                 self.tendon_seg_rolling_delta_l,
                 self.tendon_seg_rolling_delta_r,
                 self.tendon_cone_sweep_count,
+                0,
                 0,
                 0,
                 0,
