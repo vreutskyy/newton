@@ -1695,13 +1695,12 @@ def solve_body_joints(
                 dt,
             )
 
-            d_lambda_linear = d_lambda * linear_relaxation
-            d_lambda_angular = d_lambda * angular_relaxation
-            constraint_lambda_linear[0] += d_lambda_linear
-            lin_delta_p += linear_p * d_lambda_linear
-            ang_delta_p += angular_p * d_lambda_angular
-            lin_delta_c += linear_c * d_lambda_linear
-            ang_delta_c += angular_c * d_lambda_angular
+            d_lambda *= linear_relaxation
+            constraint_lambda_linear[0] += d_lambda
+            lin_delta_p += linear_p * d_lambda
+            ang_delta_p += angular_p * d_lambda
+            lin_delta_c += linear_c * d_lambda
+            ang_delta_c += angular_c * d_lambda
         else:
             constraint_lambda_linear[0] = 0.0
 
@@ -1851,16 +1850,15 @@ def solve_body_joints(
                     dt,
                 )
 
-                d_lambda_linear = d_lambda * linear_relaxation
-                d_lambda_angular = d_lambda * angular_relaxation
+                d_lambda *= linear_relaxation
                 if limit_active:
-                    constraint_lambda_linear[dim] += d_lambda_linear
+                    constraint_lambda_linear[dim] += d_lambda
                 elif drive_active:
-                    drive_lambda_linear[dim] += d_lambda_linear
-                lin_delta_p += linear_p * d_lambda_linear
-                ang_delta_p += angular_p * d_lambda_angular
-                lin_delta_c += linear_c * d_lambda_linear
-                ang_delta_c += angular_c * d_lambda_angular
+                    drive_lambda_linear[dim] += d_lambda
+                lin_delta_p += linear_p * d_lambda
+                ang_delta_p += angular_p * d_lambda
+                lin_delta_c += linear_c * d_lambda
+                ang_delta_c += angular_c * d_lambda
 
     if type == JointType.FIXED or type == JointType.PRISMATIC or type == JointType.REVOLUTE or type == JointType.D6:
         # handle angular constraints
