@@ -18,7 +18,8 @@ import warp as wp
 import newton
 from newton._src.sim.builder import Axis
 from newton._src.sim.tendon import TendonLinkFlags, TendonLinkType
-from newton._src.solvers.xpbd.tendon_kernels import solve_tendon_slip
+from newton._src.solvers.tendon_kernels import tendon_segment_length_rate
+from newton._src.solvers.xpbd.tendon_kernels import solve_tendon_slip, solve_tendon_stretch
 from newton.examples.cable.cable import get_tendon_cable_lines
 from newton.examples.cable.example_tendon_capstan_friction import Example as DynamicCapstanExample
 from newton.examples.cable.example_tendon_mujoco_switch import Example as MujocoSwitchExample
@@ -32,6 +33,37 @@ SIGMOID_TENDON_MATERIAL = {
     "tendon_sigmoid_transition_strain": 0.005,
     "tendon_sigmoid_transition_width": 0.0008,
 }
+
+
+@wp.kernel
+def _measure_tendon_segment_length_rates(
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    tendon_link_body: wp.array[int],
+    tendon_link_type: wp.array[int],
+    tendon_link_offset: wp.array[wp.vec3],
+    tendon_link_axis: wp.array[wp.vec3],
+    seg_active_link_l: wp.array[int],
+    seg_active_link_r: wp.array[int],
+    seg_attachment_l: wp.array[wp.vec3],
+    seg_attachment_r: wp.array[wp.vec3],
+    length_rates: wp.array[float],
+):
+    seg = wp.tid()
+    length_rates[seg] = tendon_segment_length_rate(
+        body_q,
+        body_qd,
+        body_com,
+        tendon_link_body,
+        tendon_link_type,
+        tendon_link_offset,
+        tendon_link_axis,
+        seg_active_link_l[seg],
+        seg_active_link_r[seg],
+        seg_attachment_l[seg],
+        seg_attachment_r[seg],
+    )
 
 
 def add_test(cls, name, devices, test_fn):
@@ -2456,6 +2488,170 @@ def test_same_body_tendon_segment_reports_constitutive_tension(test, device):
         np.testing.assert_allclose(state_1.body_q.numpy(), initial_pose, rtol=0.0, atol=1.0e-7)
 
 
+def test_same_body_rolling_route_matches_length_gradient(test, device):
+    """Stretch and damping rows must differentiate the complete routed length."""
+    with wp.ScopedDevice(device):
+        anchor_point = np.array([-0.8, -0.5], dtype=np.float64)
+        roller_center_local = np.array([0.1, 0.15], dtype=np.float64)
+        attachment_local = np.array([0.5, -0.3], dtype=np.float64)
+        radius = 0.12
+        angle = 0.23
+
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        anchor = builder.add_body(
+            xform=wp.transform(p=wp.vec3(anchor_point[0], anchor_point[1], 0.0)),
+            mass=0.0,
+            is_kinematic=True,
+        )
+        body = builder.add_body(
+            xform=wp.transform(q=wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), angle)),
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3)),
+            lock_inertia=True,
+        )
+        builder.add_tendon()
+        builder.add_tendon_link(body=anchor, link_type=int(TendonLinkType.ATTACHMENT))
+        builder.add_tendon_link(
+            body=body,
+            link_type=int(TendonLinkType.ROLLING),
+            radius=radius,
+            orientation=-1,
+            mu=0.0,
+            offset=(*roller_center_local, 0.0),
+            compliance=1.0e-3,
+            rest_length=-1.0,
+        )
+        builder.add_tendon_link(
+            body=body,
+            link_type=int(TendonLinkType.ATTACHMENT),
+            offset=(*attachment_local, 0.0),
+            compliance=1.0e-3,
+            rest_length=-1.0,
+        )
+
+        model = builder.finalize()
+        solver = newton.solvers.SolverXPBD(model, iterations=1, joint_linear_relaxation=1.0)
+        state = model.state()
+        attachment_l = solver.tendon_seg_attachment_l.numpy()
+        attachment_r = solver.tendon_seg_attachment_r.numpy()
+        tangent_left_ref = attachment_r[0, :2].astype(np.float64)
+        tangent_right_ref = attachment_l[1, :2].astype(np.float64)
+
+        def rotate(point, q):
+            c = math.cos(q)
+            s = math.sin(q)
+            return np.array([c * point[0] - s * point[1], s * point[0] + c * point[1]])
+
+        def tangent_point(point, center, reference):
+            offset = point - center
+            distance_sq = float(np.dot(offset, offset))
+            base = center + radius * radius * offset / distance_sq
+            perpendicular = np.array([-offset[1], offset[0]])
+            tangent_offset = radius * math.sqrt(distance_sq - radius * radius) * perpendicular / distance_sq
+            candidates = (base + tangent_offset, base - tangent_offset)
+            return min(candidates, key=lambda candidate: np.linalg.norm(candidate - reference))
+
+        def routed_length(q):
+            center = rotate(roller_center_local, q)
+            attachment = rotate(attachment_local, q)
+            tangent_left = tangent_point(anchor_point, center, tangent_left_ref)
+            tangent_right = tangent_point(attachment, center, tangent_right_ref)
+            radial_left = (tangent_left - center) / radius
+            radial_right = (tangent_right - center) / radius
+            wrap_angle = abs(
+                math.atan2(
+                    radial_left[0] * radial_right[1] - radial_left[1] * radial_right[0],
+                    float(np.dot(radial_left, radial_right)),
+                )
+            )
+            return (
+                np.linalg.norm(tangent_left - anchor_point)
+                + radius * wrap_angle
+                + np.linalg.norm(attachment - tangent_right)
+            )
+
+        finite_difference_step = 1.0e-2
+        expected_gradient = (
+            routed_length(angle + finite_difference_step) - routed_length(angle - finite_difference_step)
+        ) / (2.0 * finite_difference_step)
+
+        span_lengths = np.linalg.norm(attachment_r - attachment_l, axis=1)
+        solver.tendon_seg_rest_length.assign(span_lengths - 0.01)
+        solver.tendon_seg_lambda.zero_()
+        solver.tendon_seg_delta_lambda.zero_()
+        body_deltas = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
+        zero_inv_mass = wp.zeros(model.body_count, dtype=float, device=model.device)
+        zero_inv_inertia = wp.zeros(model.body_count, dtype=wp.mat33, device=model.device)
+        dt = 1.0 / 120.0
+
+        wp.launch(
+            kernel=solve_tendon_stretch,
+            dim=model.tendon_segment_count,
+            inputs=[
+                state.body_q,
+                state.body_qd,
+                model.body_com,
+                zero_inv_mass,
+                zero_inv_inertia,
+                model.tendon_link_body,
+                model.tendon_link_type,
+                model.tendon_link_offset,
+                model.tendon_link_axis,
+                solver.tendon_seg_rest_length,
+                solver.tendon_seg_attachment_l,
+                solver.tendon_seg_attachment_r,
+                solver.tendon_seg_attachment_l_local,
+                solver.tendon_seg_attachment_r_local,
+                solver.tendon_seg_active_compliance,
+                solver.tendon_seg_active_damping,
+                solver.tendon_seg_lambda,
+                solver.tendon_seg_delta_lambda,
+                solver.tendon_seg_active,
+                solver.tendon_seg_active_link_l,
+                solver.tendon_seg_active_link_r,
+                1.0 / dt,
+                1.0,
+                dt,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ],
+            outputs=[body_deltas],
+            device=model.device,
+        )
+
+        delta_lambda = solver.tendon_seg_delta_lambda.numpy()
+        test.assertAlmostEqual(float(delta_lambda[0]), float(delta_lambda[1]), delta=1.0e-6)
+        stretch_gradient = float(body_deltas.numpy()[body, 5] / np.mean(delta_lambda))
+        test.assertAlmostEqual(stretch_gradient, expected_gradient, delta=1.0e-4)
+
+        body_qd = np.zeros((model.body_count, 6), dtype=np.float32)
+        body_qd[body, 5] = 1.0
+        state.body_qd.assign(wp.array(body_qd, dtype=wp.spatial_vector, device=device))
+        length_rates = wp.zeros(model.tendon_segment_count, dtype=float, device=model.device)
+        wp.launch(
+            kernel=_measure_tendon_segment_length_rates,
+            dim=model.tendon_segment_count,
+            inputs=[
+                state.body_q,
+                state.body_qd,
+                model.body_com,
+                model.tendon_link_body,
+                model.tendon_link_type,
+                model.tendon_link_offset,
+                model.tendon_link_axis,
+                solver.tendon_seg_active_link_l,
+                solver.tendon_seg_active_link_r,
+                solver.tendon_seg_attachment_l,
+                solver.tendon_seg_attachment_r,
+            ],
+            outputs=[length_rates],
+            device=model.device,
+        )
+        test.assertAlmostEqual(float(np.sum(length_rates.numpy())), expected_gradient, delta=1.0e-4)
+
+
 def test_rolling_link_body_preserves_center_motion_jacobian(test, device):
     """A rolling endpoint must retain torque caused by motion of its center."""
     with wp.ScopedDevice(device):
@@ -3219,6 +3415,12 @@ add_test(
     "same_body_tendon_segment_reports_constitutive_tension",
     devices,
     test_same_body_tendon_segment_reports_constitutive_tension,
+)
+add_test(
+    TestTendonCapstan,
+    "same_body_rolling_route_matches_length_gradient",
+    devices,
+    test_same_body_rolling_route_matches_length_gradient,
 )
 add_test(
     TestTendonCapstan,
