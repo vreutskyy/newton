@@ -2366,6 +2366,50 @@ def test_xpbd_off_center_joint_damping_convergence(test, device):
     np.testing.assert_allclose(velocities, velocities[-1], rtol=0.003)
 
 
+def test_xpbd_off_center_joint_force_independent_of_angular_relaxation(test, device):
+    mass = 0.15
+    com_y = 0.03875
+    inertia_z = 2.0e-4
+    force_x = 20.0
+    dt = 1.0 / 480.0
+
+    def simulate(joint_type, angular_relaxation):
+        builder = newton.ModelBuilder(gravity=0.0, up_axis=newton.Axis.Z)
+        body = builder.add_link(
+            mass=mass,
+            inertia=wp.mat33(inertia_z, 0.0, 0.0, 0.0, inertia_z, 0.0, 0.0, 0.0, inertia_z),
+            com=wp.vec3(0.0, com_y, 0.0),
+        )
+        if joint_type == "ball":
+            joint = builder.add_joint_ball(parent=-1, child=body)
+        else:
+            joint = builder.add_joint_revolute(parent=-1, child=body, axis=newton.Axis.Z)
+        builder.add_articulation([joint])
+        model = builder.finalize(device=device)
+        solver = newton.solvers.SolverXPBD(
+            model,
+            iterations=128,
+            joint_linear_relaxation=0.7,
+            joint_angular_relaxation=angular_relaxation,
+        )
+        state_0 = model.state()
+        state_1 = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+        body_f = np.zeros((model.body_count, 6), dtype=np.float32)
+        body_f[body, 0] = force_x
+        state_0.body_f.assign(body_f)
+        solver.step(state_0, state_1, model.control(), None, dt)
+        body_q = state_1.body_q.numpy()[body]
+        return 2.0 * np.arctan2(body_q[5], body_q[6])
+
+    expected = -com_y * force_x / (inertia_z + mass * com_y * com_y) * dt * dt
+    for joint_type in ("ball", "revolute"):
+        with test.subTest(joint_type=joint_type):
+            angles = np.array([simulate(joint_type, relaxation) for relaxation in (0.4, 0.7)])
+            np.testing.assert_allclose(angles, expected, rtol=0.005)
+            np.testing.assert_allclose(angles, angles[-1], rtol=1.0e-4)
+
+
 def test_xpbd_compliant_joint_limit_independent_of_iterations(test, device):
     def simulate(iterations):
         builder = newton.ModelBuilder(gravity=0.0, up_axis=newton.Axis.Z)
@@ -2431,6 +2475,13 @@ add_function_test(
     TestSolverXPBD,
     "test_xpbd_off_center_joint_damping_convergence",
     test_xpbd_off_center_joint_damping_convergence,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_off_center_joint_force_independent_of_angular_relaxation",
+    test_xpbd_off_center_joint_force_independent_of_angular_relaxation,
     devices=devices,
     check_output=False,
 )
