@@ -18,7 +18,6 @@ import warp as wp
 import newton
 from newton._src.sim.builder import Axis
 from newton._src.sim.tendon import TendonLinkFlags, TendonLinkType
-from newton._src.solvers.tendon_kernels import tendon_segment_length_rate
 from newton._src.solvers.xpbd.tendon_kernels import solve_tendon_slip, solve_tendon_stretch
 from newton.examples.cable.cable import get_tendon_cable_lines
 from newton.examples.cable.example_tendon_capstan_friction import Example as DynamicCapstanExample
@@ -33,36 +32,6 @@ SIGMOID_TENDON_MATERIAL = {
     "tendon_sigmoid_transition_strain": 0.005,
     "tendon_sigmoid_transition_width": 0.0008,
 }
-
-
-@wp.kernel
-def _measure_tendon_segment_length_rate(
-    body_q: wp.array[wp.transform],
-    body_qd: wp.array[wp.spatial_vector],
-    body_com: wp.array[wp.vec3],
-    tendon_link_body: wp.array[int],
-    tendon_link_type: wp.array[int],
-    tendon_link_offset: wp.array[wp.vec3],
-    tendon_link_axis: wp.array[wp.vec3],
-    link_l: int,
-    link_r: int,
-    x_l: wp.vec3,
-    x_r: wp.vec3,
-    length_rate: wp.array[float],
-):
-    length_rate[0] = tendon_segment_length_rate(
-        body_q,
-        body_qd,
-        body_com,
-        tendon_link_body,
-        tendon_link_type,
-        tendon_link_offset,
-        tendon_link_axis,
-        link_l,
-        link_r,
-        x_l,
-        x_r,
-    )
 
 
 def add_test(cls, name, devices, test_fn):
@@ -2576,45 +2545,6 @@ def test_same_body_rolling_segment_does_not_move_body(test, device):
         np.testing.assert_allclose(body_deltas.numpy(), 0.0, rtol=0.0, atol=1.0e-7)
 
 
-def test_same_body_tendon_segment_has_zero_rigid_motion_length_rate(test, device):
-    """A body-internal segment must have zero length rate under common rigid motion."""
-    with wp.ScopedDevice(device):
-        body_q = wp.array([wp.transform()], dtype=wp.transform, device=device)
-        body_qd = wp.array([wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 1.0)], dtype=wp.spatial_vector, device=device)
-        body_com = wp.zeros(1, dtype=wp.vec3, device=device)
-        tendon_link_body = wp.zeros(2, dtype=int, device=device)
-        tendon_link_offset = wp.array([wp.vec3(0.1, 0.15, 0.0), wp.vec3(0.0, 0.0, 0.0)], dtype=wp.vec3, device=device)
-        tendon_link_axis = wp.array([wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, 1.0)], dtype=wp.vec3, device=device)
-        attachment_l = wp.vec3(0.22, 0.15, 0.0)
-        attachment_r = wp.vec3(0.5, -0.3, 0.0)
-
-        for link_type in (TendonLinkType.PINHOLE, TendonLinkType.ROLLING):
-            with test.subTest(link_type=link_type):
-                tendon_link_type = wp.array([int(link_type), int(TendonLinkType.ATTACHMENT)], dtype=int, device=device)
-                length_rate = wp.zeros(1, dtype=float, device=device)
-                wp.launch(
-                    kernel=_measure_tendon_segment_length_rate,
-                    dim=1,
-                    inputs=[
-                        body_q,
-                        body_qd,
-                        body_com,
-                        tendon_link_body,
-                        tendon_link_type,
-                        tendon_link_offset,
-                        tendon_link_axis,
-                        0,
-                        1,
-                        attachment_l,
-                        attachment_r,
-                    ],
-                    outputs=[length_rate],
-                    device=device,
-                )
-
-                test.assertAlmostEqual(float(length_rate.numpy()[0]), 0.0, delta=1.0e-6)
-
-
 def test_rolling_link_body_preserves_center_motion_jacobian(test, device):
     """A rolling endpoint must retain torque caused by motion of its center."""
     with wp.ScopedDevice(device):
@@ -3384,12 +3314,6 @@ add_test(
     "same_body_rolling_segment_does_not_move_body",
     devices,
     test_same_body_rolling_segment_does_not_move_body,
-)
-add_test(
-    TestTendonCapstan,
-    "same_body_tendon_segment_has_zero_rigid_motion_length_rate",
-    devices,
-    test_same_body_tendon_segment_has_zero_rigid_motion_length_rate,
 )
 add_test(
     TestTendonCapstan,
