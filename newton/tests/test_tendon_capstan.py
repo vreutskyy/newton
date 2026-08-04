@@ -18,7 +18,7 @@ import warp as wp
 import newton
 from newton._src.sim.builder import Axis
 from newton._src.sim.tendon import TendonLinkFlags, TendonLinkType
-from newton._src.solvers.xpbd.tendon_kernels import solve_tendon_slip
+from newton._src.solvers.xpbd.tendon_kernels import solve_tendon_slip, solve_tendon_stretch
 from newton.examples.cable.cable import get_tendon_cable_lines
 from newton.examples.cable.example_tendon_capstan_friction import Example as DynamicCapstanExample
 from newton.examples.cable.example_tendon_mujoco_switch import Example as MujocoSwitchExample
@@ -2456,6 +2456,95 @@ def test_same_body_tendon_segment_reports_constitutive_tension(test, device):
         np.testing.assert_allclose(state_1.body_q.numpy(), initial_pose, rtol=0.0, atol=1.0e-7)
 
 
+def test_same_body_rolling_segment_does_not_move_body(test, device):
+    """A rolling segment internal to one rigid body must exert no generalized force."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        body = builder.add_body(
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3)),
+            lock_inertia=True,
+        )
+        builder.add_tendon()
+        builder.add_tendon_link(
+            body=body,
+            link_type=int(TendonLinkType.ATTACHMENT),
+            offset=(-0.7, -0.2, 0.0),
+        )
+        builder.add_tendon_link(
+            body=body,
+            link_type=int(TendonLinkType.ROLLING),
+            radius=0.12,
+            orientation=-1,
+            mu=0.0,
+            offset=(0.1, 0.15, 0.0),
+            compliance=1.0e-3,
+            rest_length=-1.0,
+        )
+        builder.add_tendon_link(
+            body=body,
+            link_type=int(TendonLinkType.ATTACHMENT),
+            offset=(0.5, -0.3, 0.0),
+            compliance=1.0e-3,
+            rest_length=-1.0,
+        )
+
+        model = builder.finalize()
+        solver = newton.solvers.SolverXPBD(model, iterations=1, joint_linear_relaxation=1.0)
+        span_lengths = np.linalg.norm(
+            solver.tendon_seg_attachment_r.numpy() - solver.tendon_seg_attachment_l.numpy(), axis=1
+        )
+        solver.tendon_seg_rest_length.assign(span_lengths - np.array([0.0, 0.01]))
+
+        solver.tendon_seg_active.assign([False, True])
+        solver.tendon_seg_lambda.zero_()
+        solver.tendon_seg_delta_lambda.zero_()
+        body_deltas = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
+        state = model.state()
+        dt = 1.0 / 120.0
+
+        wp.launch(
+            kernel=solve_tendon_stretch,
+            dim=model.tendon_segment_count,
+            inputs=[
+                state.body_q,
+                state.body_qd,
+                model.body_com,
+                solver.body_inv_mass_effective,
+                solver.body_inv_inertia_effective,
+                model.tendon_link_body,
+                model.tendon_link_type,
+                model.tendon_link_offset,
+                model.tendon_link_axis,
+                solver.tendon_seg_rest_length,
+                solver.tendon_seg_attachment_l,
+                solver.tendon_seg_attachment_r,
+                solver.tendon_seg_attachment_l_local,
+                solver.tendon_seg_attachment_r_local,
+                solver.tendon_seg_active_compliance,
+                solver.tendon_seg_active_damping,
+                solver.tendon_seg_lambda,
+                solver.tendon_seg_delta_lambda,
+                solver.tendon_seg_active,
+                solver.tendon_seg_active_link_l,
+                solver.tendon_seg_active_link_r,
+                1.0 / dt,
+                1.0,
+                dt,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ],
+            outputs=[body_deltas],
+            device=model.device,
+        )
+
+        lambda_tension = -solver.tendon_seg_lambda.numpy() / dt
+        test.assertGreater(float(lambda_tension[1]), 1.0)
+        np.testing.assert_allclose(body_deltas.numpy(), 0.0, rtol=0.0, atol=1.0e-7)
+
+
 def test_rolling_link_body_preserves_center_motion_jacobian(test, device):
     """A rolling endpoint must retain torque caused by motion of its center."""
     with wp.ScopedDevice(device):
@@ -3219,6 +3308,12 @@ add_test(
     "same_body_tendon_segment_reports_constitutive_tension",
     devices,
     test_same_body_tendon_segment_reports_constitutive_tension,
+)
+add_test(
+    TestTendonCapstan,
+    "same_body_rolling_segment_does_not_move_body",
+    devices,
+    test_same_body_rolling_segment_does_not_move_body,
 )
 add_test(
     TestTendonCapstan,

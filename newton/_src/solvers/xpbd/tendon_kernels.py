@@ -120,18 +120,21 @@ def solve_tendon_stretch(
     linear_r = n
     angular_l = -wp.cross(r_l, n)
     angular_r = wp.cross(r_r, n)
-    # Remove only spin about the roller center; motion of an off-center roller
-    # remains part of the rigid-body Jacobian.
-    if link_type_l == int(TendonLinkType.ROLLING):
-        center_l = wp.transform_point(pose_l, tendon_link_offset[link_l])
-        normal_l = wp.transform_vector(pose_l, tendon_link_axis[link_l])
-        radial_l = x_l - center_l
-        angular_l = angular_l - wp.dot(wp.cross(radial_l, linear_l), normal_l) * normal_l
-    if link_type_r == int(TendonLinkType.ROLLING):
-        center_r = wp.transform_point(pose_r, tendon_link_offset[link_r])
-        normal_r = wp.transform_vector(pose_r, tendon_link_axis[link_r])
-        radial_r = x_r - center_r
-        angular_r = angular_r - wp.dot(wp.cross(radial_r, linear_r), normal_r) * normal_r
+    # Full endpoint Jacobians cancel common rigid motion. Projecting roller spin
+    # first would make a body-fixed span exert a fictitious torque.
+    if body_l != body_r:
+        # Remove only spin about the roller center; motion of an off-center roller
+        # remains part of the rigid-body Jacobian.
+        if link_type_l == int(TendonLinkType.ROLLING):
+            center_l = wp.transform_point(pose_l, tendon_link_offset[link_l])
+            normal_l = wp.transform_vector(pose_l, tendon_link_axis[link_l])
+            radial_l = x_l - center_l
+            angular_l = angular_l - wp.dot(wp.cross(radial_l, linear_l), normal_l) * normal_l
+        if link_type_r == int(TendonLinkType.ROLLING):
+            center_r = wp.transform_point(pose_r, tendon_link_offset[link_r])
+            normal_r = wp.transform_vector(pose_r, tendon_link_axis[link_r])
+            radial_r = x_r - center_r
+            angular_r = angular_r - wp.dot(wp.cross(radial_r, linear_r), normal_r) * normal_r
 
     rot_l = wp.transform_get_rotation(pose_l)
     rot_r = wp.transform_get_rotation(pose_r)
