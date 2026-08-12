@@ -1677,6 +1677,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
         if self.tendon_seg_lambda is not None and state_in.body_q is not None:
             self._snapshot_tendon_step_state()
             self._update_tendon_link_active(self.model, state_in.body_q)
+            self.tendon_seg_material_tension.zero_()
             if self.iterations == 0 or self.integrate_with_external_rigid_solver:
                 self.tendon_seg_lambda.zero_()
 
@@ -2520,15 +2521,22 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 model.tendon_link_body,
                 self.tendon_seg_attachment_l_local,
                 self.tendon_seg_attachment_r_local,
+                self.tendon_seg_rest_length,
+                self.tendon_seg_active_compliance,
                 self.tendon_seg_active_damping,
                 self.tendon_seg_active,
                 self.tendon_seg_active_link_l,
                 self.tendon_seg_active_link_r,
                 self.tendon_seg_delta_lambda,
+                self.tendon_sigmoid_ea_low,
+                self.tendon_sigmoid_ea_ratio,
+                self.tendon_sigmoid_transition_strain,
+                self.tendon_sigmoid_transition_width,
             ],
             outputs=[
                 self.tendon_seg_attachment_l,
                 self.tendon_seg_attachment_r,
+                self.tendon_seg_material_tension,
                 self.tendon_seg_damping_tension,
                 self.tendon_seg_lambda,
             ],

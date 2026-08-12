@@ -2617,11 +2617,22 @@ def test_same_body_rolling_route_matches_length_gradient(test, device):
                 0.0,
                 1.0,
             ],
-            outputs=[body_deltas],
+            outputs=[solver.tendon_seg_material_tension, body_deltas],
             device=model.device,
         )
 
         delta_lambda = solver.tendon_seg_delta_lambda.numpy()
+        solved_lengths = np.linalg.norm(
+            solver.tendon_seg_attachment_r.numpy() - solver.tendon_seg_attachment_l.numpy(), axis=1
+        )
+        expected_material_tension = np.maximum(solved_lengths - solver.tendon_seg_rest_length.numpy(), 0.0)
+        expected_material_tension /= solver.tendon_seg_active_compliance.numpy()
+        np.testing.assert_allclose(
+            solver.tendon_seg_material_tension.numpy(),
+            expected_material_tension,
+            rtol=1.0e-5,
+            atol=1.0e-5,
+        )
         test.assertAlmostEqual(float(delta_lambda[0]), float(delta_lambda[1]), delta=1.0e-6)
         stretch_gradient = float(body_deltas.numpy()[body, 5] / np.mean(delta_lambda))
         test.assertAlmostEqual(stretch_gradient, expected_gradient, delta=1.0e-4)
@@ -3243,6 +3254,7 @@ def test_xpbd_sigmoid_stretch_uses_material_tangent(test, device):
         inv_mass = float(model.body_inv_mass.numpy()[body])
         expected_lambda = -dt * tension / (1.0 + dt * dt * tangent * inv_mass)
 
+        np.testing.assert_allclose(solver.tendon_seg_material_tension.numpy()[0], tension, rtol=2.0e-5)
         test.assertAlmostEqual(float(solver.tendon_seg_lambda.numpy()[0]), expected_lambda, delta=1.0e-5)
 
 

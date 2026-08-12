@@ -457,6 +457,7 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                 self._snapshot_tendon_step_state()
                 self._update_tendon_link_active(model, body_q)
                 self.tendon_seg_lambda.zero_()
+                self.tendon_seg_material_tension.zero_()
 
             for i in range(self.iterations):
                 with wp.ScopedTimer(f"iteration_{i}", False):
@@ -821,7 +822,7 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                                 self.tendon_sigmoid_transition_strain,
                                 self.tendon_sigmoid_transition_width,
                             ],
-                            outputs=[body_deltas],
+                            outputs=[self.tendon_seg_material_tension, body_deltas],
                             device=model.device,
                         )
 

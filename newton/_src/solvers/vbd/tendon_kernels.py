@@ -88,13 +88,20 @@ def update_tendon_segment_diagnostics(
     tendon_link_body: wp.array[int],
     seg_attachment_l_local: wp.array[wp.vec3],
     seg_attachment_r_local: wp.array[wp.vec3],
+    seg_rest_length: wp.array[float],
+    seg_active_compliance: wp.array[float],
     seg_active_damping: wp.array[float],
     seg_active: wp.array[int],
     seg_active_link_l: wp.array[int],
     seg_active_link_r: wp.array[int],
     seg_length_prev: wp.array[float],
+    sigmoid_ea_low: float,
+    sigmoid_ea_ratio: float,
+    sigmoid_transition_strain: float,
+    sigmoid_transition_width: float,
     seg_attachment_l: wp.array[wp.vec3],
     seg_attachment_r: wp.array[wp.vec3],
+    seg_material_tension: wp.array[float],
     seg_damping_tension: wp.array[float],
     seg_lambda: wp.array[float],
 ):
@@ -102,6 +109,7 @@ def update_tendon_segment_diagnostics(
     seg = wp.tid()
     seg_attachment_l[seg] = wp.vec3(0.0)
     seg_attachment_r[seg] = wp.vec3(0.0)
+    seg_material_tension[seg] = 0.0
     seg_damping_tension[seg] = 0.0
     # Native VBD does not solve XPBD constraint multipliers.
     seg_lambda[seg] = 0.0
@@ -119,6 +127,16 @@ def update_tendon_segment_diagnostics(
     seg_attachment_r[seg] = attachment_r
     length = wp.length(attachment_r - attachment_l)
     length_rate = (length - seg_length_prev[seg]) / dt
+    compliance = wp.max(seg_active_compliance[seg], _MIN_TENDON_COMPLIANCE)
+    seg_material_tension[seg] = tendon_material_tension(
+        length,
+        seg_rest_length[seg],
+        compliance,
+        sigmoid_ea_low,
+        sigmoid_ea_ratio,
+        sigmoid_transition_strain,
+        sigmoid_transition_width,
+    )
     seg_damping_tension[seg] = seg_active_damping[seg] * length_rate
 
 

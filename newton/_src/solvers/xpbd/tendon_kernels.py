@@ -52,6 +52,7 @@ def solve_tendon_stretch(
     sigmoid_transition_strain: float,
     sigmoid_transition_width: float,
     # outputs
+    seg_material_tension: wp.array[float],
     body_deltas: wp.array[wp.spatial_vector],
 ):
     """Phase 3: Solve unilateral distance constraints for each tendon segment.
@@ -60,6 +61,7 @@ def solve_tendon_stretch(
     constraint between attachment points on two rigid bodies.
     """
     seg = wp.tid()
+    seg_material_tension[seg] = 0.0
     if seg_active[seg] == 0:
         seg_lambda[seg] = 0.0
         seg_delta_lambda[seg] = 0.0
@@ -105,6 +107,17 @@ def solve_tendon_stretch(
         seg_lambda[seg] = 0.0
         seg_delta_lambda[seg] = 0.0
         return
+
+    material_tension = tendon_material_tension(
+        d,
+        rest,
+        compliance,
+        sigmoid_ea_low,
+        sigmoid_ea_ratio,
+        sigmoid_transition_strain,
+        sigmoid_transition_width,
+    )
+    seg_material_tension[seg] = material_tension
 
     # constraint direction
     n = diff / d
@@ -158,15 +171,6 @@ def solve_tendon_stretch(
 
     lambda_prev = seg_lambda[seg]
     if sigmoid_ea_low > 0.0:
-        tension = tendon_material_tension(
-            d,
-            rest,
-            compliance,
-            sigmoid_ea_low,
-            sigmoid_ea_ratio,
-            sigmoid_transition_strain,
-            sigmoid_transition_width,
-        )
         tangent = tendon_material_tangent(
             d,
             rest,
@@ -176,7 +180,7 @@ def solve_tendon_stretch(
             sigmoid_transition_strain,
             sigmoid_transition_width,
         )
-        d_lambda = -(lambda_prev + dt * (tension + damping * derr))
+        d_lambda = -(lambda_prev + dt * (material_tension + damping * derr))
         nonlinear_denom = 1.0 + (dt * dt * tangent + dt * damping) * denom
         d_lambda = d_lambda / nonlinear_denom
     else:

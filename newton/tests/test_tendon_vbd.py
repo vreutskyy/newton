@@ -511,6 +511,7 @@ def test_vbd_dynamic_tendon_route_switches_inside_solver(test, device):
         body_q = state_0.body_q.numpy()
         active_history = []
         segment_history = []
+        material_tension_history = []
         first_upper_z = None
         for x in (0.25, 0.05, -0.25, 0.25):
             body_q[candidate, :3] = (x, 0.0, 0.0)
@@ -518,6 +519,7 @@ def test_vbd_dynamic_tendon_route_switches_inside_solver(test, device):
             solver.step(state_0, state_1, control, None, 1.0 / 120.0)
             active_history.append(bool(solver.tendon_link_active.numpy()[candidate_link]))
             segment_history.append(solver.tendon_seg_active.numpy().tolist())
+            material_tension_history.append(solver.tendon_seg_material_tension.numpy().tolist())
             if first_upper_z is None:
                 first_upper_z = float(state_1.body_q.numpy()[upper][2])
             state_0, state_1 = state_1, state_0
@@ -525,6 +527,8 @@ def test_vbd_dynamic_tendon_route_switches_inside_solver(test, device):
 
         test.assertEqual(active_history, [False, True, True, False])
         test.assertEqual(segment_history, [[1, 0], [1, 1], [1, 1], [1, 0]])
+        test.assertEqual(material_tension_history[0][1], 0.0)
+        test.assertEqual(material_tension_history[-1][1], 0.0)
         test.assertLess(first_upper_z, 0.499, "The inactive bypass span must load its new right endpoint")
         test.assertTrue(np.isfinite(state_0.body_q.numpy()).all())
 
@@ -654,8 +658,10 @@ def test_vbd_sigmoid_stretch_uses_material_tangent(test, device):
         tangent = sigmoid_tendon_tangent(1.0, rest_length, material)
         mass = float(model.body_mass.numpy()[body])
         expected_x = 1.0 - tension / (mass / (dt * dt) + tangent)
+        expected_tension = sigmoid_tendon_tension(expected_x, rest_length, material)
 
         test.assertAlmostEqual(float(state_1.body_q.numpy()[body][0]), expected_x, delta=1.0e-5)
+        np.testing.assert_allclose(solver.tendon_seg_material_tension.numpy()[0], expected_tension, rtol=2.0e-5)
 
 
 def test_vbd_slack_damped_tendon_remains_force_free(test, device):
@@ -693,8 +699,10 @@ def test_vbd_slack_damped_tendon_remains_force_free(test, device):
         solver.step(state_0, state_1, model.control(), None, dt)
 
         final_vx = float(state_1.body_qd.numpy()[body][0])
+        material_tension = float(solver.tendon_seg_material_tension.numpy()[0])
         reported_lambda = float(solver.tendon_seg_lambda.numpy()[0])
         test.assertAlmostEqual(final_vx, 30.0, delta=1.0e-4)
+        test.assertEqual(material_tension, 0.0)
         test.assertEqual(reported_lambda, 0.0, "VBD must not report a synthetic XPBD multiplier")
 
 
@@ -740,12 +748,15 @@ def test_vbd_tendon_diagnostics_match_final_pose(test, device):
         attachment_r = solver.tendon_seg_attachment_r.numpy()[0]
         attachment_length = float(np.linalg.norm(attachment_r - attachment_l))
         length_rate = (final_length - initial_length) / dt
-        material_tension = max((final_length - rest_length) / compliance + damping * length_rate, 0.0)
+        material_tension = max((final_length - rest_length) / compliance, 0.0)
+        total_tension = max(material_tension + damping * length_rate, 0.0)
+        reported_material_tension = float(solver.tendon_seg_material_tension.numpy()[0])
         reported_lambda = float(solver.tendon_seg_lambda.numpy()[0])
         routing_damping_tension = float(solver.tendon_seg_damping_tension.numpy()[0])
         test.assertLess(final_length, 0.75, "The solve must move the endpoints enough to expose stale diagnostics")
-        test.assertGreater(material_tension, 0.0, "The regression must exercise a loaded tendon")
+        test.assertGreater(total_tension, 0.0, "The regression must exercise a loaded tendon")
         test.assertAlmostEqual(attachment_length, final_length, delta=1.0e-6)
+        test.assertAlmostEqual(reported_material_tension, material_tension, delta=1.0e-3)
         test.assertAlmostEqual(
             routing_damping_tension,
             damping * length_rate,

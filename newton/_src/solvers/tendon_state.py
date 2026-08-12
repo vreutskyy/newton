@@ -142,6 +142,7 @@ class TendonStateMixin:
             self.tendon_seg_rest_length = None
             self.tendon_seg_rest_length_step = None
             self.tendon_seg_stretch = None
+            self.tendon_seg_material_tension = None
             self.tendon_seg_damping_tension = None
             self.tendon_seg_attachment_l = None
             self.tendon_seg_attachment_r = None
@@ -174,6 +175,8 @@ class TendonStateMixin:
             self.tendon_seg_attachment_r_local = wp.zeros(model.tendon_segment_count, dtype=wp.vec3)
             self.tendon_seg_attachment_l_local_step = wp.zeros(model.tendon_segment_count, dtype=wp.vec3)
             self.tendon_seg_attachment_r_local_step = wp.zeros(model.tendon_segment_count, dtype=wp.vec3)
+            # Unilateral constitutive tension; the signed damping term is reported separately.
+            self.tendon_seg_material_tension = wp.zeros(model.tendon_segment_count, dtype=float)
             self.tendon_seg_lambda = (
                 wp.zeros(model.tendon_segment_count, dtype=float) if allocate_xpbd_lambdas else None
             )
