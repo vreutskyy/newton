@@ -297,8 +297,11 @@ def evaluate_tendon_force_hessians(
 
                     cap_ratio = wp.exp(wp.min(wp.max(tendon_link_mu[link], 0.0) * theta, 20.0))
                     spin_scale = (cap_ratio - 1.0) / (cap_ratio + 1.0)
-                    moment_axis = moment_axis - (1.0 - spin_scale) * wp.dot(moment_axis, normal) * normal
-                    body_torque = body_torque - (1.0 - spin_scale) * wp.dot(body_torque, normal) * normal
+                    radial = attachment - center
+                    spin_moment_axis = wp.cross(radial, direction)
+                    spin_torque = wp.cross(radial, body_force)
+                    moment_axis = moment_axis - (1.0 - spin_scale) * wp.dot(spin_moment_axis, normal) * normal
+                    body_torque = body_torque - (1.0 - spin_scale) * wp.dot(spin_torque, normal) * normal
 
         effective_stiffness = stiffness + damping / dt
 

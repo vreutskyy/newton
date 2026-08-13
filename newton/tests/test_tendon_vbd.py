@@ -847,6 +847,66 @@ def test_vbd_rolling_spin_does_not_add_damping_tension(test, device):
         )
 
 
+def test_vbd_frictionless_off_center_roller_retains_body_torque(test, device):
+    """A frictionless roller still transmits force through its off-center axis."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        anchor_l = builder.add_body(
+            xform=wp.transform(p=wp.vec3(-0.5, 1.0, 0.0)),
+            mass=0.0,
+            is_kinematic=True,
+        )
+        roller = builder.add_body(
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3)),
+            lock_inertia=True,
+        )
+        anchor_r = builder.add_body(
+            xform=wp.transform(p=wp.vec3(1.5, 1.0, 0.0)),
+            mass=0.0,
+            is_kinematic=True,
+        )
+
+        builder.add_tendon()
+        builder.add_tendon_link(body=anchor_l, link_type=int(TendonLinkType.ATTACHMENT))
+        builder.add_tendon_link(
+            body=roller,
+            link_type=int(TendonLinkType.ROLLING),
+            radius=0.2,
+            orientation=1,
+            axis=(0.0, 0.0, 1.0),
+            offset=(0.5, 0.0, 0.0),
+            mu=0.0,
+            compliance=1.0e-2,
+            rest_length=1.3,
+        )
+        builder.add_tendon_link(
+            body=anchor_r,
+            link_type=int(TendonLinkType.ATTACHMENT),
+            compliance=1.0e-2,
+            rest_length=1.3,
+        )
+        builder.color()
+        model = builder.finalize()
+        _set_serial_body_coloring(model)
+
+        solver_kwargs = dict(TENDON_VBD_SOLVER_KWARGS)
+        solver_kwargs["iterations"] = 1
+        solver = newton.solvers.SolverVBD(model, **solver_kwargs)
+        state_0 = model.state()
+        state_1 = model.state()
+        solver.step(state_0, state_1, model.control(), None, 1.0 / 120.0)
+
+        tension = solver.tendon_seg_material_tension.numpy()
+        angle = _hinge_z_angle(state_1.body_q.numpy(), roller)
+        np.testing.assert_allclose(tension[0], tension[1], rtol=1.0e-4, atol=1.0e-4)
+        test.assertGreater(
+            angle,
+            4.0e-4,
+            "The resultant tendon force at an off-center roller must retain its moment about the body COM",
+        )
+
+
 def test_vbd_tendon_cuda_graph_capture(test, device):
     """Native VBD tendon force accumulation should remain CUDA graph-capturable."""
     device = wp.get_device(device)
@@ -1584,6 +1644,12 @@ add_test(
     "vbd_rolling_spin_does_not_add_damping_tension",
     devices,
     test_vbd_rolling_spin_does_not_add_damping_tension,
+)
+add_test(
+    TestTendonVBD,
+    "vbd_frictionless_off_center_roller_retains_body_torque",
+    devices,
+    test_vbd_frictionless_off_center_roller_retains_body_torque,
 )
 add_test(TestTendonVBD, "vbd_tendon_cuda_graph_capture", devices, test_vbd_tendon_cuda_graph_capture)
 add_test(TestTendonVBD, "vbd_dynamic_tendon_cuda_graph_capture", devices, test_vbd_dynamic_tendon_cuda_graph_capture)
