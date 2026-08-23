@@ -141,6 +141,69 @@ def update_tendon_segment_diagnostics(
 
 
 @wp.func
+def _rolling_spin_axis_component(
+    body_q: wp.array[wp.transform],
+    tendon_link_body: wp.array[int],
+    tendon_link_type: wp.array[int],
+    tendon_link_radius: wp.array[float],
+    tendon_link_mu: wp.array[float],
+    tendon_link_offset: wp.array[wp.vec3],
+    tendon_link_axis: wp.array[wp.vec3],
+    tendon_link_seg_left: wp.array[int],
+    seg_attachment_l_local: wp.array[wp.vec3],
+    seg_attachment_r_local: wp.array[wp.vec3],
+    seg_active: wp.array[int],
+    link: int,
+    attachment: wp.vec3,
+    direction: wp.vec3,
+) -> wp.vec3:
+    """Roller-axis moment row of a unit-tension span at a ROLLING link.
+
+    Returns ``(1 - spin_scale) * dot(cross(radial, direction), normal) * normal``
+    — the roller-axis part of the span's moment that an ideal (or partially
+    slipping) pulley cannot transmit through its rim. Zero for non-ROLLING
+    links or when the wrap geometry is unavailable.
+    """
+    if tendon_link_type[link] != int(TendonLinkType.ROLLING):
+        return wp.vec3(0.0)
+    seg_left = tendon_link_seg_left[link]
+    if seg_left < 0:
+        return wp.vec3(0.0)
+    seg_right = seg_left + 1
+    if seg_right >= seg_active.shape[0] or seg_active[seg_left] == 0 or seg_active[seg_right] == 0:
+        return wp.vec3(0.0)
+
+    body = tendon_link_body[link]
+    pose = body_q[body]
+    center = wp.transform_point(pose, tendon_link_offset[link])
+    normal = wp.normalize(wp.transform_vector(pose, tendon_link_axis[link]))
+    point_left = wp.transform_point(pose, seg_attachment_r_local[seg_left])
+    point_right = wp.transform_point(pose, seg_attachment_l_local[seg_right])
+    radial_left = point_left - center
+    radial_right = point_right - center
+    radial_left = radial_left - wp.dot(radial_left, normal) * normal
+    radial_right = radial_right - wp.dot(radial_right, normal) * normal
+    radial_left_length = wp.length(radial_left)
+    radial_right_length = wp.length(radial_right)
+
+    theta = float(0.0)
+    if tendon_link_radius[link] > 0.0 and radial_left_length > 1.0e-8 and radial_right_length > 1.0e-8:
+        unit_left = radial_left / radial_left_length
+        unit_right = radial_right / radial_right_length
+        theta = wp.abs(
+            wp.atan2(
+                wp.dot(wp.cross(unit_left, unit_right), normal),
+                wp.dot(unit_left, unit_right),
+            )
+        )
+
+    cap_ratio = wp.exp(wp.min(wp.max(tendon_link_mu[link], 0.0) * theta, 20.0))
+    spin_scale = (cap_ratio - 1.0) / (cap_ratio + 1.0)
+    radial = attachment - center
+    return (1.0 - spin_scale) * wp.dot(wp.cross(radial, direction), normal) * normal
+
+
+@wp.func
 def evaluate_tendon_force_hessians(
     body: int,
     dt: float,
@@ -247,7 +310,34 @@ def evaluate_tendon_force_hessians(
             )
         tension = wp.max(tension, 0.0)
 
-        if tension <= 0.0 or body_l == body_r:
+        if tension <= 0.0:
+            continue
+
+        if body_l == body_r:
+            # Both endpoints ride this body: the endpoint forces and their base
+            # torques cancel exactly, but the rolling spin corrections are
+            # asymmetric, leaving a net roller-axis torque — the same net row
+            # XPBD's combined same-body Jacobian applies. Without it, a cable
+            # that wraps a roller and terminates on the same body transmits no
+            # torque at all (toy3 cable B: R3 -> tip on link1).
+            fix_l = _rolling_spin_axis_component(
+                body_q, tendon_link_body, tendon_link_type, tendon_link_radius,
+                tendon_link_mu, tendon_link_offset, tendon_link_axis,
+                tendon_link_seg_left, seg_attachment_l_local,
+                seg_attachment_r_local, seg_active,
+                link_l, attachment_l, direction,
+            )
+            fix_r = _rolling_spin_axis_component(
+                body_q, tendon_link_body, tendon_link_type, tendon_link_radius,
+                tendon_link_mu, tendon_link_offset, tendon_link_axis,
+                tendon_link_seg_left, seg_attachment_l_local,
+                seg_attachment_r_local, seg_active,
+                link_r, attachment_r, direction,
+            )
+            net_moment_axis = fix_l - fix_r
+            torque = torque - tension * net_moment_axis
+            same_body_stiffness = stiffness + damping / dt
+            h_aa = h_aa + same_body_stiffness * wp.outer(net_moment_axis, net_moment_axis)
             continue
 
         world_com = wp.transform_point(body_q[body], body_com[body])
