@@ -1682,13 +1682,17 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_seg_lambda.zero_()
 
         for iter_num in range(self.iterations):
+            # Iteration 0 routes on the raw inertial-predictor pose, whose
+            # transient overshoot can show spurious negative wraps; the wrap
+            # diagnostic is instead reported from the accepted route state
+            # after the loop (below), once per step like XPBD.
             self._solve_rigid_body_iteration(
                 state_in,
                 state_out,
                 control,
                 contacts,
                 dt,
-                report_unsupported_wrap=iter_num == 0,
+                report_unsupported_wrap=False,
             )
             self._solve_particle_iteration(state_in, state_out, contacts, dt, iter_num)
 
@@ -1702,7 +1706,10 @@ class SolverVBD(TendonStateMixin, SolverBase):
             # The final body update changes tendon geometry after the last
             # in-iteration material solve. Accept its route state before
             # reporting tension or carrying rest lengths into the next step.
-            self._update_tendon_routing(state_in, dt, False)
+            # This accepted state is also where the unsupported-wrap
+            # diagnostic is meaningful (mid-iteration predictor overshoot is
+            # not), so report it here.
+            self._update_tendon_routing(state_in, dt, True)
             self._snapshot_tendon_segment_length_reference(state_in.body_q, dt)
 
         # Snapshot solved rigid contact state for next-frame warm-start.
