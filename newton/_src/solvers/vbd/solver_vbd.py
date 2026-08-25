@@ -1672,8 +1672,9 @@ class SolverVBD(TendonStateMixin, SolverBase):
         if control is None:
             control = self.model.control(clone_variables=False)
 
-        self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
-        self._initialize_particles(state_in, state_out, dt)
+        # Must run BEFORE _initialize_rigid_bodies: the dynamic routing activation
+        # decision has to see the accepted pose, but the inertial predictor inside
+        # _initialize_rigid_bodies overwrites state_in.body_q in place.
         if self.tendon_seg_lambda is not None and state_in.body_q is not None:
             self._snapshot_tendon_step_state()
             self._update_tendon_link_active(self.model, state_in.body_q)
@@ -1681,11 +1682,16 @@ class SolverVBD(TendonStateMixin, SolverBase):
             if self.iterations == 0 or self.integrate_with_external_rigid_solver:
                 self.tendon_seg_lambda.zero_()
 
+        self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
+        self._initialize_particles(state_in, state_out, dt)
+
         for iter_num in range(self.iterations):
-            # Iteration 0 routes on the raw inertial-predictor pose, whose
-            # transient overshoot can show spurious negative wraps; the wrap
-            # diagnostic is instead reported from the accepted route state
-            # after the loop (below), once per step like XPBD.
+            # Routing geometry is refreshed every iteration, so iteration 0 sees
+            # the raw inertial-predictor pose, whose transient overshoot can show
+            # spurious negative wraps; the wrap diagnostic is instead reported
+            # from the accepted route state after the loop (below), once per step
+            # like XPBD. (The activation decision is not affected: it is made once
+            # per step from the accepted pose, above.)
             self._solve_rigid_body_iteration(
                 state_in,
                 state_out,
