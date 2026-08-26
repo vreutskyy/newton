@@ -455,7 +455,10 @@ class SolverXPBD(TendonStateMixin, SolverBase):
             # slip stage applies capstan-limited spin-axis coupling.
             if model.tendon_segment_count > 0 and body_q is not None:
                 self._snapshot_tendon_step_state()
-                self._update_tendon_link_active(model, body_q)
+                # Activation must see the accepted pose: ``body_q`` aliases
+                # state_out.body_q, which integrate_bodies has already filled with
+                # the inertial predictor. state_in.body_q is left untouched there.
+                self._update_tendon_link_active(model, state_in.body_q)
                 self.tendon_seg_lambda.zero_()
                 self.tendon_seg_material_tension.zero_()
 
