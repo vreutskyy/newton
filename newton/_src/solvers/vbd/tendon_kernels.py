@@ -321,18 +321,36 @@ def evaluate_tendon_force_hessians(
             # that wraps a roller and terminates on the same body transmits no
             # torque at all (toy3 cable B: R3 -> tip on link1).
             fix_l = _rolling_spin_axis_component(
-                body_q, tendon_link_body, tendon_link_type, tendon_link_radius,
-                tendon_link_mu, tendon_link_offset, tendon_link_axis,
-                tendon_link_seg_left, seg_attachment_l_local,
-                seg_attachment_r_local, seg_active,
-                link_l, attachment_l, direction,
+                body_q,
+                tendon_link_body,
+                tendon_link_type,
+                tendon_link_radius,
+                tendon_link_mu,
+                tendon_link_offset,
+                tendon_link_axis,
+                tendon_link_seg_left,
+                seg_attachment_l_local,
+                seg_attachment_r_local,
+                seg_active,
+                link_l,
+                attachment_l,
+                direction,
             )
             fix_r = _rolling_spin_axis_component(
-                body_q, tendon_link_body, tendon_link_type, tendon_link_radius,
-                tendon_link_mu, tendon_link_offset, tendon_link_axis,
-                tendon_link_seg_left, seg_attachment_l_local,
-                seg_attachment_r_local, seg_active,
-                link_r, attachment_r, direction,
+                body_q,
+                tendon_link_body,
+                tendon_link_type,
+                tendon_link_radius,
+                tendon_link_mu,
+                tendon_link_offset,
+                tendon_link_axis,
+                tendon_link_seg_left,
+                seg_attachment_l_local,
+                seg_attachment_r_local,
+                seg_active,
+                link_r,
+                attachment_r,
+                direction,
             )
             net_moment_axis = fix_l - fix_r
             torque = torque - tension * net_moment_axis

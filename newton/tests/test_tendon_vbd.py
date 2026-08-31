@@ -28,6 +28,7 @@ from newton.tests.test_tendon_capstan import (
     SIGMOID_TENDON_MATERIAL,
     _moving_rolling_route_material_error,
     build_dynamic_pulley_atwood,
+    build_force_driven_dynamic_route,
     build_kinematic_pulley_atwood,
     build_kinematic_rolling_transport,
     build_motorized_pulley_drive,
@@ -533,6 +534,29 @@ def test_vbd_dynamic_tendon_route_switches_inside_solver(test, device):
         test.assertTrue(np.isfinite(state_0.body_q.numpy()).all())
 
 
+def test_vbd_dynamic_route_activation_uses_accepted_pose(test, device):
+    """Route activation should not use the VBD inertial predictor pose."""
+    with wp.ScopedDevice(device):
+        model, candidate, candidate_link = build_force_driven_dynamic_route(device)
+        _set_serial_body_coloring(model)
+        solver = _make_tendon_vbd_solver(model)
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+
+        test.assertFalse(solver.tendon_link_active.numpy()[candidate_link])
+        body_qd = state_0.body_qd.numpy()
+        body_qd[candidate, 0] = -24.0
+        state_0.body_qd.assign(body_qd)
+
+        solver.step(state_0, state_1, model.control(), None, 1.0 / 120.0)
+
+        test.assertLess(abs(float(state_1.body_q.numpy()[candidate, 0])), 0.1)
+        test.assertFalse(
+            solver.tendon_link_active.numpy()[candidate_link],
+            "The predictor crossed the cable, but activation belongs to the accepted step-start pose",
+        )
+
+
 def test_vbd_tendon_coloring_separates_segment_endpoints(test, device):
     """Rigid-body coloring should include tendon force-element connectivity."""
     with wp.ScopedDevice(device):
@@ -905,6 +929,67 @@ def test_vbd_frictionless_off_center_roller_retains_body_torque(test, device):
             4.0e-4,
             "The resultant tendon force at an off-center roller must retain its moment about the body COM",
         )
+
+
+def test_vbd_same_body_rolling_span_applies_net_torque(test, device):
+    """A rolling span with both endpoints on one body should retain its net torque."""
+    with wp.ScopedDevice(device):
+        initial_angle = 0.23
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        anchor = builder.add_body(
+            xform=wp.transform(p=wp.vec3(-0.8, -0.5, 0.0)),
+            mass=0.0,
+            is_kinematic=True,
+        )
+        body = builder.add_body(
+            xform=wp.transform(q=wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), initial_angle)),
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3)),
+            lock_inertia=True,
+        )
+
+        builder.add_tendon()
+        builder.add_tendon_link(body=anchor, link_type=int(TendonLinkType.ATTACHMENT))
+        builder.add_tendon_link(
+            body=body,
+            link_type=int(TendonLinkType.ROLLING),
+            radius=0.12,
+            orientation=-1,
+            mu=0.0,
+            offset=(0.1, 0.15, 0.0),
+            compliance=1.0e-3,
+            rest_length=-1.0,
+        )
+        builder.add_tendon_link(
+            body=body,
+            link_type=int(TendonLinkType.ATTACHMENT),
+            offset=(0.5, -0.3, 0.0),
+            compliance=1.0e-3,
+            rest_length=-1.0,
+        )
+        builder.color()
+        model = builder.finalize()
+        _set_serial_body_coloring(model)
+
+        solver_kwargs = dict(TENDON_VBD_SOLVER_KWARGS)
+        solver_kwargs.update(iterations=1, tendon_max_sweeps=1)
+        solver = newton.solvers.SolverVBD(model, **solver_kwargs)
+        span_lengths = np.linalg.norm(
+            solver.tendon_seg_attachment_r.numpy() - solver.tendon_seg_attachment_l.numpy(), axis=1
+        )
+        rest_lengths = span_lengths.copy()
+        rest_lengths[0] += 1.0
+        rest_lengths[1] -= 0.01
+        solver.tendon_seg_rest_length.assign(rest_lengths)
+
+        state_0, state_1 = model.state(), model.state()
+        initial_pose = state_0.body_q.numpy()[body].copy()
+        solver.step(state_0, state_1, model.control(), None, 1.0 / 120.0)
+
+        final_pose = state_1.body_q.numpy()[body]
+        np.testing.assert_allclose(final_pose[:3], initial_pose[:3], rtol=0.0, atol=1.0e-7)
+        test.assertGreater(_hinge_z_angle(state_1.body_q.numpy(), body), initial_angle + 1.0e-5)
+        test.assertGreater(float(solver.tendon_seg_material_tension.numpy()[1]), 1.0)
 
 
 def test_vbd_tendon_cuda_graph_capture(test, device):
@@ -1599,6 +1684,12 @@ add_test(
 )
 add_test(
     TestTendonVBD,
+    "vbd_dynamic_route_activation_uses_accepted_pose",
+    devices,
+    test_vbd_dynamic_route_activation_uses_accepted_pose,
+)
+add_test(
+    TestTendonVBD,
     "vbd_tendon_coloring_separates_segment_endpoints",
     devices,
     test_vbd_tendon_coloring_separates_segment_endpoints,
@@ -1650,6 +1741,12 @@ add_test(
     "vbd_frictionless_off_center_roller_retains_body_torque",
     devices,
     test_vbd_frictionless_off_center_roller_retains_body_torque,
+)
+add_test(
+    TestTendonVBD,
+    "vbd_same_body_rolling_span_applies_net_torque",
+    devices,
+    test_vbd_same_body_rolling_span_applies_net_torque,
 )
 add_test(TestTendonVBD, "vbd_tendon_cuda_graph_capture", devices, test_vbd_tendon_cuda_graph_capture)
 add_test(TestTendonVBD, "vbd_dynamic_tendon_cuda_graph_capture", devices, test_vbd_dynamic_tendon_cuda_graph_capture)

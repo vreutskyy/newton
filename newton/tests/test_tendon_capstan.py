@@ -1498,6 +1498,28 @@ def test_force_driven_dynamic_route_updates_inside_solver(test, device):
         )
 
 
+def test_dynamic_route_activation_uses_accepted_pose(test, device):
+    """Route activation should not use the inertial predictor pose."""
+    with wp.ScopedDevice(device):
+        model, candidate, candidate_link = build_force_driven_dynamic_route(device)
+        solver = newton.solvers.SolverXPBD(model, iterations=1, joint_linear_relaxation=1.0)
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+
+        test.assertFalse(solver.tendon_link_active.numpy()[candidate_link])
+        body_qd = state_0.body_qd.numpy()
+        body_qd[candidate, 0] = -24.0
+        state_0.body_qd.assign(body_qd)
+
+        solver.step(state_0, state_1, model.control(), None, 1.0 / 120.0)
+
+        test.assertLess(abs(float(state_1.body_q.numpy()[candidate, 0])), 0.1)
+        test.assertFalse(
+            solver.tendon_link_active.numpy()[candidate_link],
+            "The predictor crossed the cable, but activation belongs to the accepted step-start pose",
+        )
+
+
 def test_dynamic_route_neighbor_matrix_conserves_material(test, device):
     """Route transitions should conserve material for every supported neighbor-type pair."""
     with wp.ScopedDevice(device):
@@ -3451,6 +3473,12 @@ add_test(
     "force_driven_dynamic_route_updates_inside_solver",
     devices,
     test_force_driven_dynamic_route_updates_inside_solver,
+)
+add_test(
+    TestTendonCapstan,
+    "dynamic_route_activation_uses_accepted_pose",
+    devices,
+    test_dynamic_route_activation_uses_accepted_pose,
 )
 add_test(
     TestTendonCapstan,
