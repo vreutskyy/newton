@@ -3514,6 +3514,147 @@ def test_material_transfer_delta_reaches_capstan_bound(test, device):
         )
 
 
+def test_material_transfer_short_stiff_span_reaches_capstan_bound(test, device):
+    """A seeded search must not overtransfer into the sticking cone on a millimeter span."""
+    material = {
+        "tendon_sigmoid_ea_low": 1.0e5,
+        "tendon_sigmoid_ea_ratio": 10.0,
+        "tendon_sigmoid_transition_strain": 0.01,
+        "tendon_sigmoid_transition_width": 0.003,
+    }
+    # Length, stretch, compliance, and signed damping tension on each side,
+    # followed by the capstan ratio and minimum rest length.
+    inputs = np.array(
+        [
+            [
+                0.92338794,
+                0.00024624719,
+                1.0e-3,
+                -5.2265472,
+                0.0015967730,
+                1.1958657e-8,
+                1.0e-3,
+                0.05955357,
+                8.079463,
+                1.0e-6,
+            ],
+            [
+                0.57543057,
+                0.00007028520,
+                1.0e-3,
+                -3.2897294,
+                0.0016807445,
+                1.5237820e-8,
+                1.0e-3,
+                0.15492801,
+                5.670775,
+                1.0e-6,
+            ],
+            [
+                0.87295008,
+                0.00046448651,
+                1.0e-3,
+                -15.828298,
+                0.0010416997,
+                1.4480457e-8,
+                1.0e-3,
+                0.10011336,
+                2.118709,
+                1.0e-6,
+            ],
+            [
+                0.73449081,
+                0.00005580587,
+                1.0e-3,
+                -6.7456317,
+                0.0025013199,
+                1.9021170e-8,
+                1.0e-3,
+                -0.84322917,
+                4.641068,
+                1.0e-6,
+            ],
+            [
+                0.0017613044,
+                0.000018538092,
+                1.0e-3,
+                -422.75708,
+                0.83326381,
+                3.2186508e-6,
+                1.0e-3,
+                -0.10706627,
+                2.510671,
+                1.0e-6,
+            ],
+            [0.0011951855, 0.000028289021, 1.0e-3, 0.0, 0.68580937, 1.1453037e-6, 1.0e-3, 0.0, 1.689236, 1.0e-6],
+        ],
+        dtype=np.float32,
+    )
+    # Match the stretch precision produced by the geometry kernel.
+    inputs[:, 1] = inputs[:, 0] - (inputs[:, 0] - inputs[:, 1])
+    inputs[:, 5] = inputs[:, 4] - (inputs[:, 4] - inputs[:, 5])
+    delta_out = wp.zeros(len(inputs), dtype=float, device=device)
+    wp.launch(
+        _material_transfer_delta_kernel,
+        dim=len(inputs),
+        inputs=[
+            wp.array(inputs, dtype=float, device=device),
+            material["tendon_sigmoid_ea_low"],
+            material["tendon_sigmoid_ea_ratio"],
+            material["tendon_sigmoid_transition_strain"],
+            material["tendon_sigmoid_transition_width"],
+        ],
+        outputs=[delta_out],
+        device=device,
+    )
+    delta = delta_out.numpy()
+    max_delta = np.minimum(inputs[:, 1], inputs[:, 4] - inputs[:, 5] - inputs[:, 9])
+    test.assertTrue(np.all(delta >= 0.0))
+    test.assertTrue(np.all(delta <= max_delta))
+    rest_high = inputs[:, 0] - inputs[:, 1] + delta
+    rest_low = inputs[:, 4] - inputs[:, 5] - delta
+    tension_high = np.maximum(sigmoid_tendon_tension(inputs[:, 0], rest_high, material) + inputs[:, 3], 0.0)
+    tension_low = np.maximum(sigmoid_tendon_tension(inputs[:, 4], rest_low, material) + inputs[:, 7], 0.0)
+    residual = tension_high - inputs[:, 8] * tension_low
+    # dT/drest = -(length/rest) * dT/dlength. The root may lie between float32 rest lengths.
+    resolution_high = (
+        sigmoid_tendon_tangent(inputs[:, 0], rest_high, material) * inputs[:, 0] / rest_high * np.spacing(rest_high)
+    )
+    resolution_low = (
+        sigmoid_tendon_tangent(inputs[:, 4], rest_low, material) * inputs[:, 4] / rest_low * np.spacing(rest_low)
+    )
+    scale = np.maximum(tension_high, inputs[:, 8] * tension_low)
+    np.testing.assert_array_less(
+        np.abs(residual), 1.0e-4 * scale + 2.0 * (resolution_high + inputs[:, 8] * resolution_low)
+    )
+
+
+def test_material_transfer_respects_available_rest_length(test, device):
+    """An unreachable capstan boundary must not move more material than is available."""
+    inputs = np.array(
+        [
+            [1.0, 0.0, 1.0e-3, 100.0, 1.0, 0.0, 1.0e-3, 0.0, 2.0, 1.0e-6],
+            [1.0, 0.1, 1.0e-3, 100.0, 1.0e-6, 0.0, 1.0e-3, 0.0, 2.0, 1.0e-6],
+            [1.0, 0.1, 1.0e-3, 100.0, 1.0, 0.0, 1.0e-3, 0.0, 2.0, 1.0e-6],
+            [1.0, 0.1, 1.0e-3, 1000.0, 2.0e-6, 0.0, 1.0e-3, 0.0, 2.0, 1.0e-6],
+        ],
+        dtype=np.float32,
+    )
+    delta_out = wp.zeros(len(inputs), dtype=float, device=device)
+    wp.launch(
+        _material_transfer_delta_kernel,
+        dim=len(inputs),
+        inputs=[wp.array(inputs, dtype=float, device=device), 100.0, 1.0, 0.01, 0.003],
+        outputs=[delta_out],
+        device=device,
+    )
+    delta = delta_out.numpy()
+    max_delta = np.minimum(inputs[:, 1], inputs[:, 4] - inputs[:, 5] - inputs[:, 9])
+    test.assertTrue(np.all(delta >= 0.0))
+    test.assertTrue(np.all(delta <= max_delta))
+    np.testing.assert_allclose(delta, max_delta, rtol=1.0e-6, atol=0.0)
+
+
 devices = ["cpu"]
 if wp.is_cuda_available():
     devices.append("cuda:0")
@@ -3524,6 +3665,18 @@ add_test(
     "material_transfer_delta_reaches_capstan_bound",
     devices,
     test_material_transfer_delta_reaches_capstan_bound,
+)
+add_test(
+    TestTendonCapstan,
+    "material_transfer_short_stiff_span_reaches_capstan_bound",
+    devices,
+    test_material_transfer_short_stiff_span_reaches_capstan_bound,
+)
+add_test(
+    TestTendonCapstan,
+    "material_transfer_respects_available_rest_length",
+    devices,
+    test_material_transfer_respects_available_rest_length,
 )
 
 add_test(TestTendonCapstan, "pinhole_slip_atwood", devices, test_pinhole_slip_atwood)

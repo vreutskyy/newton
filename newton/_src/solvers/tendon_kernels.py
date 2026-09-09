@@ -72,13 +72,10 @@ def tendon_material_transfer_delta(
 ) -> float:
     """Find a conservative rest-length transfer that reaches the nonlinear capstan bound.
 
-    The residual ``T_high(delta) - cap_ratio * T_low(delta)`` is monotone in ``delta`` on
-    ``[0, max_delta]``, so a bracketing search is safe. Instead of 12 blind bisection steps
-    from the bracket midpoint, the bracket is first cut at the closed-form transfer of the
-    frozen-secant linearisation (the linear-law formula with the current secant compliances
-    ``stretch / tension`` of both segments), then bisected with an early exit once the
-    relative residual is below 1e-4. This is typically 1-3 tension evaluations per side
-    instead of 12 and never leaves the feasible bracket.
+    Seed a monotone bracketing search with the frozen-secant estimate, then refine until
+    the residual is below 1e-4 of the trial tensions. If the iteration budget or float
+    precision is exhausted, keep the lower bound: later sweeps can correct undertransfer,
+    but cannot undo overtransfer into the sticking cone.
     """
     max_delta = wp.min(
         wp.max(stretch_high, 0.0),
@@ -126,10 +123,8 @@ def tendon_material_transfer_delta(
 
     lo = float(0.0)
     hi = max_delta
-    tol = 1.0e-4 * wp.max(force_high0, 1.0e-30)
     trial = guess
-    # 12 steps bound the worst case at the original 2^-12 bracket resolution.
-    for _iteration in range(12):
+    for _iteration in range(32):
         trial_force_high = wp.max(
             tendon_material_tension(
                 length_high,
@@ -157,6 +152,8 @@ def tendon_material_transfer_delta(
             0.0,
         )
         residual = trial_force_high - cap_ratio * trial_force_low
+        # Entry tension can be much larger than the final tension on an unloading span.
+        tol = 1.0e-4 * wp.max(wp.max(trial_force_high, cap_ratio * trial_force_low), 1.0e-30)
         if wp.abs(residual) <= tol:
             return trial
         if residual > 0.0:
@@ -164,7 +161,9 @@ def tendon_material_transfer_delta(
         else:
             hi = trial
         trial = 0.5 * (lo + hi)
-    return 0.5 * (lo + hi)
+        if trial == lo or trial == hi:
+            break
+    return lo
 
 
 @wp.func
