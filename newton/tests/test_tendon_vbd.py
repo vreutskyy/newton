@@ -1852,6 +1852,75 @@ def test_vbd_tendon_alm_two_tendons_keep_separate_multipliers(test, device):
             )
 
 
+def test_vbd_tendon_alm_guarded_tendon_matches_flag_off(test, device):
+    """A tendon the stiffness guard leaves on the legacy row must reproduce the flag-off run bit for bit.
+
+    A routed cable with a nonlinear law is the sensitive case: the legacy row linearises the material with its
+    tangent, so any leak of the ALM row's secant into the guarded-off path shows up in the trajectory."""
+    laws = {
+        "linear": {},
+        "sigmoid": {
+            "tendon_sigmoid_ea_low": 2000.0,
+            "tendon_sigmoid_ea_ratio": 10.0,
+            "tendon_sigmoid_transition_strain": 0.002,
+            "tendon_sigmoid_transition_width": 0.001,
+        },
+    }
+    with wp.ScopedDevice(device):
+        for law_name, law_kwargs in laws.items():
+            trajectories = {}
+            for alm in (False, True):
+                model, slider = build_fixed_rolling_chain()
+                model.tendon_seg_damping.fill_(50.0)
+                _set_serial_body_coloring(model)
+                # An impossibly high ratio forces the guard to keep the legacy row for every tendon.
+                solver = newton.solvers.SolverVBD(
+                    model,
+                    **TENDON_VBD_SOLVER_KWARGS,
+                    **law_kwargs,
+                    tendon_alm=alm,
+                    tendon_alm_min_stiffness_ratio=1.0e12,
+                )
+                state_0 = model.state()
+                state_1 = model.state()
+                control = model.control()
+                direction = solver.tendon_seg_attachment_r.numpy()[-1] - solver.tendon_seg_attachment_l.numpy()[-1]
+                direction /= np.linalg.norm(direction)
+                dt = 1.0 / 120.0
+                frames = []
+                for step in range(240):
+                    # 10 N for one second, then released so the cable goes slack.
+                    body_f = np.zeros((model.body_count, 6), dtype=np.float32)
+                    body_f[slider, :3] = (10.0 if step < 120 else 0.0) * direction
+                    state_0.body_f.assign(wp.array(body_f, dtype=wp.spatial_vector))
+                    solver.step(state_0, state_1, control, None, dt)
+                    state_0, state_1 = state_1, state_0
+                    frames.append(
+                        np.concatenate(
+                            [
+                                state_0.body_q.numpy().ravel(),
+                                state_0.body_qd.numpy().ravel(),
+                                solver.tendon_seg_material_tension.numpy(),
+                                solver.tendon_seg_damping_tension.numpy(),
+                                solver.tendon_seg_lambda.numpy(),
+                            ]
+                        )
+                    )
+                trajectories[alm] = np.array(frames)
+                if alm:
+                    test.assertTrue(
+                        np.all(solver.tendon_alm_mode.numpy() == 0), "guard must have chosen the legacy row"
+                    )
+                    test.assertTrue(np.all(solver.tendon_seg_alm_k.numpy() == 0.0))
+                    test.assertTrue(np.all(solver.tendon_seg_alm_lambda.numpy() == 0.0))
+
+            test.assertTrue(
+                np.array_equal(trajectories[True], trajectories[False]),
+                f"{law_name} law: the guarded-off ALM run differs from the flag-off run, max |delta| = "
+                f"{np.max(np.abs(trajectories[True] - trajectories[False]))}",
+            )
+
+
 def test_vbd_tendon_alm_disabled_leaves_state_untouched(test, device):
     """With the default flag the ALM arrays stay zero and no multiplier is reported."""
     with wp.ScopedDevice(device):
@@ -1885,6 +1954,12 @@ add_test(
     "vbd_tendon_alm_two_tendons_keep_separate_multipliers",
     devices,
     test_vbd_tendon_alm_two_tendons_keep_separate_multipliers,
+)
+add_test(
+    TestTendonVBD,
+    "vbd_tendon_alm_guarded_tendon_matches_flag_off",
+    devices,
+    test_vbd_tendon_alm_guarded_tendon_matches_flag_off,
 )
 add_test(
     TestTendonVBD,

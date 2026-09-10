@@ -142,7 +142,10 @@ def update_tendon_segment_diagnostics(
         sigmoid_transition_width,
     )
     seg_damping_tension[seg] = seg_active_damping[seg] * length_rate
+    alm_rho = float(0.0)
     if alm_enabled != 0:
+        alm_rho = seg_alm_k[seg]
+    if alm_rho > 0.0:
         # Report the ALM row's tension at the accepted pose (its own length rate and the multiplier after the last
         # ascent), split so that ``material + damping`` is that tension: on a taut span material = T - damping,
         # on a slack span the row applies no damping, so damping is reported as 0 and material = T >= 0.
@@ -762,7 +765,12 @@ def evaluate_tendon_force_hessians(
         rest_length = seg_rest_length[seg]
         tension = float(0.0)
         effective_stiffness = float(0.0)
-        if alm_enabled == 0:
+        # A tendon the stiffness guard left on the legacy row carries rho = 0: it takes the untouched legacy
+        # path below, so its result is bit-identical to running with the ALM row switched off.
+        alm_rho = float(0.0)
+        if alm_enabled != 0:
+            alm_rho = seg_alm_k[seg]
+        if alm_enabled == 0 or alm_rho <= 0.0:
             if length <= rest_length:
                 continue
 
