@@ -1659,10 +1659,239 @@ VBD_EXAMPLE_ASSERTION_CASES = (
 )
 
 
+def test_vbd_tendon_alm_matches_penalty_equilibrium(test, device):
+    """The compliant-ALM stretch row must reach the same static equilibrium as the penalty row, with the
+    multiplier equal to the material tension."""
+    with wp.ScopedDevice(device):
+        results = {}
+        for alm in (False, True):
+            model, body_idx, mass, compliance, initial_z = build_simple_cable_gravity()
+            model.tendon_seg_damping.fill_(100.0)
+            _set_serial_body_coloring(model)
+            solver = newton.solvers.SolverVBD(
+                model, **TENDON_VBD_SOLVER_KWARGS, tendon_alm=alm, tendon_alm_min_stiffness_ratio=0.0
+            )
+            state_0 = model.state()
+            state_1 = model.state()
+            control = model.control()
+            contacts = model.contacts()
+            dt = 1.0 / 120.0
+            for _ in range(round(1.5 / dt)):
+                state_0.clear_forces()
+                solver.step(state_0, state_1, control, contacts, dt)
+                state_0, state_1 = state_1, state_0
+
+            attachment_l = solver.tendon_seg_attachment_l.numpy()[0]
+            attachment_r = solver.tendon_seg_attachment_r.numpy()[0]
+            stretch = float(np.linalg.norm(attachment_r - attachment_l)) - float(
+                solver.tendon_seg_rest_length.numpy()[0]
+            )
+            results[alm] = {
+                "z": float(state_0.body_q.numpy()[body_idx][2]),
+                "material_tension": stretch / compliance,
+                "reported_tension": float(solver.tendon_seg_material_tension.numpy()[0])
+                + float(solver.tendon_seg_damping_tension.numpy()[0]),
+                "multiplier": float(solver.tendon_seg_lambda.numpy()[0]),
+                "alm_lambda": float(solver.tendon_seg_alm_lambda.numpy()[0]) if alm else 0.0,
+            }
+
+        load = mass * 9.81
+        expected_z = initial_z - load * compliance
+        for alm, r in results.items():
+            test.assertAlmostEqual(r["material_tension"], load, delta=0.05 * load, msg=f"alm={alm}: {r}")
+            test.assertAlmostEqual(r["z"], expected_z, delta=5.0e-3, msg=f"alm={alm}: {r}")
+            test.assertAlmostEqual(r["reported_tension"], load, delta=0.05 * load, msg=f"alm={alm}: {r}")
+        test.assertAlmostEqual(results[True]["z"], results[False]["z"], delta=1.0e-3, msg=str(results))
+        test.assertEqual(results[False]["multiplier"], 0.0, "penalty mode must not report a multiplier")
+        test.assertAlmostEqual(
+            results[True]["alm_lambda"],
+            load,
+            delta=0.02 * load,
+            msg=f"ALM multiplier should carry the static tension: {results[True]}",
+        )
+        test.assertEqual(results[True]["multiplier"], results[True]["alm_lambda"])
+
+
+def test_vbd_tendon_alm_releases_slack_segment(test, device):
+    """A stale stretch multiplier on a slack segment must release without pushing on the bodies."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+        anchor = builder.add_body(mass=0.0, is_kinematic=True)
+        body = builder.add_body(
+            xform=wp.transform(p=wp.vec3(0.25, 0.0, 0.0)),
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3)),
+        )
+        builder.add_tendon()
+        builder.add_tendon_link(body=anchor, link_type=int(TendonLinkType.ATTACHMENT))
+        builder.add_tendon_link(
+            body=body,
+            link_type=int(TendonLinkType.ATTACHMENT),
+            compliance=1.0e-3,
+            damping=100.0,
+            rest_length=1.0,
+        )
+        builder.color()
+        model = builder.finalize()
+        solver = newton.solvers.SolverVBD(
+            model, **TENDON_VBD_SOLVER_KWARGS, tendon_alm=True, tendon_alm_min_stiffness_ratio=0.0
+        )
+        state_0 = model.state()
+        state_1 = model.state()
+        dt = 1.0 / 120.0
+        # First step registers the route identity of the multiplier; then plant a stale tension on it.
+        solver.step(state_0, state_1, model.control(), None, dt)
+        state_0, state_1 = state_1, state_0
+        # Plant the stale tension where the row keeps it (the per-segment array is a broadcast copy rewritten each step).
+        solver.tendon_alm_lambda.fill_(50.0)
+        solver.tendon_seg_alm_lambda.fill_(50.0)
+        state_0.body_qd.assign(
+            [
+                wp.spatial_vector(0.0),
+                wp.spatial_vector(30.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            ]
+        )
+        solver.step(state_0, state_1, model.control(), None, dt)
+
+        final_vx = float(state_1.body_qd.numpy()[body][0])
+        test.assertAlmostEqual(final_vx, 30.0, delta=1.0e-4, msg="slack segment must transmit no force")
+        test.assertEqual(float(solver.tendon_seg_alm_lambda.numpy()[0]), 0.0, "stale multiplier must release")
+        # Same contract as the legacy slack test: no material tension is reported for a slack span.
+        test.assertEqual(float(solver.tendon_seg_material_tension.numpy()[0]), 0.0)
+        test.assertEqual(float(solver.tendon_seg_lambda.numpy()[0]), 0.0)
+
+
+def test_vbd_tendon_alm_shared_multiplier_matches_material_law(test, device):
+    """On a routed cable whose segments differ in stiffness, the shared multiplier must settle on the material
+    tension of every segment (the ascent averages force residuals, not stretch)."""
+    with wp.ScopedDevice(device):
+        model, slider = build_fixed_rolling_chain()
+        compliance = model.tendon_seg_compliance.numpy()
+        compliance[1] *= 8.0  # one span eight times softer: K differs across the tendon
+        model.tendon_seg_compliance.assign(compliance)
+        model.tendon_seg_damping.fill_(50.0)
+        solver = newton.solvers.SolverVBD(
+            model, **TENDON_VBD_SOLVER_KWARGS, tendon_alm=True, tendon_alm_min_stiffness_ratio=0.0
+        )
+        state_0 = model.state()
+        state_1 = model.state()
+        control = model.control()
+
+        direction = solver.tendon_seg_attachment_r.numpy()[-1] - solver.tendon_seg_attachment_l.numpy()[-1]
+        direction /= np.linalg.norm(direction)
+        body_f = np.zeros((model.body_count, 6), dtype=np.float32)
+        body_f[slider, :3] = 10.0 * direction
+        dt = 1.0 / 120.0
+        for _ in range(240):
+            state_0.body_f.assign(wp.array(body_f, dtype=wp.spatial_vector))
+            solver.step(state_0, state_1, control, None, dt)
+            state_0, state_1 = state_1, state_0
+
+        lengths = np.linalg.norm(
+            solver.tendon_seg_attachment_r.numpy() - solver.tendon_seg_attachment_l.numpy(), axis=1
+        )
+        material = np.maximum(lengths - solver.tendon_seg_rest_length.numpy(), 0.0) / np.maximum(
+            solver.tendon_seg_active_compliance.numpy(), 1.0e-30
+        )
+        lam = float(solver.tendon_alm_lambda.numpy()[0])
+        test.assertAlmostEqual(lam, 10.0, delta=0.5, msg=f"multiplier should carry the 10 N load: {lam}")
+        for seg, t_law in enumerate(material):
+            test.assertAlmostEqual(
+                t_law, 10.0, delta=0.5, msg=f"segment {seg}: material-law tension {t_law:.3f} should equal the load"
+            )
+
+
+def test_vbd_tendon_alm_two_tendons_keep_separate_multipliers(test, device):
+    """Two cables in one model each settle on their own load (per-tendon segment ranges and multipliers)."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=-9.81)
+        masses = (1.0, 3.0)
+        compliance = 1.0e-3
+        for i, mass in enumerate(masses):
+            anchor = builder.add_body(xform=wp.transform(p=wp.vec3(float(i), 0.0, 0.0)), mass=0.0, is_kinematic=True)
+            body = builder.add_body(
+                xform=wp.transform(p=wp.vec3(float(i), 0.0, -0.5)),
+                mass=mass,
+                inertia=wp.mat33(np.eye(3) * 0.01 * mass),
+            )
+            builder.add_tendon()
+            builder.add_tendon_link(body=anchor, link_type=int(TendonLinkType.ATTACHMENT))
+            builder.add_tendon_link(
+                body=body,
+                link_type=int(TendonLinkType.ATTACHMENT),
+                compliance=compliance,
+                damping=50.0,
+                rest_length=0.5,
+            )
+        builder.color()
+        model = builder.finalize()
+        solver = newton.solvers.SolverVBD(
+            model, **TENDON_VBD_SOLVER_KWARGS, tendon_alm=True, tendon_alm_min_stiffness_ratio=0.0
+        )
+        state_0 = model.state()
+        state_1 = model.state()
+        control = model.control()
+        dt = 1.0 / 120.0
+        for _ in range(240):
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, None, dt)
+            state_0, state_1 = state_1, state_0
+
+        lam = solver.tendon_alm_lambda.numpy()
+        lengths = np.linalg.norm(
+            solver.tendon_seg_attachment_r.numpy() - solver.tendon_seg_attachment_l.numpy(), axis=1
+        )
+        material = np.maximum(lengths - solver.tendon_seg_rest_length.numpy(), 0.0) / compliance
+        for t, mass in enumerate(masses):
+            load = mass * 9.81
+            test.assertAlmostEqual(
+                float(lam[t]), load, delta=0.05 * load, msg=f"tendon {t}: multiplier {lam[t]:.3f} vs load {load:.3f}"
+            )
+            test.assertAlmostEqual(
+                float(material[t]), load, delta=0.05 * load, msg=f"tendon {t}: material {material[t]:.3f}"
+            )
+
+
+def test_vbd_tendon_alm_disabled_leaves_state_untouched(test, device):
+    """With the default flag the ALM arrays stay zero and no multiplier is reported."""
+    with wp.ScopedDevice(device):
+        model, _body = build_single_span_tendon()
+        _state, solver = run_vbd_model(model, num_frames=10, substeps=4)
+        test.assertFalse(solver.tendon_alm)
+        test.assertIsNone(solver.tendon_seg_alm_lambda, "no ALM state is allocated when the row is off")
+        test.assertIsNone(solver.tendon_alm_lambda)
+        test.assertTrue(np.all(solver.tendon_seg_lambda.numpy() == 0.0))
+
+
 devices = ["cpu"]
 if wp.is_cuda_available():
     devices.append("cuda:0")
 
+add_test(
+    TestTendonVBD,
+    "vbd_tendon_alm_matches_penalty_equilibrium",
+    devices,
+    test_vbd_tendon_alm_matches_penalty_equilibrium,
+)
+add_test(TestTendonVBD, "vbd_tendon_alm_releases_slack_segment", devices, test_vbd_tendon_alm_releases_slack_segment)
+add_test(
+    TestTendonVBD,
+    "vbd_tendon_alm_shared_multiplier_matches_material_law",
+    devices,
+    test_vbd_tendon_alm_shared_multiplier_matches_material_law,
+)
+add_test(
+    TestTendonVBD,
+    "vbd_tendon_alm_two_tendons_keep_separate_multipliers",
+    devices,
+    test_vbd_tendon_alm_two_tendons_keep_separate_multipliers,
+)
+add_test(
+    TestTendonVBD,
+    "vbd_tendon_alm_disabled_leaves_state_untouched",
+    devices,
+    test_vbd_tendon_alm_disabled_leaves_state_untouched,
+)
 add_test(TestTendonVBD, "vbd_tendon_stretch_pulls_toward_anchor", devices, test_vbd_tendon_stretch_pulls_toward_anchor)
 add_test(
     TestTendonVBD,
