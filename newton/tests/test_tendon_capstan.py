@@ -2440,6 +2440,7 @@ def test_tendon_slip_uses_true_segment_compliance(test, device):
                 seg_delta_lambda,
                 1.0,
                 0.0,
+                False,
             ],
             outputs=[body_deltas],
         )

@@ -237,6 +237,7 @@ def solve_tendon_slip(
     seg_delta_lambda: wp.array[float],
     relaxation: float,
     sigmoid_ea_low: float,
+    direct_material: bool,
     # outputs
     body_deltas: wp.array[wp.spatial_vector],
 ):
@@ -320,5 +321,11 @@ def solve_tendon_slip(
         candidate = angular * seg_delta_lambda[seg_right]
         spin_delta = spin_delta + normal * wp.dot(candidate, normal)
 
-    spin_delta = spin_delta * scale * beta
+    # The direct projection starts from full no-slip rolling motion. Its cone
+    # limiter already bounds the reaction; multiplying by beta again would
+    # under-apply the torque associated with that material transfer.
+    if direct_material:
+        spin_delta = spin_delta * scale
+    else:
+        spin_delta = spin_delta * scale * beta
     wp.atomic_add(body_deltas, body, wp.spatial_vector(wp.vec3(0.0, 0.0, 0.0), spin_delta))

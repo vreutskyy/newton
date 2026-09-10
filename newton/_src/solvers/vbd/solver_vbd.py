@@ -21,7 +21,7 @@ from ...sim import (
 )
 from ..flags import SolverNotifyFlags
 from ..solver import SolverBase
-from ..tendon_kernels import solve_tendon_material, update_tendon_attachments
+from ..tendon_kernels import update_tendon_attachments
 from ..tendon_state import TendonStateMixin
 from ..xpbd.kernels import apply_joint_forces
 from .particle_vbd_kernels import (
@@ -257,6 +257,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
         tendon_sigmoid_ea_ratio: float = 1.0,
         tendon_sigmoid_transition_strain: float = 0.0,
         tendon_sigmoid_transition_width: float = 1.0,
+        tendon_material_direct: bool = False,
     ):
         """
         Args:
@@ -376,6 +377,11 @@ class SolverVBD(TendonStateMixin, SolverBase):
             tendon_sigmoid_ea_ratio: Experimental high/low axial-stiffness ratio.
             tendon_sigmoid_transition_strain: Experimental sigmoid transition strain.
             tendon_sigmoid_transition_width: Experimental sigmoid transition width.
+            tendon_material_direct: Use the experimental direct finite-friction material solve instead of
+                material sweeps. Requires linear compliance, at most 32 segments per connected material
+                component, and capstan ratios no greater than 4. Call :meth:`check_tendon_material` outside
+                CUDA graph capture to detect unsupported or infeasible runtime states. There is no fallback
+                to material sweeps; discard a failed step and reconstruct the solver after correcting its inputs.
 
         Note:
             - The `integrate_with_external_rigid_solver` argument enables one-way coupling between rigid body and soft body
@@ -418,6 +424,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
         self.tendon_sigmoid_ea_ratio = tendon_sigmoid_ea_ratio
         self.tendon_sigmoid_transition_strain = tendon_sigmoid_transition_strain
         self.tendon_sigmoid_transition_width = tendon_sigmoid_transition_width
+        self.tendon_material_direct = tendon_material_direct
         # Rigid integration mode: when True, rigid bodies are integrated by an external
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
         # participate in particle-rigid interaction on the particle side.
@@ -1666,6 +1673,13 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 depend on this argument.
             dt: Time step size.
         """
+        if self.tendon_material_direct != self._tendon_material_state.enabled:
+            raise ValueError("Reconstruct SolverVBD to change tendon_material_direct")
+        if self.tendon_material_direct and (state_in.requires_grad or state_out.requires_grad):
+            raise ValueError("tendon_material_direct does not support differentiable simulation")
+        if self.tendon_material_direct and self.tendon_sigmoid_ea_low > 0.0:
+            raise ValueError("tendon_material_direct requires linear per-segment compliance")
+
         update_rigid = self._update_rigid_history
         self._update_rigid_history = True
 
@@ -2475,7 +2489,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
         self._update_tendon_cone_rows(model, state_in.body_q, report_unsupported_wrap)
 
         wp.launch(
-            kernel=solve_tendon_material,
+            kernel=self._tendon_material_kernel,
             dim=model.tendon_count,
             inputs=[
                 state_in.body_q,
@@ -2523,6 +2537,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_sigmoid_ea_ratio,
                 self.tendon_sigmoid_transition_strain,
                 self.tendon_sigmoid_transition_width,
+                self._tendon_material_state,
             ],
             device=self.device,
         )
@@ -2797,6 +2812,10 @@ class SolverVBD(TendonStateMixin, SolverBase):
                     self.tendon_sigmoid_ea_ratio,
                     self.tendon_sigmoid_transition_strain,
                     self.tendon_sigmoid_transition_width,
+                    self.tendon_material_direct,
+                    self.tendon_link_cone_seg_l,
+                    self.tendon_link_cone_seg_r,
+                    self.tendon_link_cap_ratio,
                 ],
                 outputs=[
                     state_in.body_q,

@@ -19,10 +19,13 @@ from .tendon_kernels import (
     prepare_tendon_route,
     snapshot_tendon_link_active,
     solve_tendon_material,
+    solve_tendon_material_direct,
     update_tendon_attachments,
     update_tendon_cone_rows,
     update_tendon_link_active,
 )
+from .tendon_material import TendonMaterialStatus
+from .tendon_material_state import TendonMaterialState
 
 
 def _transform_point_np(pose: np.ndarray, point: np.ndarray) -> np.ndarray:
@@ -104,8 +107,83 @@ def _segment_attachment_points_np(
 class TendonStateMixin:
     """Mixin that allocates routed-tendon mutable state on a solver instance."""
 
+    def _init_direct_tendon_material(self, model: Model) -> None:
+        """Validate and allocate the opt-in direct solver's packed workspace."""
+        if not getattr(self, "tendon_material_direct", False):
+            return
+        if model.requires_grad:
+            raise ValueError("tendon_material_direct does not support differentiable simulation")
+        if self.tendon_sigmoid_ea_low > 0.0:
+            raise ValueError("tendon_material_direct requires linear per-segment compliance")
+        if model.tendon_segment_count:
+            compliance = model.tendon_seg_compliance.numpy()
+            if not np.all(np.isfinite(compliance) & (compliance >= 1.0e-25)):
+                raise ValueError("tendon_material_direct requires finite segment compliance >= 1e-25")
+            starts = model.tendon_start.numpy()
+            kinds = model.tendon_link_type.numpy()
+            for tendon in range(model.tendon_count):
+                count = 0
+                for kind in kinds[starts[tendon] + 1 : starts[tendon + 1]]:
+                    count += 1
+                    if count > 32:
+                        raise ValueError(
+                            "tendon_material_direct supports at most 32 authored spans between attachments "
+                            f"(tendon {tendon})"
+                        )
+                    if kind == int(TendonLinkType.ATTACHMENT):
+                        count = 0
+
+        state = self._tendon_material_state
+        state.enabled = True
+        state.raw_compliance = model.tendon_seg_compliance
+        self._tendon_material_kernel = solve_tendon_material_direct
+        for name in ("initial", "compliance", "cap", "upper", "output"):
+            setattr(state, name, wp.zeros(model.tendon_segment_count, dtype=float, device=model.device))
+        for name in ("status", "faces", "valid", "pieces", "count", "next_link", "incoming"):
+            setattr(state, name, wp.zeros(model.tendon_segment_count, dtype=int, device=model.device))
+        for name in ("ids", "edge_ids"):
+            setattr(state, name, wp.full(model.tendon_segment_count, -1, dtype=int, device=model.device))
+        state.failure = wp.zeros(model.tendon_count, dtype=int, device=model.device)
+        state.failure_component = wp.full(model.tendon_count, -1, dtype=int, device=model.device)
+
+    def check_tendon_material(self) -> None:
+        """Check the experimental direct material solve for latched failures.
+
+        Call outside CUDA graph capture, after a step or graph replay and before
+        consuming its results. This synchronizes the failure status to the host.
+        GPU execution is not rolled back on failure: discard the entire affected
+        step/frame/batch and reconstruct the solver after correcting the input.
+        No material sweeps are used as a fallback. Does nothing in sweep mode.
+
+        Raises:
+            RuntimeError: A direct solve received unsupported input, could not
+                satisfy the rest-length bound, or failed numerical validation.
+        """
+        state = self._tendon_material_state
+        if not state.enabled:
+            return
+        failures = state.failure.numpy()
+        failed = np.flatnonzero(failures)
+        if failed.size:
+            tendon = int(failed[0])
+            code = int(failures[tendon])
+            names = {-102: "INVALID_ROUTE", -103: "COMPONENT_TOO_LARGE"}
+            try:
+                reason = TendonMaterialStatus(code).name
+            except ValueError:
+                reason = names.get(code, "UNKNOWN_FAILURE")
+            component = int(state.failure_component.numpy()[tendon])
+            raise RuntimeError(
+                f"Direct tendon material solve failed: {reason} ({code}), tendon {tendon}, "
+                f"component starting at segment {component}. Discard this step/frame/batch; "
+                "correct the input and reconstruct the solver. No sweep fallback was applied."
+            )
+
     def _init_tendon_state(self, model: Model, allocate_xpbd_lambdas: bool = True) -> None:
         """Allocate mutable tendon state arrays and build segment/link mappings."""
+        self._tendon_material_state = TendonMaterialState()
+        self._tendon_material_state.enabled = False
+        self._tendon_material_kernel = solve_tendon_material
         self._has_dynamic_tendon_links = False
         # Solver-level cable cone parameters (a solver may override before calling this).
         if not hasattr(self, "tendon_max_sweeps"):
@@ -145,6 +223,7 @@ class TendonStateMixin:
                 raise ValueError(
                     f"tendon_sigmoid_transition_width must be positive, got {self.tendon_sigmoid_transition_width}"
                 )
+        self._init_direct_tendon_material(model)
         if model.tendon_segment_count == 0:
             self.tendon_seg_rest_length = None
             self.tendon_seg_rest_length_step = None
@@ -320,6 +399,10 @@ class TendonStateMixin:
         if model.tendon_segment_count == 0:
             return
 
+        if self._tendon_material_state.enabled:
+            # Also track array replacement outside capture, not just in-place updates.
+            self._tendon_material_state.raw_compliance = model.tendon_seg_compliance
+
         wp.launch(
             kernel=prepare_tendon_route,
             dim=model.tendon_count,
@@ -382,6 +465,7 @@ class TendonStateMixin:
                 self.tendon_seg_attachment_r,
                 self.tendon_seg_length,
                 int(report_unsupported_wrap),
+                self._tendon_material_state.enabled,
             ],
             outputs=[
                 self.tendon_link_cone_seg_l,
@@ -523,7 +607,7 @@ class TendonStateMixin:
         )
 
         wp.launch(
-            kernel=solve_tendon_material,
+            kernel=self._tendon_material_kernel,
             dim=model.tendon_count,
             inputs=[
                 body_q,
@@ -571,6 +655,7 @@ class TendonStateMixin:
                 self.tendon_sigmoid_ea_ratio,
                 self.tendon_sigmoid_transition_strain,
                 self.tendon_sigmoid_transition_width,
+                self._tendon_material_state,
             ],
             device=model.device,
         )
