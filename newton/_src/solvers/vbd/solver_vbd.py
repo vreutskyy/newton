@@ -83,6 +83,8 @@ from .rigid_vbd_kernels import (
 from .tendon_kernels import (
     TendonForceElementAdjacencyInfo,
     snapshot_tendon_segment_length_reference,
+    step_tendon_alm_state,
+    update_duals_tendon,
     update_tendon_segment_diagnostics,
 )
 from .tri_mesh_collision import (
@@ -257,6 +259,9 @@ class SolverVBD(TendonStateMixin, SolverBase):
         tendon_sigmoid_ea_ratio: float = 1.0,
         tendon_sigmoid_transition_strain: float = 0.0,
         tendon_sigmoid_transition_width: float = 1.0,
+        tendon_alm: bool = False,
+        tendon_alm_penalty_scale: float = 5.0,
+        tendon_alm_min_stiffness_ratio: float = 50.0,
     ):
         """
         Args:
@@ -376,6 +381,20 @@ class SolverVBD(TendonStateMixin, SolverBase):
             tendon_sigmoid_ea_ratio: Experimental high/low axial-stiffness ratio.
             tendon_sigmoid_transition_strain: Experimental sigmoid transition strain.
             tendon_sigmoid_transition_width: Experimental sigmoid transition width.
+            tendon_alm: Experimental. Solve routed-tendon stretch as a compliant augmented-Lagrangian row
+                (a tension multiplier shared along the tendon plus an inertia-scaled penalty) instead of a
+                stiffness penalty. The material law is unchanged at convergence; the row's Hessian is bounded
+                by the tendon's inertial support, so very stiff cables settle with fewer substeps. Off by default
+                (legacy behaviour, bit-identical).
+            tendon_alm_penalty_scale: Penalty metric of the ALM row as a multiple of the tendon's inertial
+                support ``1 / (dt^2 * w)``. Small values leave the multiplier too slow to follow a stiff cable;
+                large values fall back towards penalty behaviour.
+            tendon_alm_min_stiffness_ratio: A tendon whose material stiffness is below this multiple of its
+                inertial support keeps the legacy penalty row. The ratio is the penalty row's conditioning number
+                (how much heavier the cable's stretch term is than the body's inertia term in the local solve);
+                the ALM row is only worth its cost where that number is large. Decided once per tendon, at the
+                first step, and kept. 0 applies the ALM row to every tendon. The multiplier decays per step by
+                ``rigid_avbd_gamma``, like the joint multipliers.
 
         Note:
             - The `integrate_with_external_rigid_solver` argument enables one-way coupling between rigid body and soft body
@@ -418,6 +437,15 @@ class SolverVBD(TendonStateMixin, SolverBase):
         self.tendon_sigmoid_ea_ratio = tendon_sigmoid_ea_ratio
         self.tendon_sigmoid_transition_strain = tendon_sigmoid_transition_strain
         self.tendon_sigmoid_transition_width = tendon_sigmoid_transition_width
+        if tendon_alm_penalty_scale < 0.0:
+            raise ValueError(f"tendon_alm_penalty_scale must be non-negative, got {tendon_alm_penalty_scale}")
+        if tendon_alm_min_stiffness_ratio < 0.0:
+            raise ValueError(
+                f"tendon_alm_min_stiffness_ratio must be non-negative, got {tendon_alm_min_stiffness_ratio}"
+            )
+        self.tendon_alm = bool(tendon_alm)
+        self.tendon_alm_penalty_scale = float(tendon_alm_penalty_scale)
+        self.tendon_alm_min_stiffness_ratio = float(tendon_alm_min_stiffness_ratio)
         # Rigid integration mode: when True, rigid bodies are integrated by an external
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
         # participate in particle-rigid interaction on the particle side.
@@ -1682,8 +1710,15 @@ class SolverVBD(TendonStateMixin, SolverBase):
             self.tendon_seg_material_tension.zero_()
             if self.iterations == 0 or self.integrate_with_external_rigid_solver:
                 self.tendon_seg_lambda.zero_()
+                if self.tendon_alm:
+                    self.tendon_seg_alm_lambda.zero_()
+                    self.tendon_seg_alm_k.zero_()
+                    self.tendon_alm_lambda.zero_()
+                    self.tendon_alm_k.zero_()
 
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
+        # Step-start pose (body_q_prev is only advanced in _finalize_rigid_bodies).
+        self._step_tendon_alm_state(dt)
         self._initialize_particles(state_in, state_out, dt)
 
         for iter_num in range(self.iterations):
@@ -2527,6 +2562,53 @@ class SolverVBD(TendonStateMixin, SolverBase):
             device=self.device,
         )
 
+    def _step_tendon_alm_state(self, dt: float) -> None:
+        """Per-step compliant-ALM tendon maintenance from the step-start pose (``body_q_prev``)."""
+        model = self.model
+        if not self.tendon_alm or model.tendon_segment_count == 0 or self.integrate_with_external_rigid_solver:
+            return
+        wp.launch(
+            kernel=step_tendon_alm_state,
+            dim=model.tendon_count,
+            inputs=[
+                dt,
+                self.body_q_prev,
+                model.body_com,
+                self.body_inv_mass_effective,
+                self.body_inv_inertia_effective,
+                model.tendon_start,
+                model.tendon_link_body,
+                model.tendon_link_type,
+                model.tendon_link_radius,
+                model.tendon_link_mu,
+                model.tendon_link_offset,
+                model.tendon_link_axis,
+                self.tendon_link_seg_left,
+                self.tendon_seg_attachment_l_local_step,
+                self.tendon_seg_attachment_r_local_step,
+                self.tendon_seg_route_rest_length,
+                self.tendon_seg_active_compliance,
+                self.tendon_seg_active,
+                self.tendon_seg_active_link_l,
+                self.tendon_seg_active_link_r,
+                self.tendon_sigmoid_ea_low,
+                self.tendon_sigmoid_ea_ratio,
+                self.tendon_sigmoid_transition_strain,
+                self.tendon_sigmoid_transition_width,
+                self.tendon_alm_penalty_scale,
+                self.tendon_alm_min_stiffness_ratio,
+                self.rigid_avbd_gamma,
+                self.tendon_alm_mode,  # input/output
+                self.tendon_alm_lambda,  # input/output
+                self.tendon_alm_k,  # input/output
+                self.tendon_seg_alm_lambda,  # input/output
+                self.tendon_seg_alm_k,  # input/output
+                self.tendon_seg_alm_link_l,  # input/output
+                self.tendon_seg_alm_link_r,  # input/output
+            ],
+            device=self.device,
+        )
+
     def _snapshot_tendon_segment_length_reference(self, body_q: wp.array[wp.transform], dt: float) -> None:
         """Preserve previous-pose segment lengths through rigid finalization."""
         model = self.model
@@ -2577,6 +2659,9 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_sigmoid_ea_ratio,
                 self.tendon_sigmoid_transition_strain,
                 self.tendon_sigmoid_transition_width,
+                self.tendon_seg_alm_lambda,
+                self.tendon_seg_alm_k,
+                int(self.tendon_alm),
             ],
             outputs=[
                 self.tendon_seg_attachment_l,
@@ -2797,6 +2882,9 @@ class SolverVBD(TendonStateMixin, SolverBase):
                     self.tendon_sigmoid_ea_ratio,
                     self.tendon_sigmoid_transition_strain,
                     self.tendon_sigmoid_transition_width,
+                    self.tendon_seg_alm_lambda,
+                    self.tendon_seg_alm_k,
+                    int(self.tendon_alm),
                 ],
                 outputs=[
                     state_in.body_q,
@@ -2894,6 +2982,42 @@ class SolverVBD(TendonStateMixin, SolverBase):
                     self.joint_penalty_k,  # input/output
                     self.joint_lambda_lin,  # input/output
                     self.joint_lambda_ang,  # input/output
+                ],
+                device=self.device,
+            )
+
+        if self.tendon_alm and model.tendon_segment_count > 0:
+            # Dual ascent on the pose just produced by the colour sweeps, with the rest lengths
+            # this iteration's material solve gave the force kernel.
+            wp.launch(
+                kernel=update_duals_tendon,
+                dim=model.tendon_count,
+                inputs=[
+                    dt,
+                    state_in.body_q,
+                    self.body_q_prev,
+                    model.body_com,
+                    model.tendon_start,
+                    model.tendon_link_body,
+                    model.tendon_link_type,
+                    model.tendon_link_offset,
+                    model.tendon_link_axis,
+                    self.tendon_seg_attachment_l_local,
+                    self.tendon_seg_attachment_r_local,
+                    self.tendon_seg_rest_length,
+                    self.tendon_seg_active_compliance,
+                    self.tendon_seg_active_damping,
+                    self.tendon_seg_active,
+                    self.tendon_seg_active_link_l,
+                    self.tendon_seg_active_link_r,
+                    self.tendon_sigmoid_ea_low,
+                    self.tendon_sigmoid_ea_ratio,
+                    self.tendon_sigmoid_transition_strain,
+                    self.tendon_sigmoid_transition_width,
+                    self.tendon_alm_lambda,  # input/output
+                    self.tendon_alm_k,  # input
+                    self.tendon_seg_alm_lambda,  # input/output
+                    self.tendon_seg_alm_k,  # input
                 ],
                 device=self.device,
             )

@@ -161,6 +161,13 @@ class TendonStateMixin:
             self.tendon_seg_attachment_r_local_step = None
             self.tendon_seg_lambda = None
             self.tendon_seg_delta_lambda = None
+            self.tendon_seg_alm_lambda = None
+            self.tendon_seg_alm_k = None
+            self.tendon_seg_alm_link_l = None
+            self.tendon_seg_alm_link_r = None
+            self.tendon_alm_lambda = None
+            self.tendon_alm_k = None
+            self.tendon_alm_mode = None
             self.tendon_seg_rolling_delta_l = None
             self.tendon_seg_rolling_delta_r = None
             self.tendon_cone_sweep_count = None
@@ -197,6 +204,27 @@ class TendonStateMixin:
             self.tendon_seg_delta_lambda = (
                 wp.zeros(model.tendon_segment_count, dtype=float) if allocate_xpbd_lambdas else None
             )
+            # Compliant-ALM stretch row state (VBD, ``SolverVBD(tendon_alm=True)`` only; XPBD and the default VBD
+            # never touch it): the multiplier [N] and penalty metric [N/m] are shared along a tendon (one tension
+            # per frictionless cable) and broadcast into per-segment copies read by the force kernel, plus the
+            # route each segment's multiplier belongs to and the per-tendon row choice
+            # (-1 undecided, 0 legacy penalty row for soft cables, 1 ALM row; decided once, no chatter).
+            if getattr(self, "tendon_alm", False):
+                self.tendon_seg_alm_lambda = wp.zeros(model.tendon_segment_count, dtype=float)
+                self.tendon_seg_alm_k = wp.zeros(model.tendon_segment_count, dtype=float)
+                self.tendon_seg_alm_link_l = wp.full(model.tendon_segment_count, -1, dtype=wp.int32)
+                self.tendon_seg_alm_link_r = wp.full(model.tendon_segment_count, -1, dtype=wp.int32)
+                self.tendon_alm_lambda = wp.zeros(model.tendon_count, dtype=float)
+                self.tendon_alm_k = wp.zeros(model.tendon_count, dtype=float)
+                self.tendon_alm_mode = wp.full(model.tendon_count, -1, dtype=wp.int32)
+            else:
+                self.tendon_seg_alm_lambda = None
+                self.tendon_seg_alm_k = None
+                self.tendon_seg_alm_link_l = None
+                self.tendon_seg_alm_link_r = None
+                self.tendon_alm_lambda = None
+                self.tendon_alm_k = None
+                self.tendon_alm_mode = None
             self.tendon_seg_rolling_delta_l = wp.zeros(model.tendon_segment_count, dtype=float)
             self.tendon_seg_rolling_delta_r = wp.zeros(model.tendon_segment_count, dtype=float)
             # Cached instantaneous damping term used by routing and slip projections.
