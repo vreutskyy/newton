@@ -89,10 +89,12 @@ class SolverXPBD(TendonStateMixin, SolverBase):
 
     The experimental constructor option ``tendon_material_direct=True`` replaces
     material sweeps with a finite-friction direct solve and matching rolling
-    reaction. It currently supports linear compliance >= 1e-25 m/N, at most 32
-    authored spans between attachments, and capstan ratios up to 4. Geometry-
-    dependent cap ratios and feasibility are checked at runtime. Nonlinear
-    material and differentiable simulation are not supported in this mode.
+    reaction. It supports linear compliance >= 1e-25 m/N or the experimental
+    sigmoid law, at most 32 authored spans between attachments, and capstan
+    ratios up to 4. CUDA uses a cooperative warp for sigmoid projection; CPU
+    uses the scalar exact-block implementation. Geometry-dependent cap ratios
+    and numerical feasibility are checked at runtime. Differentiable simulation
+    is not supported in this mode. See ``docs/direct_tendon_material.md``.
     ``tendon_max_sweeps`` and ``tendon_settle_tol`` do not control direct solves.
     Select the mode at construction; reconstruct the solver to change it.
 
@@ -343,8 +345,7 @@ class SolverXPBD(TendonStateMixin, SolverBase):
             raise ValueError("Reconstruct SolverXPBD to change tendon_material_direct")
         if self.tendon_material_direct and (requires_grad or state_out.requires_grad):
             raise ValueError("tendon_material_direct does not support differentiable simulation")
-        if self.tendon_material_direct and self.tendon_sigmoid_ea_low > 0.0:
-            raise ValueError("tendon_material_direct requires linear per-segment compliance")
+        self._validate_direct_tendon_law()
         self._particle_delta_counter = 0
         self._body_delta_counter = 0
 
@@ -788,7 +789,8 @@ class SolverXPBD(TendonStateMixin, SolverBase):
 
                         wp.launch(
                             kernel=self._tendon_material_kernel,
-                            dim=model.tendon_count,
+                            dim=model.tendon_count * self._tendon_material_lanes,
+                            block_dim=self._tendon_material_block_dim,
                             inputs=[
                                 body_q,
                                 body_qd,

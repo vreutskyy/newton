@@ -7,11 +7,18 @@ import warp as wp
 
 from ..sim.tendon import TendonLinkType
 from .tendon_material import solve_tendon_material_component
+from .tendon_material_nonlinear import TendonMaterialNonlinearState, solve_tendon_material_nonlinear_component
 
 
 @wp.struct
 class TendonMaterialState:
     enabled: bool
+    nonlinear_enabled: bool
+    nonlinear: TendonMaterialNonlinearState
+    ea_low: float
+    ea_ratio: float
+    transition_strain: float
+    transition_width: float
     raw_compliance: wp.array[float]
     initial: wp.array[float]
     compliance: wp.array[float]
@@ -51,6 +58,25 @@ def project_tendon_component(state: TendonMaterialState, row: int, count: int, t
     if state.count[row] != count:
         state.valid[row] = 0
     state.count[row] = count
+    if state.nonlinear_enabled:
+        solve_tendon_material_nonlinear_component(
+            state.nonlinear,
+            count,
+            1,
+            row,
+            1,
+            1,
+            state.ea_low,
+            state.ea_ratio,
+            state.transition_strain,
+            state.transition_width,
+            1.0e-6,
+            64,
+            1.0e-5,
+        )
+        if state.status[row] < 0:
+            fail_tendon_material(state, state.status[row] - 200, tendon, row)
+        return
     # Each component packs into its original segment interval; inactive route slots
     # need no padding. Storage remains O(total segments), not 32 slots per segment.
     solve_tendon_material_component(
@@ -169,6 +195,10 @@ def transfer_tendon_material_direct(
         state.initial[index] = seg_stretch[seg] + seg_compliance[seg] * seg_damping[seg]
         state.compliance[index] = seg_compliance[seg]
         state.upper[index] = (seg_length[seg] - min_rest) + seg_compliance[seg] * seg_damping[seg]
+        if state.nonlinear_enabled:
+            state.nonlinear.reference[index] = seg_stretch[seg]
+            state.nonlinear.length[index] = seg_length[seg]
+            state.nonlinear.damping[index] = seg_damping[seg]
         if count > 0:
             edge = index - 1
             if state.edge_ids[edge] != link:
@@ -196,7 +226,10 @@ def transfer_tendon_material_direct(
         elif state.next_link[previous] < 0:
             row = seg
             count = 0
-        seg_stretch[seg] = state.output[row + count] - seg_compliance[seg] * seg_damping[seg]
+        if state.nonlinear_enabled:
+            seg_stretch[seg] = state.output[row + count]
+        else:
+            seg_stretch[seg] = state.output[row + count] - seg_compliance[seg] * seg_damping[seg]
         count += 1
         previous = seg
     return True

@@ -49,11 +49,11 @@ def _step(model, solver, state_in=None):
     return state_out
 
 
-def test_direct_rejects_nonlinear_material(test, device):
-    """Reject the nonlinear experiment only when direct material transfer is selected."""
+def test_direct_allocates_nonlinear_material(test, device):
+    """Allocate the experimental nonlinear projection only in opt-in direct mode."""
     model = _chain_model(device)
-    with test.assertRaisesRegex(ValueError, "linear per-segment compliance"):
-        newton.solvers.SolverXPBD(model, tendon_material_direct=True, tendon_sigmoid_ea_low=2000.0)
+    solver = newton.solvers.SolverXPBD(model, tendon_material_direct=True, tendon_sigmoid_ea_low=2000.0)
+    test.assertTrue(solver._tendon_material_state.nonlinear_enabled)
     legacy = newton.solvers.SolverXPBD(model, tendon_sigmoid_ea_low=2000.0)
     test.assertFalse(legacy._tendon_material_state.enabled)
 
@@ -179,7 +179,7 @@ def test_direct_rejects_runtime_nonlinear_material(test, device):
     solver = newton.solvers.SolverXPBD(model, tendon_material_direct=True)
     rest = solver.tendon_seg_rest_length.numpy().copy()
     solver.tendon_sigmoid_ea_low = 2000.0
-    with test.assertRaisesRegex(ValueError, "linear"):
+    with test.assertRaisesRegex(ValueError, "Reconstruct.*material law"):
         _step(model, solver)
     np.testing.assert_array_equal(solver.tendon_seg_rest_length.numpy(), rest)
 
@@ -309,12 +309,14 @@ def test_direct_runtime_failure_remains_latched(test, device):
         solver.check_tendon_material()
 
 
-def test_direct_reports_failure_after_graph_replay(test, device):
+def test_direct_reports_failure_after_graph_replay(test, device, *, sigmoid=False):
     """Capture the direct path and observe later parameter failures outside graph replay."""
     if not device.is_cuda:
         test.skipTest("CUDA graph capture requires a CUDA device")
     model = _two_tendon_model(device)
-    solver = newton.solvers.SolverXPBD(model, iterations=2, tendon_material_direct=True)
+    solver = newton.solvers.SolverXPBD(
+        model, iterations=2, tendon_material_direct=True, tendon_sigmoid_ea_low=500.0 if sigmoid else 0.0
+    )
     state_in, state_out = model.state(), model.state()
     control = model.control()
     solver.step(state_in, state_out, control, None, 1.0 / 240.0)
@@ -331,7 +333,7 @@ def test_direct_reports_failure_after_graph_replay(test, device):
         solver.check_tendon_material()
 
 
-def test_direct_dynamic_route_repacking(test, device):
+def test_direct_dynamic_route_repacking(test, device, *, solver_type=newton.solvers.SolverXPBD, sigmoid=False):
     """Repack repeatedly changing active spans without touching adjacent components or tendons."""
     builder = newton.ModelBuilder(gravity=0.0)
     base = builder.add_body(mass=0.0, is_kinematic=True)
@@ -361,8 +363,11 @@ def test_direct_dynamic_route_repacking(test, device):
             mu=0.1,
         )
     _add_chain(builder, base, 2, height=3.0, rest_lengths=[0.97, 0.99])
+    builder.color()
     model = builder.finalize(device=device)
-    solver = newton.solvers.SolverXPBD(model, iterations=3, tendon_material_direct=True)
+    solver = solver_type(
+        model, iterations=3, tendon_material_direct=True, tendon_sigmoid_ea_low=500.0 if sigmoid else 0.0
+    )
     state = model.state()
     unaffected_rest = None
     for x, active in (
@@ -410,7 +415,7 @@ class TestTendonMaterialIntegration(unittest.TestCase):
 
 devices = get_test_devices()
 for test_function in (
-    test_direct_rejects_nonlinear_material,
+    test_direct_allocates_nonlinear_material,
     test_direct_rejects_gradient_model,
     test_direct_rejects_invalid_compliance,
     test_direct_rejects_oversized_component,

@@ -378,8 +378,10 @@ class SolverVBD(TendonStateMixin, SolverBase):
             tendon_sigmoid_transition_strain: Experimental sigmoid transition strain.
             tendon_sigmoid_transition_width: Experimental sigmoid transition width.
             tendon_material_direct: Use the experimental direct finite-friction material solve instead of
-                material sweeps. Requires linear compliance, at most 32 segments per connected material
-                component, and capstan ratios no greater than 4. Call :meth:`check_tendon_material` outside
+                material sweeps. Supports linear compliance or the experimental sigmoid law,
+                at most 32 authored spans between attachments, and capstan ratios no greater than 4.
+                CUDA projects sigmoid components cooperatively; CPU uses scalar exact blocks.
+                Call :meth:`check_tendon_material` outside
                 CUDA graph capture to detect unsupported or infeasible runtime states. There is no fallback
                 to material sweeps; discard a failed step and reconstruct the solver after correcting its inputs.
 
@@ -1677,8 +1679,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
             raise ValueError("Reconstruct SolverVBD to change tendon_material_direct")
         if self.tendon_material_direct and (state_in.requires_grad or state_out.requires_grad):
             raise ValueError("tendon_material_direct does not support differentiable simulation")
-        if self.tendon_material_direct and self.tendon_sigmoid_ea_low > 0.0:
-            raise ValueError("tendon_material_direct requires linear per-segment compliance")
+        self._validate_direct_tendon_law()
 
         update_rigid = self._update_rigid_history
         self._update_rigid_history = True
@@ -2490,7 +2491,8 @@ class SolverVBD(TendonStateMixin, SolverBase):
 
         wp.launch(
             kernel=self._tendon_material_kernel,
-            dim=model.tendon_count,
+            dim=model.tendon_count * self._tendon_material_lanes,
+            block_dim=self._tendon_material_block_dim,
             inputs=[
                 state_in.body_q,
                 state_in.body_qd,

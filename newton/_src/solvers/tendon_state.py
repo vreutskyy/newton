@@ -25,6 +25,8 @@ from .tendon_kernels import (
     update_tendon_link_active,
 )
 from .tendon_material import TendonMaterialStatus
+from .tendon_material_cooperative_kernels import solve_tendon_material_cooperative
+from .tendon_material_nonlinear import TendonMaterialNonlinearStatus, allocate_tendon_material_nonlinear_state
 from .tendon_material_state import TendonMaterialState
 
 
@@ -113,8 +115,6 @@ class TendonStateMixin:
             return
         if model.requires_grad:
             raise ValueError("tendon_material_direct does not support differentiable simulation")
-        if self.tendon_sigmoid_ea_low > 0.0:
-            raise ValueError("tendon_material_direct requires linear per-segment compliance")
         if model.tendon_segment_count:
             compliance = model.tendon_seg_compliance.numpy()
             if not np.all(np.isfinite(compliance) & (compliance >= 1.0e-25)):
@@ -145,6 +145,42 @@ class TendonStateMixin:
             setattr(state, name, wp.full(model.tendon_segment_count, -1, dtype=int, device=model.device))
         state.failure = wp.zeros(model.tendon_count, dtype=int, device=model.device)
         state.failure_component = wp.full(model.tendon_count, -1, dtype=int, device=model.device)
+        state.nonlinear_enabled = self.tendon_sigmoid_ea_low > 0.0
+        if state.nonlinear_enabled:
+            state.ea_low = self.tendon_sigmoid_ea_low
+            state.ea_ratio = self.tendon_sigmoid_ea_ratio
+            state.transition_strain = self.tendon_sigmoid_transition_strain
+            state.transition_width = self.tendon_sigmoid_transition_width
+            state.nonlinear = allocate_tendon_material_nonlinear_state(
+                model.tendon_segment_count, model.tendon_segment_count, model.tendon_segment_count, device=model.device
+            )
+            for name in ("cap", "output", "status", "faces", "valid"):
+                setattr(state.nonlinear, name, getattr(state, name))
+            if model.device.is_cuda:
+                self._tendon_material_kernel = solve_tendon_material_cooperative
+                self._tendon_material_lanes = 32
+                self._tendon_material_block_dim = 32
+
+    def _validate_direct_tendon_law(self) -> None:
+        """Keep the experimental packed law synchronized with constructor settings."""
+        state = self._tendon_material_state
+        if not state.enabled:
+            return
+        expected = (
+            self.tendon_sigmoid_ea_low,
+            self.tendon_sigmoid_ea_ratio,
+            self.tendon_sigmoid_transition_strain,
+            self.tendon_sigmoid_transition_width,
+        )
+        if state.nonlinear_enabled != (self.tendon_sigmoid_ea_low > 0.0):
+            raise ValueError("Reconstruct the solver to change the direct tendon material law")
+        if state.nonlinear_enabled and expected != (
+            state.ea_low,
+            state.ea_ratio,
+            state.transition_strain,
+            state.transition_width,
+        ):
+            raise ValueError("Reconstruct the solver to change the direct tendon material law")
 
     def check_tendon_material(self) -> None:
         """Check the experimental direct material solve for latched failures.
@@ -169,7 +205,9 @@ class TendonStateMixin:
             code = int(failures[tendon])
             names = {-102: "INVALID_ROUTE", -103: "COMPONENT_TOO_LARGE"}
             try:
-                reason = TendonMaterialStatus(code).name
+                reason = (
+                    TendonMaterialNonlinearStatus(code + 200).name if code < -200 else TendonMaterialStatus(code).name
+                )
             except ValueError:
                 reason = names.get(code, "UNKNOWN_FAILURE")
             component = int(state.failure_component.numpy()[tendon])
@@ -184,6 +222,8 @@ class TendonStateMixin:
         self._tendon_material_state = TendonMaterialState()
         self._tendon_material_state.enabled = False
         self._tendon_material_kernel = solve_tendon_material
+        self._tendon_material_lanes = 1
+        self._tendon_material_block_dim = 256
         self._has_dynamic_tendon_links = False
         # Solver-level cable cone parameters (a solver may override before calling this).
         if not hasattr(self, "tendon_max_sweeps"):
@@ -608,7 +648,8 @@ class TendonStateMixin:
 
         wp.launch(
             kernel=self._tendon_material_kernel,
-            dim=model.tendon_count,
+            dim=model.tendon_count * self._tendon_material_lanes,
+            block_dim=self._tendon_material_block_dim,
             inputs=[
                 body_q,
                 model.body_qd,

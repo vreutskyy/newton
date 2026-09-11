@@ -204,7 +204,7 @@ def _rolling_spin_axis_component(
 
 
 @wp.func
-def _linear_tendon_span_tension(
+def _direct_tendon_span_tension(
     seg: int,
     dt: float,
     body_q: wp.array[wp.transform],
@@ -221,8 +221,12 @@ def _linear_tendon_span_tension(
     seg_active_damping: wp.array[float],
     seg_active_link_l: wp.array[int],
     seg_active_link_r: wp.array[int],
+    sigmoid_ea_low: float,
+    sigmoid_ea_ratio: float,
+    sigmoid_transition_strain: float,
+    sigmoid_transition_width: float,
 ) -> float:
-    """Evaluate the existing linear VBD force law at the current trial poses."""
+    """Evaluate the selected VBD material law at the current trial poses."""
     link_l = seg_active_link_l[seg]
     link_r = seg_active_link_r[seg]
     attachment_l = wp.transform_point(body_q[tendon_link_body[link_l]], seg_attachment_l_local[seg])
@@ -250,7 +254,18 @@ def _linear_tendon_span_tension(
         attachment_r,
     )
     stiffness = 1.0 / compliance
-    return wp.max(stiffness * (length - rest_length) + seg_active_damping[seg] * length_rate, 0.0)
+    material_tension = stiffness * (length - rest_length)
+    if sigmoid_ea_low > 0.0:
+        material_tension = tendon_material_tension(
+            length,
+            rest_length,
+            compliance,
+            sigmoid_ea_low,
+            sigmoid_ea_ratio,
+            sigmoid_transition_strain,
+            sigmoid_transition_width,
+        )
+    return wp.max(material_tension + seg_active_damping[seg] * length_rate, 0.0)
 
 
 @wp.func
@@ -277,6 +292,10 @@ def _direct_rolling_spin_axis_component(
     link: int,
     attachment: wp.vec3,
     direction: wp.vec3,
+    sigmoid_ea_low: float,
+    sigmoid_ea_ratio: float,
+    sigmoid_transition_strain: float,
+    sigmoid_transition_width: float,
 ) -> wp.vec3:
     """Remove only the rim moment forbidden by the direct material cone.
 
@@ -300,7 +319,7 @@ def _direct_rolling_spin_axis_component(
     # cached cone angle stays valid until the route is retangented.
     cap_ratio = tendon_link_cap_ratio[link]
     if cap_ratio > 1.0:
-        tension_l = _linear_tendon_span_tension(
+        tension_l = _direct_tendon_span_tension(
             seg_left,
             dt,
             body_q,
@@ -317,8 +336,12 @@ def _direct_rolling_spin_axis_component(
             seg_active_damping,
             seg_active_link_l,
             seg_active_link_r,
+            sigmoid_ea_low,
+            sigmoid_ea_ratio,
+            sigmoid_transition_strain,
+            sigmoid_transition_width,
         )
-        tension_r = _linear_tendon_span_tension(
+        tension_r = _direct_tendon_span_tension(
             seg_right,
             dt,
             body_q,
@@ -335,6 +358,10 @@ def _direct_rolling_spin_axis_component(
             seg_active_damping,
             seg_active_link_l,
             seg_active_link_r,
+            sigmoid_ea_low,
+            sigmoid_ea_ratio,
+            sigmoid_transition_strain,
+            sigmoid_transition_width,
         )
         beta = (cap_ratio - 1.0) / (cap_ratio + 1.0)
         allowed_difference = beta * (tension_l + tension_r)
@@ -497,6 +524,10 @@ def evaluate_tendon_force_hessians(
                     link_l,
                     attachment_l,
                     direction,
+                    sigmoid_ea_low,
+                    sigmoid_ea_ratio,
+                    sigmoid_transition_strain,
+                    sigmoid_transition_width,
                 )
                 fix_r = _direct_rolling_spin_axis_component(
                     dt,
@@ -521,6 +552,10 @@ def evaluate_tendon_force_hessians(
                     link_r,
                     attachment_r,
                     direction,
+                    sigmoid_ea_low,
+                    sigmoid_ea_ratio,
+                    sigmoid_transition_strain,
+                    sigmoid_transition_width,
                 )
             else:
                 fix_l = _rolling_spin_axis_component(
@@ -599,6 +634,10 @@ def evaluate_tendon_force_hessians(
                 link,
                 attachment,
                 direction,
+                sigmoid_ea_low,
+                sigmoid_ea_ratio,
+                sigmoid_transition_strain,
+                sigmoid_transition_width,
             )
             moment_axis = moment_axis - spin_fix
             endpoint_sign = 1.0 if body == body_l else -1.0

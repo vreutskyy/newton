@@ -457,10 +457,10 @@ class TestTendonMaterialVBD(unittest.TestCase):
                     self.assertLessEqual(float(tension[cone_r[link]] - cap[link] * tension[cone_l[link]]), 2.0e-3)
 
     def test_runtime_mode_and_nonlinear_changes_are_rejected(self):
-        """Keep direct mode immutable and exclude the parked nonlinear material experiment."""
+        """Keep the experimental direct mode and selected material law immutable."""
         model = _chain_model("cpu")
-        with self.assertRaisesRegex(ValueError, "linear per-segment compliance"):
-            newton.solvers.SolverVBD(model, tendon_material_direct=True, tendon_sigmoid_ea_low=2000.0)
+        nonlinear = newton.solvers.SolverVBD(model, tendon_material_direct=True, tendon_sigmoid_ea_low=2000.0)
+        self.assertTrue(nonlinear._tendon_material_state.nonlinear_enabled)
         for enabled in (False, True):
             with self.subTest(initially_enabled=enabled):
                 solver = _make_solver(model, direct=enabled)
@@ -469,7 +469,7 @@ class TestTendonMaterialVBD(unittest.TestCase):
                     solver.step(model.state(), model.state(), model.control(), None, 0.001)
         solver = _make_solver(model)
         solver.tendon_sigmoid_ea_low = 2000.0
-        with self.assertRaisesRegex(ValueError, "linear"):
+        with self.assertRaisesRegex(ValueError, "Reconstruct.*material law"):
             solver.step(model.state(), model.state(), model.control(), None, 0.001)
 
 
