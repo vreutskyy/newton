@@ -461,6 +461,64 @@ def test_exact_publication_preserves_hard_rest_bound(test, device):
     np.testing.assert_array_equal(state.output.numpy(), [-123.0])
 
 
+def test_exact_repairs_overbound_rolling_trial(test, device):
+    """Project a full-rolling trial before enforcing individual span rest bounds."""
+    # Both spans start with extension 0.002 m and rest length 0.098 m.
+    # Full rolling transfers 0.11 m: its no-slip trial crosses a rest bound,
+    # but capstan slip can restore valid rest lengths without losing material.
+    reference = np.array([-0.108, 0.112], dtype=np.float32)
+    length = float(np.float32(0.1))
+    total = float(reference.astype(float).sum())
+
+    def tension(extension):
+        strain = extension / (length - extension)
+        return (
+            100.0
+            * (1.0 + 4.5 * (1.0 + math.tanh((strain - float(np.float32(0.1))) / float(np.float32(0.05)))))
+            * strain
+        )
+
+    # Independent scalar root of T_right = 2 T_left on the slipping face.
+    lower, upper = 0.0, total
+    for _ in range(80):
+        middle = 0.5 * (lower + upper)
+        if tension(total - middle) > 2.0 * tension(middle):
+            lower = middle
+        else:
+            upper = middle
+    left = 0.5 * (lower + upper)
+    expected = np.array([left, total - left])
+    state, inputs, count = _fixture(device, [reference, reference[::-1]], [length, length], [2.0], ratio=10.0)
+    original = state.reference.numpy().copy()
+    for _ in range(2):
+        # Check both cold and cached-face solves and both rolling directions.
+        _launch(_project_exact, dim=count, inputs=inputs, device=device)
+        _assert_certificate(test, state, 2, ratio=10.0, exact=True)
+        np.testing.assert_allclose(state.corrected.numpy().reshape(2, 2), [expected, expected[::-1]], rtol=2.0e-6)
+        np.testing.assert_array_equal(state.reference.numpy(), original)
+
+
+def test_exact_rejects_invalid_geometry_and_infeasible_inventory(test, device):
+    """Accepting trial extensions must not permit invalid geometry or final rest lengths."""
+    for lengths, reference in (
+        ([-0.1, 0.1], [-0.2, 0.0]),
+        ([np.nan, 0.1], [0.0, 0.0]),
+        ([np.inf, 0.1], [0.0, 0.0]),
+        ([0.1, 0.1], [np.nan, 0.0]),
+        ([0.1, 0.1], [np.inf, 0.0]),
+        # There is not enough material for even the sum of minimum rest lengths.
+        ([0.1, 0.1], [0.1, 0.1]),
+        ([0.1], [0.11]),
+    ):
+        with test.subTest(lengths=lengths, reference=reference):
+            n = len(lengths)
+            state, inputs, count = _fixture(device, reference, lengths, np.full(n - 1, 2.0), ratio=10.0)
+            _launch(_project_exact, dim=count, inputs=inputs, device=device)
+            test.assertLess(state.status.numpy()[0], 0)
+            test.assertEqual(state.valid.numpy()[0], 0)
+            np.testing.assert_array_equal(state.output.numpy(), np.full(n, -123.0))
+
+
 def test_exact_cache_revalidates_inputs_and_preserves_failure(test, device):
     """Re-solve cached faces for changed inputs; a rejected cache cannot publish."""
     state, inputs, count = _fixture(device, [0.3, 0.1], [1.0, 1.0], [1.4])
@@ -846,6 +904,8 @@ for _test in (
     test_exact_rounding_qualified_force_tolerance,
     test_exact_publication_rejects_bad_math_and_non_nearest_storage,
     test_exact_publication_preserves_hard_rest_bound,
+    test_exact_repairs_overbound_rolling_trial,
+    test_exact_rejects_invalid_geometry_and_infeasible_inventory,
     test_exact_cache_revalidates_inputs_and_preserves_failure,
     test_exact_storage_conservation_error_is_explicit,
     test_inverse_hint_and_reused_tangent,

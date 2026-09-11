@@ -38,6 +38,12 @@ It does not support differentiable simulation or arbitrary constitutive laws.
 Existing routing restrictions, including unsupported fixed-roller wraps,
 remain unchanged.
 
+The minimum rest length constrains the final material allocation, not the
+geometric span length: a shorter (including zero-length) span may be slack.
+Full rolling may temporarily put a no-slip trial beyond an individual rest
+bound; the direct solve allows slip to repair it before certifying the result.
+Infeasible final allocations still fail without publication.
+
 Call `solver.check_tendon_material()` outside capture after a step or graph
 replay, before consuming its results. A failure is latched; discard the affected
 step/frame/batch and correct the input before reconstructing the solver. There
@@ -89,13 +95,14 @@ identical iteration. It does not change the friction coefficient.
 The repository tests cover analytical and independently constructed solutions,
 both slip directions, zero/positive damping plateaus, least transfer, rounded
 storage, 1–32-span components, heterogeneous packed rows, graph replay, failed
-row isolation, route changes, and native XPBD/VBD integration:
+row isolation, route changes, over-bound rolling trials, tiny slack spans, and
+native XPBD/VBD integration:
 
 ```text
-uv run -m unittest newton.tests.test_tendon_material_direct newton.tests.test_tendon_material_dynamics newton.tests.test_tendon_material_nonlinear newton.tests.test_tendon_material_cooperative newton.tests.test_tendon_material_integration newton.tests.test_tendon_material_nonlinear_integration newton.tests.test_tendon_material_vbd
+uv run -m unittest newton.tests.test_tendon_material_direct newton.tests.test_tendon_material_transfer newton.tests.test_tendon_material_dynamics newton.tests.test_tendon_material_nonlinear newton.tests.test_tendon_material_cooperative newton.tests.test_tendon_material_integration newton.tests.test_tendon_material_nonlinear_integration newton.tests.test_tendon_material_vbd
 ```
 
-The review-branch run completed 153 tests successfully (5 device-specific
+The review-branch run completed 168 tests successfully (5 device-specific
 skips) on CPU and CUDA. Its native XPBD integration also completed both phases
 of the 366-frame Toy3 recording below: every shared simulation-state array
 matched the validated mixed-precision prototype bit for bit. This checks the

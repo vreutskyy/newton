@@ -96,6 +96,49 @@ def test_nonlinear_solver_entry(test, device):
                 test.assertGreater(int(solver._tendon_material_state.status.numpy()[0]), 0)
 
 
+def test_nonlinear_short_slack_span(test, device):
+    """Keep valid slack material even when geometric length is below the rest floor."""
+    for solver_type in (newton.solvers.SolverXPBD, newton.solvers.SolverVBD):
+        for length in (0.0, 5.0e-7):
+            with test.subTest(solver=solver_type.__name__, length=length):
+                builder = newton.ModelBuilder(gravity=0.0)
+                body = builder.add_body(mass=0.0, is_kinematic=True)
+                builder.add_tendon()
+                for x in (0.0, length):
+                    builder.add_tendon_link(
+                        body=body,
+                        link_type=newton.TendonLinkType.ATTACHMENT,
+                        offset=(x, 0.0, 0.0),
+                        rest_length=2.0e-6,
+                        compliance=1.0e-3,
+                    )
+                builder.color()
+                model = builder.finalize(device=device)
+                solver = solver_type(
+                    model,
+                    iterations=1,
+                    tendon_material_direct=True,
+                    tendon_sigmoid_ea_low=500.0,
+                    tendon_sigmoid_ea_ratio=10.0,
+                    tendon_sigmoid_transition_strain=0.01,
+                    tendon_sigmoid_transition_width=0.003,
+                )
+                original_rest = solver.tendon_seg_rest_length.numpy().copy()
+                state, next_state = model.state(), model.state()
+                control = model.control()
+                for _ in range(3):
+                    solver.step(state, next_state, control, None, 1.0e-3)
+                    solver.check_tendon_material()
+                    state, next_state = next_state, state
+                    np.testing.assert_array_equal(solver.tendon_seg_rest_length.numpy(), original_rest)
+                    np.testing.assert_array_equal(
+                        solver.tendon_seg_length.numpy(), np.array([length], dtype=np.float32)
+                    )
+                    np.testing.assert_array_equal(solver.tendon_seg_material_tension.numpy(), [0.0])
+                    np.testing.assert_array_equal(solver.tendon_seg_damping_tension.numpy(), [0.0])
+                    np.testing.assert_array_equal(state.body_q.numpy(), model.body_q.numpy())
+
+
 def test_vbd_adjacent_trial_uses_sigmoid(test, device):
     """Evaluate VBD direct friction limiting with sigmoid rather than linear tension."""
     model = _chain_model(device, rest_lengths=[0.99, 0.995])
@@ -249,6 +292,7 @@ class TestTendonMaterialNonlinearIntegration(unittest.TestCase):
 
 for _test in (
     test_nonlinear_solver_entry,
+    test_nonlinear_short_slack_span,
     test_vbd_adjacent_trial_uses_sigmoid,
     test_nonlinear_curved_finite_friction,
     test_nonlinear_material_law_is_immutable,

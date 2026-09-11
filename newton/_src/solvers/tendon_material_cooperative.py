@@ -356,18 +356,15 @@ def prepare_cooperative(
     ):
         state.valid[row] = 0
         return True
+    # Full rolling can put the no-slip trial beyond an individual rest bound;
+    # slip must be allowed to repair it. Certify the projected rest lengths,
+    # not the trial. A short geometric span can also contain valid slack.
     for i in range(n):
         index = row * span_stride + i
         reference = state.reference[index]
         length = state.length[index]
         damping = state.damping[index]
-        if (
-            not wp.isfinite(reference)
-            or not wp.isfinite(length)
-            or length < min_rest
-            or not wp.isfinite(damping)
-            or wp.float64(length) - wp.float64(reference) < wp.float64(min_rest)
-        ):
+        if not wp.isfinite(reference) or not wp.isfinite(length) or length < 0.0 or not wp.isfinite(damping):
             state.valid[row] = 0
             return True
         if i < n - 1:
