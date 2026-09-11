@@ -1,5 +1,9 @@
 # Cable Joints
 
+For the opt-in direct material solver on this experimental branch, see
+[Direct tendon material solver](direct_tendon_material.md). The historical
+baseline and sweep formulation below are unchanged by that option.
+
 Newton's XPBD tendon solver implements the routed-cable baseline from
 Müller et al. "Cable Joints" (SCA 2018), with a finite-slip capstan extension
 for rolling links.  The known-good pre-split finite capstan baseline is commit
