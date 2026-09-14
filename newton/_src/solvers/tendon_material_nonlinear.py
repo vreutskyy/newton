@@ -381,7 +381,16 @@ def _measure_candidate(
     flow = wp.float64(0.0)
     objective = wp.float64(0.0)
     error = wp.float64(0.0)
-    flow_tolerance = wp.float64(tolerance) * peak * minimum_compliance
+    # A prefix flow only selects a capstan face once it exceeds the accuracy the
+    # allocation itself can promise. Conservation holds to the same prefix
+    # roundoff the block allocator uses, which scales with the largest packed
+    # extension rather than with the force tolerance. Without that floor, a
+    # slack component whose peak tension is pure damping demands a saturated
+    # face at a stationary block boundary and can never be certified.
+    flow_tolerance = wp.max(
+        wp.float64(tolerance) * peak * minimum_compliance,
+        wp.float64(128.0 * 2.220446049250313e-16) * wp.float64(n) * scale,
+    )
     for i in range(n):
         extension = wp.float64(state.candidate[offset + i])
         if exact:
