@@ -9,6 +9,7 @@
 - Add `cable_cross_slide_table` example demonstrating a cable-driven XY table
 - Add an experimental augmented-Lagrangian stretch row for routed tendons in `SolverVBD` (`tendon_alm=True`), letting very stiff cables settle with fewer substeps; off by default
 - Add `SolverXPBD.joint_reaction_f` for reading per-joint reaction wrenches accumulated from the XPBD joint solve.
+- Add a routed-tendon authoring warning at solver construction when the per-segment compliance of a tendon is not proportional to its span lengths: a span with compliance `c` and rest length `L0` saturates at `T = L0/c`, so short spans authored with the same compliance as long ones silently cap the cable tension. Author `compliance = L0_i/EA` (or distribute a total compliance by length) to silence it.
 - Add an optional `kernel_block_dim` argument to `SensorTiledCamera.update()` for tuning the Warp ray-tracer's `render_megakernel` launch shape.
 - Add `ArticulationView.joint_template_labels`, `link_template_labels` (aliased as `body_template_labels`), and `shape_template_labels` exposing the raw template-articulation labels alongside the existing leaf-only `*_names`, so callers can disambiguate selected entries whose leaf names collide.
 - Add robotics tutorial notebook covering ModelBuilder, solvers, CUDA graphs, IK, and pick-and-place

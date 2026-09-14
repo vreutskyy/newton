@@ -10,6 +10,8 @@ mapping before applying their own numerical solve.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import warp as wp
 
@@ -23,6 +25,12 @@ from .tendon_kernels import (
     update_tendon_cone_rows,
     update_tendon_link_active,
 )
+
+# Largest ratio of per-unit-length compliance within one tendon that is reported as physical.
+TENDON_COMPLIANCE_SPREAD_WARN = 10.0
+# Shortest span [m] the ratio above is measured on: sub-0.1 mm spans are zero-span placeholders
+# or momentarily collapsed routes, not authored cable.
+TENDON_COMPLIANCE_SPREAD_MIN_LENGTH = 1.0e-4
 
 
 def _transform_point_np(pose: np.ndarray, point: np.ndarray) -> np.ndarray:
@@ -314,6 +322,55 @@ class TendonStateMixin:
             self.tendon_link_route_rest_length = wp.array(route_rest_np, dtype=float, device=model.device)
 
             self._init_tendon_attachment_points(model, auto_mask, route_seg_mask)
+
+        # Rest lengths are final here: authored values, plus the routed lengths filled in for
+        # auto segments by _init_tendon_attachment_points. Solvers call _init_tendon_state once
+        # at construction, so the diagnostic below runs once, never per step.
+        self._warn_on_tendon_compliance_spread(model)
+
+    def _warn_on_tendon_compliance_spread(self, model: Model) -> None:
+        """Warn once per tendon whose per-segment compliance is not proportional to span length.
+
+        A span cannot extend beyond its own length, so a segment with compliance ``c`` and rest
+        length ``L0`` saturates at ``T = L0 / c``. Authoring one compliance for spans of very
+        different length therefore caps the short ones far below the tension the rest of the
+        cable carries. Read-only: no array is modified and nothing is raised.
+        """
+        if model.tendon_count == 0 or self.tendon_seg_rest_length is None:
+            return
+
+        tendon_start = model.tendon_start.numpy()
+        compliance = model.tendon_seg_compliance.numpy()
+        rest = self.tendon_seg_rest_length.numpy()
+
+        seg = 0
+        for t in range(model.tendon_count):
+            count = int(tendon_start[t + 1] - tendon_start[t]) - 1
+            segments = np.arange(seg, seg + count)
+            seg += count
+            # Zero-compliance (inextensible) spans have no finite tension ceiling, so they are
+            # not part of the comparison.
+            segments = segments[(rest[segments] > TENDON_COMPLIANCE_SPREAD_MIN_LENGTH) & (compliance[segments] > 0.0)]
+            if segments.size < 2:
+                continue
+
+            per_length = compliance[segments] / rest[segments]
+            spread = float(per_length.max() / per_length.min())
+            if spread <= TENDON_COMPLIANCE_SPREAD_WARN:
+                continue
+
+            worst = int(segments[int(np.argmax(per_length))])
+            rest_worst = float(rest[worst])
+            compliance_worst = float(compliance[worst])
+            warnings.warn(
+                f"Tendon {t}: segment {worst} has rest length {rest_worst * 1.0e3:.3f} mm and compliance "
+                f"{compliance_worst:.3e} m/N, so it cannot carry more than T = L0/c = "
+                f"{rest_worst / compliance_worst:.1f} N, while compliance per unit length varies by "
+                f"{spread:.1f}x across this tendon's spans. Per-segment compliance is not proportional to "
+                f"segment length; short spans saturate at T = L0/c. Author compliance as L0_i/EA (or "
+                f"distribute a total compliance by length) for a physical cable.",
+                stacklevel=2,
+            )
 
     def _snapshot_tendon_step_state(self) -> None:
         """Snapshot mutable tendon material state at the start of a time step."""

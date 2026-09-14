@@ -10,6 +10,7 @@ acceptance criteria.  Test expectation changes in this file should follow
 
 import math
 import unittest
+import warnings
 from itertools import pairwise
 
 import numpy as np
@@ -212,6 +213,35 @@ def build_slack_pinhole_route():
         offset=(0.0, 0.0, 0.0),
         compliance=1.0e-6,
         rest_length=3.0,
+    )
+
+    return builder.finalize()
+
+
+def build_two_span_route(rest_lengths, compliances):
+    """Build a static two-span route with authored rest lengths and per-segment compliances."""
+    builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+
+    xs = [0.0, rest_lengths[0], rest_lengths[0] + rest_lengths[1]]
+    bodies = []
+    for x in xs:
+        body = builder.add_body(xform=wp.transform(p=wp.vec3(x, 0.0, 0.0)), mass=0.0, is_kinematic=True)
+        builder.add_shape_sphere(body, radius=0.01)
+        bodies.append(body)
+
+    builder.add_tendon()
+    builder.add_tendon_link(body=bodies[0], link_type=int(TendonLinkType.ATTACHMENT))
+    builder.add_tendon_link(
+        body=bodies[1],
+        link_type=int(TendonLinkType.PINHOLE),
+        compliance=compliances[0],
+        rest_length=rest_lengths[0],
+    )
+    builder.add_tendon_link(
+        body=bodies[2],
+        link_type=int(TendonLinkType.ATTACHMENT),
+        compliance=compliances[1],
+        rest_length=rest_lengths[1],
     )
 
     return builder.finalize()
@@ -1302,6 +1332,30 @@ class TestTendonCapstan(unittest.TestCase):
                 radius=0.1,
                 dynamic=True,
             )
+
+    def test_warns_on_non_length_proportional_tendon_compliance(self):
+        # A 0.2 mm chord and a 40 mm span authored with the same compliance: the chord
+        # saturates at 40 N while the long span carries 8 kN at the same strain.
+        model = build_two_span_route(rest_lengths=(0.0002, 0.04), compliances=(5.0e-6, 5.0e-6))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            newton.solvers.SolverXPBD(model)
+
+        messages = [str(w.message) for w in caught if "T = L0/c" in str(w.message)]
+        self.assertEqual(len(messages), 1, messages)
+        self.assertIn("Tendon 0: segment 0", messages[0])
+        self.assertIn("0.200 mm", messages[0])
+        self.assertIn("40.0 N", messages[0])
+        self.assertIn("200.0x", messages[0])
+
+    def test_length_proportional_tendon_compliance_is_silent(self):
+        # Same route authored as c_i = L0_i / EA with EA = 1e5 N.
+        model = build_two_span_route(rest_lengths=(0.0002, 0.04), compliances=(2.0e-9, 4.0e-7))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            newton.solvers.SolverXPBD(model)
+
+        self.assertEqual([str(w.message) for w in caught if "T = L0/c" in str(w.message)], [])
 
 
 def _hinge_y_angle(body_q, body_idx):
