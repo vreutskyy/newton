@@ -18,6 +18,7 @@
 ### Changed
 
 - Remove the `cbor2` `<6` dependency ceiling after updating recorder deserialization to accept mapping-like decoded containers
+- Widen the dynamic tendon routing hysteresis: the activation band now takes the larger of the relative `tendon_activation_tol` and the new absolute `SolverVBD`/`SolverXPBD` argument `tendon_route_hysteresis` (default 1e-4 m) so that small rollers keep a physical dead band, and the same band guards the span-end test. Rollers still deactivate at their surface, where the wrap angle changes sign. Pass `tendon_activation_tol=0.0, tendon_route_hysteresis=0.0, tendon_route_min_span_ratio=0.0` to restore the previous thresholds exactly.
 - Require Warp 1.14 and configure Warp logging through `warp.config.log_level`; use Newton's `--quiet` flag or `--warp-config log_level=...` instead of legacy `verbose` or `quiet` config keys
 - Auto-scale `ViewerGL` contact arrows, joint axes, and COM markers by `Viewer.scene_scale`; to approximate the previous fixed sizes after `set_model()`, set `viewer.renderer.arrow_length_scale = 0.1 / viewer.scene_scale`, `viewer.renderer.joint_scale = 0.1 / viewer.scene_scale`, and `viewer.renderer.com_scale = 0.1 / viewer.scene_scale`.
 
@@ -42,6 +43,7 @@
 - Fix MJCF `xyaxes` parsing to treat the second vector as Y and derive Z from X cross Y.
 - Fix mesh-convex and heightfield-convex contacts missing when shapes are separated by margin but still within the contact envelope.
 - Fix rolling tendon routes changing total cable material as their wrap angle changes.
+- Fix dynamic tendon routing switching a candidate roller on an undefined bypass span: when the two neighboring wrap circles overlap, when the tangent construction between them does not settle, or when the resulting span is shorter than `tendon_route_min_span_ratio` candidate radii, the previous activation state is now held instead of being decided from a collapsed or noise-dominated span. This removes the rest-length steps, tension spikes, and copy-to-copy divergence such a switch caused.
 - Fix `SolverMuJoCo` returning `State.joint_qd` in world frame for root `FREE` joints with non-identity `parent_xform`, violating the documented parent-frame contract and corrupting derived `body_qd`.
 - Fix `example_softbody_gift` emitting spurious non-manifold edge warnings caused by mismatched 5-tet diagonals across adjacent cubes in the soft body mesh.
 - Fix `basic_conveyor` example emitting a spurious inertia validation warning at finalize.

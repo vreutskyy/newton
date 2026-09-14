@@ -255,6 +255,8 @@ class SolverVBD(TendonStateMixin, SolverBase):
         tendon_settle_tol: float = 1.0e-3,
         rigid_enable_dahl_friction: bool | None = None,  # Deprecated: auto-detected from model attributes
         tendon_activation_tol: float = 2.0e-3,
+        tendon_route_hysteresis: float = 1.0e-4,
+        tendon_route_min_span_ratio: float = 2.0,
         tendon_sigmoid_ea_low: float = 0.0,
         tendon_sigmoid_ea_ratio: float = 1.0,
         tendon_sigmoid_transition_strain: float = 0.0,
@@ -375,7 +377,13 @@ class SolverVBD(TendonStateMixin, SolverBase):
             tendon_settle_tol: Relative tension-change tolerance for stopping capstan material relaxation.
             rigid_enable_dahl_friction: Deprecated and ignored. Dahl friction is auto-detected
                 from ``model.vbd.dahl_eps_max`` / ``model.vbd.dahl_tau``.
-            tendon_activation_tol: Relative radius gap that inactive dynamic rollers must cross before activation.
+            tendon_activation_tol: Relative radius gap that inactive dynamic rollers must cross before
+                activation; the solver takes the larger of it and ``tendon_route_hysteresis`` [m]. Active
+                rollers still deactivate at their surface.
+            tendon_route_hysteresis: Absolute floor [m] under ``tendon_activation_tol`` for the dynamic routing
+                hysteresis band.
+            tendon_route_min_span_ratio: Shortest bypass span, in candidate radii, that the dynamic routing test
+                is evaluated on. Candidates with a shorter span keep their previous state.
             tendon_sigmoid_ea_low: Experimental low-strain axial stiffness for the solver-wide sigmoid tendon law.
                 A non-positive value disables the experimental law.
             tendon_sigmoid_ea_ratio: Experimental high/low axial-stiffness ratio.
@@ -433,6 +441,8 @@ class SolverVBD(TendonStateMixin, SolverBase):
         self.tendon_max_sweeps = tendon_max_sweeps
         self.tendon_settle_tol = tendon_settle_tol
         self.tendon_activation_tol = tendon_activation_tol
+        self.tendon_route_hysteresis = tendon_route_hysteresis
+        self.tendon_route_min_span_ratio = tendon_route_min_span_ratio
         self.tendon_sigmoid_ea_low = tendon_sigmoid_ea_low
         self.tendon_sigmoid_ea_ratio = tendon_sigmoid_ea_ratio
         self.tendon_sigmoid_transition_strain = tendon_sigmoid_transition_strain

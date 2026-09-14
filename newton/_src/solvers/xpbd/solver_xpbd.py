@@ -118,6 +118,8 @@ class SolverXPBD(TendonStateMixin, SolverBase):
         tendon_max_sweeps: int = 256,
         tendon_settle_tol: float = 1.0e-3,
         tendon_activation_tol: float = 2.0e-3,
+        tendon_route_hysteresis: float = 1.0e-4,
+        tendon_route_min_span_ratio: float = 2.0,
         tendon_sigmoid_ea_low: float = 0.0,
         tendon_sigmoid_ea_ratio: float = 1.0,
         tendon_sigmoid_transition_strain: float = 0.0,
@@ -131,9 +133,14 @@ class SolverXPBD(TendonStateMixin, SolverBase):
         # immediately; stiff/transient ones run up to the cap.
         self.tendon_max_sweeps = tendon_max_sweeps
         self.tendon_settle_tol = tendon_settle_tol
-        # Inactive dynamic rollers activate only after entering this fraction of their radius.
-        # Active rollers still deactivate at zero clearance.
+        # Dynamic routing hysteresis: inactive rollers activate only after entering the larger
+        # of this fraction of their radius and tendon_route_hysteresis [m]; active rollers still
+        # deactivate at their surface. Candidates whose bypass span is shorter than
+        # tendon_route_min_span_ratio candidate radii keep their previous state, because the
+        # test is undefined there.
         self.tendon_activation_tol = tendon_activation_tol
+        self.tendon_route_hysteresis = tendon_route_hysteresis
+        self.tendon_route_min_span_ratio = tendon_route_min_span_ratio
         # Experimental solver-wide nonlinear tendon material. A non-positive
         # low-strain EA keeps the established per-segment compliance path.
         self.tendon_sigmoid_ea_low = tendon_sigmoid_ea_low

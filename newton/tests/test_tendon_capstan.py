@@ -19,6 +19,7 @@ import newton
 from newton._src.sim.builder import Axis
 from newton._src.sim.tendon import TendonLinkFlags, TendonLinkType
 from newton._src.solvers.tendon_kernels import tendon_material_transfer_delta, tendon_segment_length_rate
+from newton._src.solvers.tendon_state import _segment_attachment_points_np
 from newton._src.solvers.xpbd.tendon_kernels import solve_tendon_slip, solve_tendon_stretch
 from newton.examples.cable.cable import get_tendon_cable_lines
 from newton.examples.cable.example_tendon_capstan_friction import Example as DynamicCapstanExample
@@ -938,12 +939,125 @@ def build_oriented_dynamic_route(orientation, device):
     return builder.finalize(device=device), candidate, candidate_link
 
 
+def build_interpenetrating_neighbor_route(device):
+    """Build an active dynamic candidate whose rolling neighbors can be made to overlap."""
+    builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+
+    lower = builder.add_body(xform=wp.transform(p=wp.vec3(0.0, 0.0, -0.5)), mass=0.0, is_kinematic=True)
+    upper = builder.add_body(xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.5)), mass=0.0, is_kinematic=True)
+    candidate = builder.add_body(xform=wp.transform(p=wp.vec3(-0.25, 0.0, 0.0)), mass=0.0, is_kinematic=True)
+
+    def add_neighbor(body):
+        builder.add_tendon_link(
+            body=body,
+            link_type=int(TendonLinkType.ROLLING),
+            radius=0.3,
+            orientation=1,
+            mu=0.0,
+            axis=(0.0, 1.0, 0.0),
+            rest_length=-1.0,
+        )
+
+    builder.add_tendon()
+    builder.add_tendon_link(body=lower, link_type=int(TendonLinkType.ATTACHMENT), axis=(0.0, 1.0, 0.0))
+    add_neighbor(lower)
+    candidate_link = builder.add_tendon_link(
+        body=candidate,
+        link_type=int(TendonLinkType.ROLLING),
+        radius=0.1,
+        orientation=1,
+        mu=0.0,
+        dynamic=True,
+        axis=(0.0, 1.0, 0.0),
+        rest_length=-1.0,
+    )
+    add_neighbor(upper)
+    builder.add_tendon_link(
+        body=upper,
+        link_type=int(TendonLinkType.ATTACHMENT),
+        axis=(0.0, 1.0, 0.0),
+        rest_length=-1.0,
+    )
+    return builder.finalize(device=device), upper, candidate_link
+
+
+# toy4 A.R1 scale: two 5.8 mm rollers 12.66 mm apart, wrapped in opposite senses, leave a
+# 5.07 mm internal-tangent bypass span - only 1.31 radii of the 3.867 mm candidate.
+SHORT_SPAN_NEIGHBOR_RADIUS = 0.0058
+SHORT_SPAN_CANDIDATE_RADIUS = 0.003867
+SHORT_SPAN_HALF_SEPARATION = 0.00633
+SHORT_SPAN_PLANE_NORMAL = np.array([0.0, 1.0, 0.0])
+
+
+def build_short_span_neighbor_route(device):
+    """Build a dynamic candidate between close, non-overlapping, oppositely wrapped rollers."""
+    builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+
+    lower_center = np.array([0.0, 0.0, -SHORT_SPAN_HALF_SEPARATION])
+    upper_center = np.array([0.0, 0.0, SHORT_SPAN_HALF_SEPARATION])
+    span_l, span_r = _segment_attachment_points_np(
+        lower_center,
+        upper_center,
+        int(TendonLinkType.ROLLING),
+        int(TendonLinkType.ROLLING),
+        SHORT_SPAN_NEIGHBOR_RADIUS,
+        SHORT_SPAN_NEIGHBOR_RADIUS,
+        1,
+        -1,
+        SHORT_SPAN_PLANE_NORMAL,
+        SHORT_SPAN_PLANE_NORMAL,
+    )
+    span = span_r - span_l
+    side = np.cross(SHORT_SPAN_PLANE_NORMAL, span / np.linalg.norm(span))
+    # Authored at the far end of the span, half a millimeter inside the candidate surface.
+    candidate_center = span_r + (SHORT_SPAN_CANDIDATE_RADIUS - 5.0e-4) * side
+
+    lower = builder.add_body(xform=wp.transform(p=wp.vec3(*lower_center)), mass=0.0, is_kinematic=True)
+    upper = builder.add_body(xform=wp.transform(p=wp.vec3(*upper_center)), mass=0.0, is_kinematic=True)
+    candidate = builder.add_body(xform=wp.transform(p=wp.vec3(*candidate_center)), mass=0.0, is_kinematic=True)
+
+    def add_neighbor(body, orientation):
+        builder.add_tendon_link(
+            body=body,
+            link_type=int(TendonLinkType.ROLLING),
+            radius=SHORT_SPAN_NEIGHBOR_RADIUS,
+            orientation=orientation,
+            mu=0.0,
+            axis=(0.0, 1.0, 0.0),
+            rest_length=-1.0,
+        )
+
+    builder.add_tendon()
+    builder.add_tendon_link(body=lower, link_type=int(TendonLinkType.ATTACHMENT), axis=(0.0, 1.0, 0.0))
+    add_neighbor(lower, 1)
+    candidate_link = builder.add_tendon_link(
+        body=candidate,
+        link_type=int(TendonLinkType.ROLLING),
+        radius=SHORT_SPAN_CANDIDATE_RADIUS,
+        orientation=1,
+        mu=0.0,
+        dynamic=True,
+        axis=(0.0, 1.0, 0.0),
+        rest_length=-1.0,
+    )
+    add_neighbor(upper, -1)
+    builder.add_tendon_link(
+        body=upper,
+        link_type=int(TendonLinkType.ATTACHMENT),
+        axis=(0.0, 1.0, 0.0),
+        rest_length=-1.0,
+    )
+    return builder.finalize(device=device), candidate, candidate_link, span_l, span_r
+
+
 def build_dynamic_route_neighbor_matrix_case(device, left_type, right_type, orientation):
     """Build an inactive dynamic roller between the requested link types."""
     builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
     base = builder.add_body(mass=0.0, is_kinematic=True)
     inactive_position = (0.05, 0.03 * orientation, 0.0)
-    active_position = (0.05, 0.0025 * orientation, 0.0)
+    # Clear of the routing hysteresis band for every neighbor pair: at 0.0025 the
+    # rolling-neighbor cases sit only ~20 um inside the candidate surface.
+    active_position = (0.05, 0.002 * orientation, 0.0)
     candidate = builder.add_body(
         xform=wp.transform(p=wp.vec3(inactive_position)),
         mass=0.0,
@@ -1637,6 +1751,154 @@ def test_dynamic_route_activation_tolerance_preserves_boundary_state(test, devic
                 solver._update_tendon_link_active(model, model.body_q)
                 actual_active = bool(solver.tendon_link_active.numpy()[candidate_link])
                 test.assertEqual(actual_active, expected_active)
+
+
+def test_dynamic_route_holds_state_when_neighbors_interpenetrate(test, device):
+    """Overlapping neighbors have no bypass tangent, so the last decision must hold."""
+    with wp.ScopedDevice(device):
+        model, upper, candidate_link = build_interpenetrating_neighbor_route(device)
+        solver = newton.solvers.SolverXPBD(model, iterations=1)
+
+        solver._update_tendon_link_active(model, model.body_q)
+        held = bool(solver.tendon_link_active.numpy()[candidate_link])
+        test.assertTrue(held, "The candidate should be active while the neighbors are apart")
+        solver._prepare_tendon_route(model, model.body_q)
+        route_rest = solver.tendon_seg_route_rest_length.numpy().copy()
+
+        # Sink the upper neighbor until the two 0.3 m wrap circles overlap by 0.45 m.
+        body_q = model.body_q.numpy()
+        body_q[upper, :3] = (0.0, 0.0, -0.35)
+        model.body_q.assign(body_q)
+
+        for step in range(8):
+            solver._snapshot_tendon_step_state()
+            solver._update_tendon_link_active(model, model.body_q)
+            solver._prepare_tendon_route(model, model.body_q)
+            test.assertEqual(
+                bool(solver.tendon_link_active.numpy()[candidate_link]),
+                held,
+                f"Dynamic state changed on an undefined bypass span at step {step}",
+            )
+            np.testing.assert_allclose(
+                solver.tendon_seg_route_rest_length.numpy(),
+                route_rest,
+                atol=1.0e-9,
+                err_msg=f"Route rest length stepped on an undefined bypass span at step {step}",
+            )
+
+
+def test_dynamic_route_holds_state_on_short_bypass_span(test, device):
+    """A span barely longer than the candidate makes the span parameter noise-dominated."""
+    with wp.ScopedDevice(device):
+        model, candidate, candidate_link, span_l, span_r = build_short_span_neighbor_route(device)
+        span = span_r - span_l
+        span_length = float(np.linalg.norm(span))
+        along = span / span_length
+
+        # Close but genuinely apart, so the interpenetration guard is not what fires here.
+        test.assertGreater(2.0 * SHORT_SPAN_HALF_SEPARATION, 2.0 * SHORT_SPAN_NEIGHBOR_RADIUS)
+        test.assertLess(span_length, 2.0 * SHORT_SPAN_CANDIDATE_RADIUS)
+
+        def jitter_history(solver):
+            history = []
+            body_q = model.body_q.numpy()
+            authored = body_q[candidate, :3].copy()
+            for sample in range(12):
+                offset = 2.0e-4 * (1.0 if sample % 2 else -1.0)
+                body_q[candidate, :3] = authored + offset * along
+                model.body_q.assign(body_q)
+                solver._update_tendon_link_active(model, model.body_q)
+                history.append(bool(solver.tendon_link_active.numpy()[candidate_link]))
+            return history
+
+        solver = newton.solvers.SolverXPBD(model, iterations=1)
+        held = bool(solver.tendon_link_active.numpy()[candidate_link])
+        test.assertEqual(
+            jitter_history(solver),
+            [held] * 12,
+            "0.2 mm of pose jitter flipped a candidate on a span it cannot be placed on",
+        )
+
+        # The same jitter does flip the candidate once the span floor is disabled.
+        loose = newton.solvers.SolverXPBD(model, iterations=1, tendon_route_min_span_ratio=0.0)
+        test.assertIn(not held, jitter_history(loose))
+
+
+def test_dynamic_route_hysteresis_band_absorbs_pose_jitter(test, device):
+    """Pose jitter of +-band/2 inside the routing dead band must not flip the route."""
+    with wp.ScopedDevice(device):
+        radius = 0.1
+        band = 1.0e-3
+        # The dead band runs from the activation threshold up to the surface, where the
+        # oriented wrap angle changes sign, so the jitter is centered inside it.
+        center = radius - 0.5 * band
+        for orientation in (-1, 1):
+            for seed_active in (False, True):
+                model, candidate, candidate_link = build_oriented_dynamic_route(orientation, device)
+                solver = newton.solvers.SolverXPBD(
+                    model,
+                    iterations=1,
+                    tendon_activation_tol=0.0,
+                    tendon_route_hysteresis=band,
+                )
+                body_q = model.body_q.numpy()
+
+                seed = radius - 4.0 * band if seed_active else radius + 4.0 * band
+                body_q[candidate, :3] = (seed * orientation, 0.0, 0.0)
+                model.body_q.assign(body_q)
+                solver._update_tendon_link_active(model, model.body_q)
+                test.assertEqual(
+                    bool(solver.tendon_link_active.numpy()[candidate_link]),
+                    seed_active,
+                    f"orientation={orientation}, seed_active={seed_active}",
+                )
+
+                for sample in range(12):
+                    jitter = 0.4 * band * (1.0 if sample % 2 else -1.0)
+                    body_q[candidate, :3] = ((center + jitter) * orientation, 0.0, 0.0)
+                    model.body_q.assign(body_q)
+                    solver._update_tendon_link_active(model, model.body_q)
+                    test.assertEqual(
+                        bool(solver.tendon_link_active.numpy()[candidate_link]),
+                        seed_active,
+                        f"orientation={orientation}, seed_active={seed_active}, sample={sample}",
+                    )
+
+
+def test_dynamic_route_deactivates_when_wrap_angle_crosses_zero(test, device):
+    """A candidate leaving contact must deactivate on the sample its wrap turns negative."""
+    with wp.ScopedDevice(device):
+        radius = 0.1
+        band = 1.0e-3
+        for orientation in (-1, 1):
+            model, candidate, candidate_link = build_oriented_dynamic_route(orientation, device)
+            solver = newton.solvers.SolverXPBD(
+                model,
+                iterations=1,
+                tendon_activation_tol=0.0,
+                tendon_route_hysteresis=band,
+            )
+            body_q = model.body_q.numpy()
+
+            # The neighbors are sites, so the bypass span is the straight line between
+            # them and the candidate's oriented wrap angle is zero exactly where its
+            # surface touches that line. Past it the wrap is negative, which the route
+            # cannot represent, so the candidate must be inactive no matter how small
+            # the excursion is.
+            for sample in range(17):
+                distance = radius - 4.0 * band + 0.5 * band * float(sample)
+                body_q[candidate, :3] = (distance * orientation, 0.0, 0.0)
+                model.body_q.assign(body_q)
+                solver._update_tendon_link_active(model, model.body_q)
+                active = bool(solver.tendon_link_active.numpy()[candidate_link])
+                if distance > radius:
+                    test.assertFalse(
+                        active,
+                        f"orientation={orientation}: still active {(distance - radius) * 1e3:.3f} mm "
+                        "past the surface, where the wrap angle is negative",
+                    )
+                elif distance <= radius - band:
+                    test.assertTrue(active, f"orientation={orientation}, distance={distance}")
 
 
 def test_dynamic_route_requires_projection_on_bypass_span(test, device):
@@ -3804,6 +4066,30 @@ add_test(
     "dynamic_route_activation_tolerance_preserves_boundary_state",
     devices,
     test_dynamic_route_activation_tolerance_preserves_boundary_state,
+)
+add_test(
+    TestTendonCapstan,
+    "dynamic_route_holds_state_when_neighbors_interpenetrate",
+    devices,
+    test_dynamic_route_holds_state_when_neighbors_interpenetrate,
+)
+add_test(
+    TestTendonCapstan,
+    "dynamic_route_holds_state_on_short_bypass_span",
+    devices,
+    test_dynamic_route_holds_state_on_short_bypass_span,
+)
+add_test(
+    TestTendonCapstan,
+    "dynamic_route_hysteresis_band_absorbs_pose_jitter",
+    devices,
+    test_dynamic_route_hysteresis_band_absorbs_pose_jitter,
+)
+add_test(
+    TestTendonCapstan,
+    "dynamic_route_deactivates_when_wrap_angle_crosses_zero",
+    devices,
+    test_dynamic_route_deactivates_when_wrap_angle_crosses_zero,
 )
 add_test(
     TestTendonCapstan,

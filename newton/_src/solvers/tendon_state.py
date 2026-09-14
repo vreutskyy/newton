@@ -114,6 +114,17 @@ class TendonStateMixin:
             self.tendon_settle_tol = 1.0e-3
         if not hasattr(self, "tendon_activation_tol"):
             self.tendon_activation_tol = 2.0e-3
+        if not hasattr(self, "tendon_route_hysteresis"):
+            # Absolute floor [m] under the relative activation tolerance, so that small
+            # rollers keep a physical routing dead band instead of one that shrinks with
+            # their radius (2e-3 of a 3.9 mm roller is 7.7 um, far below the sub-mm pose
+            # noise of a loaded maximal-coordinate chain).
+            self.tendon_route_hysteresis = 1.0e-4
+        if not hasattr(self, "tendon_route_min_span_ratio"):
+            # Shortest bypass span, in candidate radii, the activation test is trusted on.
+            # One candidate diameter keeps the toy4 arm's healthy 5.0-radius spans while
+            # rejecting its near-degenerate 1.3-radius ones.
+            self.tendon_route_min_span_ratio = 2.0
         if not hasattr(self, "tendon_sigmoid_ea_low"):
             self.tendon_sigmoid_ea_low = 0.0
         if not hasattr(self, "tendon_sigmoid_ea_ratio"):
@@ -130,6 +141,12 @@ class TendonStateMixin:
             raise ValueError(
                 f"tendon_activation_tol must be between 0 (inclusive) and 1 (exclusive), "
                 f"got {self.tendon_activation_tol}"
+            )
+        if self.tendon_route_hysteresis < 0.0:
+            raise ValueError(f"tendon_route_hysteresis must be non-negative, got {self.tendon_route_hysteresis}")
+        if self.tendon_route_min_span_ratio < 0.0:
+            raise ValueError(
+                f"tendon_route_min_span_ratio must be non-negative, got {self.tendon_route_min_span_ratio}"
             )
         if self.tendon_sigmoid_ea_low < 0.0:
             raise ValueError(f"tendon_sigmoid_ea_low must be non-negative, got {self.tendon_sigmoid_ea_low}")
@@ -333,6 +350,8 @@ class TendonStateMixin:
                 model.tendon_link_offset,
                 model.tendon_link_axis,
                 self.tendon_activation_tol,
+                self.tendon_route_hysteresis,
+                self.tendon_route_min_span_ratio,
                 self.tendon_link_active,
             ],
             device=model.device,

@@ -296,6 +296,8 @@ def update_tendon_link_active(
     tendon_link_offset: wp.array[wp.vec3],
     tendon_link_axis: wp.array[wp.vec3],
     tendon_activation_tol: float,
+    tendon_route_hysteresis: float,
+    tendon_route_min_span_ratio: float,
     tendon_link_active: wp.array[bool],
 ):
     """Update dynamic rolling links from oriented distance to their bypass span."""
@@ -330,12 +332,30 @@ def update_tendon_link_active(
             and tendon_link_radius[next_link] > 0.0
         )
 
+        # The bypass span is the common external tangent of the two neighbors, so it only
+        # exists while their wrap circles stay apart. Once they interpenetrate there is no
+        # such tangent: the tangent helper falls back to its inside-the-circle branch, the
+        # span collapses and both alpha and the signed distance stop meaning anything.
+        # Hold the previous decision there instead of switching on garbage.
+        prev_radius = float(0.0)
+        if prev_rolling:
+            prev_radius = tendon_link_radius[prev_link]
+        next_radius = float(0.0)
+        if next_rolling:
+            next_radius = tendon_link_radius[next_link]
+        neighbor_distance = wp.length(next_center - prev_center)
+        if neighbor_distance <= prev_radius + next_radius + 1.0e-9:
+            continue
+
         bypass_l = prev_center
         bypass_r = next_center
+        bypass_step = float(0.0)
         if prev_rolling and next_rolling:
             prev_normal = wp.transform_vector(prev_pose, tendon_link_axis[prev_link])
             next_normal = wp.transform_vector(next_pose, tendon_link_axis[next_link])
             for _iter in range(10):
+                last_l = bypass_l
+                last_r = bypass_r
                 bypass_r = tangent_point_circle(
                     bypass_l,
                     next_center,
@@ -350,6 +370,7 @@ def update_tendon_link_active(
                     prev_normal,
                     -tendon_link_orientation[prev_link],
                 )
+                bypass_step = wp.length(bypass_l - last_l) + wp.length(bypass_r - last_r)
         elif prev_rolling:
             prev_normal = wp.transform_vector(prev_pose, tendon_link_axis[prev_link])
             bypass_l = tangent_point_circle(
@@ -382,20 +403,53 @@ def update_tendon_link_active(
         span = span - wp.dot(span, normal) * normal
         candidate_offset = candidate_offset - wp.dot(candidate_offset, normal) * normal
         span_length_sq = wp.dot(span, span)
+        # A collapsed span, or a tangent iteration that is still moving after its last
+        # sweep, leaves the test undefined the same way interpenetrating neighbors do.
+        # The tolerance is relative because a float32 fixed point cannot settle on an
+        # absolute metric threshold once the geometry is far from the origin.
+        if span_length_sq <= 1.0e-12 or bypass_step > 1.0e-5 * neighbor_distance:
+            continue
+
+        span_length = wp.sqrt(span_length_sq)
+        radius = tendon_link_radius[link_idx]
+        alpha = wp.dot(candidate_offset, span) / span_length_sq
+        closest_offset = alpha * span
+        span_normal = wp.cross(normal, span) / span_length
+        # Orient the signed distance so it is positive on the inactive side.
+        distance = wp.dot(candidate_offset - closest_offset, span_normal)
+        if tendon_link_orientation[link_idx] <= 0:
+            distance = -distance
+        if not wp.isfinite(alpha) or not wp.isfinite(distance):
+            continue
+
+        # The span parameter is normalized by the span, so its sensitivity to pose noise
+        # grows as 1 / |span| long before the neighbors actually touch. On the toy4 arm a
+        # 5.1 mm span (1.3 x the candidate radius) turns 0.2 mm of joint drift into an
+        # alpha swing of 0.04, well past any usable band, while a healthy pose of the same
+        # joint spans 19 mm (5.0 x). A span shorter than the candidate's own diameter
+        # cannot place it between the neighbors at all, so hold the previous decision --
+        # except that the distance is still exact there, and an active candidate that has
+        # left its surface wraps a negative angle, which is never worth holding.
+        if span_length <= tendon_route_min_span_ratio * radius:
+            if tendon_link_active[link_idx] and distance > radius:
+                tendon_link_active[link_idx] = False
+            continue
+
+        # Hysteresis band [m] on activation and on the span-end gate. The relative term
+        # keeps the historical behavior for large rollers; the absolute floor covers small
+        # ones, where radius * tol drops far below the pose noise of a loaded
+        # maximal-coordinate chain (0.1 mm of joint drift can move the margin by 0.2 mm,
+        # against a 7.7 um band for a 3.9 mm roller). Deactivation stays on the surface
+        # itself: past it the candidate's oriented wrap angle is negative, and holding an
+        # invalid wrap corrupts the route's rest length and tension.
+        band = wp.max(radius * tendon_activation_tol, tendon_route_hysteresis)
+        alpha_band = band / span_length
         active = False
-        if span_length_sq > 1.0e-12:
-            alpha = wp.dot(candidate_offset, span) / span_length_sq
-            closest_offset = alpha * span
-            span_normal = wp.cross(normal, span) / wp.sqrt(span_length_sq)
-            # Orient the signed distance so it is positive on the inactive side.
-            distance = wp.dot(candidate_offset - closest_offset, span_normal)
-            if tendon_link_orientation[link_idx] <= 0:
-                distance = -distance
-            activation_radius = tendon_link_radius[link_idx]
-            if not tendon_link_active[link_idx]:
-                activation_radius = activation_radius * (1.0 - tendon_activation_tol)
-            if alpha > 0.0 and alpha < 1.0 and distance <= activation_radius:
+        if tendon_link_active[link_idx]:
+            if alpha > -alpha_band and alpha < 1.0 + alpha_band and distance <= radius:
                 active = True
+        elif alpha > alpha_band and alpha < 1.0 - alpha_band and distance <= radius - band:
+            active = True
         tendon_link_active[link_idx] = active
 
 
