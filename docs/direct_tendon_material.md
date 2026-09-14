@@ -50,6 +50,14 @@ step/frame/batch and correct the input before reconstructing the solver. There
 is no fallback to material sweeps. `tendon_max_sweeps` and `tendon_settle_tol`
 control sweeps only, not the direct solve.
 
+`SolverVBD` latches only rejections taken on the accepted end-of-step pose. Its
+iteration 0 solves the raw inertial-predictor pose, which the solver itself
+discards one iteration later; a rejection there keeps that iteration's rest
+lengths and is re-tried, so a transient trial geometry cannot freeze a tendon's
+material state for the rest of the simulation. A genuine infeasibility is still
+reported within the same step. XPBD, initialization and the cooperative CUDA
+kernel latch every rejection.
+
 ## Formulation and implementation
 
 Each connected material component is solved at fixed body poses, span lengths,

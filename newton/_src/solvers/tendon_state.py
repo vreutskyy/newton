@@ -801,6 +801,7 @@ class TendonStateMixin:
                 self.tendon_sigmoid_transition_strain,
                 self.tendon_sigmoid_transition_width,
                 self._tendon_material_state,
+                1,
             ],
             device=model.device,
         )

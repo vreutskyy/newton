@@ -123,6 +123,7 @@ class _MaterialFixture:
                 0.0,
                 0.0,
                 solver._tendon_material_state,
+                1,  # latch a rejection: this fixture solves an accepted pose, not a trial pose
             ],
             device="cpu",
         )

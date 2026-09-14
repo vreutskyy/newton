@@ -465,6 +465,61 @@ class TestTendonMaterialVBD(unittest.TestCase):
                     self.assertLessEqual(float(tension[cone_l[link]] - cap[link] * tension[cone_r[link]]), 2.0e-3)
                     self.assertLessEqual(float(tension[cone_r[link]] - cap[link] * tension[cone_l[link]]), 2.0e-3)
 
+    def test_trial_pose_rejection_is_retried_and_not_latched(self):
+        """Latch a direct-material rejection on the accepted pose only, not on an iteration pose.
+
+        VBD re-solves the material every iteration, and iteration 0 runs on the raw inertial
+        predictor pose. On toy4 that pose transiently collapses a bypass span by 93% and
+        over-stretches the actuator span by 16 mm; latching there froze the tendon's rest
+        lengths for the rest of the run. An unequal-span chain with no material left in either
+        span reproduces the same infeasible component deterministically.
+        """
+        with wp.ScopedDevice("cpu"):
+            builder = newton.ModelBuilder(gravity=0.0)
+            body = builder.add_body(mass=0.0, is_kinematic=True)
+            builder.add_tendon()
+            for index, offset in enumerate(((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.2, 0.0, 0.0))):
+                builder.add_tendon_link(
+                    body=body,
+                    link_type=int(
+                        newton.TendonLinkType.ATTACHMENT if index in (0, 2) else newton.TendonLinkType.PINHOLE
+                    ),
+                    offset=offset,
+                    compliance=1.0e-3,
+                    rest_length=0.99,
+                    mu=0.1,
+                )
+            builder.color()
+            model = builder.finalize(device="cpu")
+            solver = _make_solver(model, iterations=1)
+            state = model.state()
+            workspace = solver._tendon_material_state
+
+            def set_route(rest):
+                solver.tendon_seg_route_rest_length.assign(np.full(model.tendon_segment_count, rest, dtype=np.float32))
+
+            # Equal tensions across the frictionless pinhole split the component's 1.2 m of
+            # extension evenly, so the 0.2 m span cannot hold its 0.6 m share: BOUND_INCOMPATIBLE.
+            set_route(1.0e-6)
+            solver._update_tendon_routing(state, 0.001, False)
+            np.testing.assert_array_equal(workspace.failure.numpy(), np.zeros(model.tendon_count, dtype=np.int32))
+            solver.check_tendon_material()
+
+            # The next iteration must still be solved, not skipped by a latched failure.
+            set_route(0.99)
+            solver._update_tendon_routing(state, 0.001, False)
+            solver.check_tendon_material()
+            self.assertFalse(
+                np.allclose(solver.tendon_seg_rest_length.numpy(), 0.99, atol=1.0e-6),
+                "a trial rejection must not stop later iterations from being solved",
+            )
+
+            # The accepted pose at the end of the step still reports the same infeasibility.
+            set_route(1.0e-6)
+            solver._update_tendon_routing(state, 0.001, True)
+            with self.assertRaisesRegex(RuntimeError, "BOUND_INCOMPATIBLE"):
+                solver.check_tendon_material()
+
     def test_runtime_mode_and_nonlinear_changes_are_rejected(self):
         """Keep the experimental direct mode and selected material law immutable."""
         model = _chain_model("cpu")

@@ -54,7 +54,23 @@ def fail_tendon_material(state: TendonMaterialState, code: int, tendon: int, com
 
 
 @wp.func
-def project_tendon_component(state: TendonMaterialState, row: int, count: int, tendon: int):
+def reject_tendon_material(state: TendonMaterialState, code: int, tendon: int, component: int, latch: int) -> bool:
+    """Report a rejected component, latching the failure only on an accepted pose.
+
+    VBD re-solves the material every iteration, including iteration 0, whose pose is the raw
+    inertial predictor and is discarded one iteration later. Latching a rejection taken on such
+    a trial pose would freeze the tendon's rest lengths for the rest of the simulation. A trial
+    rejection therefore leaves this iteration's rest lengths in place and is re-tried next
+    iteration; the accepted pose at the end of the step still latches, so a genuine infeasibility
+    is reported within the same step.
+    """
+    if latch != 0:
+        fail_tendon_material(state, code, tendon, component)
+    return False
+
+
+@wp.func
+def project_tendon_component(state: TendonMaterialState, row: int, count: int, tendon: int, latch: int) -> bool:
     if state.count[row] != count:
         state.valid[row] = 0
     state.count[row] = count
@@ -75,8 +91,8 @@ def project_tendon_component(state: TendonMaterialState, row: int, count: int, t
             1.0e-5,
         )
         if state.status[row] < 0:
-            fail_tendon_material(state, state.status[row] - 200, tendon, row)
-        return
+            return reject_tendon_material(state, state.status[row] - 200, tendon, row, latch)
+        return True
     # Each component packs into its original segment interval; inactive route slots
     # need no padding. Storage remains O(total segments), not 32 slots per segment.
     solve_tendon_material_component(
@@ -96,7 +112,8 @@ def project_tendon_component(state: TendonMaterialState, row: int, count: int, t
         1,
     )
     if state.status[row] < 0:
-        fail_tendon_material(state, state.status[row], tendon, row)
+        return reject_tendon_material(state, state.status[row], tendon, row, latch)
+    return True
 
 
 @wp.func
@@ -122,6 +139,7 @@ def transfer_tendon_material_direct(
     apply_rolling_transfer: int,
     apply_pinhole_slip: int,
     min_rest: float,
+    latch_failure: int,
 ) -> bool:
     for s in range(num_segs):
         seg = seg_offset + s
@@ -129,8 +147,7 @@ def transfer_tendon_material_direct(
         # must not turn invalid coefficients into an apparently valid solve.
         raw_compliance = state.raw_compliance[seg]
         if not wp.isfinite(raw_compliance) or raw_compliance < 1.0e-25:
-            fail_tendon_material(state, -1, tendon, seg_offset)
-            return False
+            return reject_tendon_material(state, -1, tendon, seg_offset, latch_failure)
         state.next_link[seg] = -1
         state.incoming[seg] = -1
 
@@ -146,15 +163,12 @@ def transfer_tendon_material_direct(
         if left < 0 or right < 0:
             continue
         if left < seg_offset or right >= seg_offset + num_segs or left >= right:
-            fail_tendon_material(state, -102, tendon, seg_offset)
-            return False
+            return reject_tendon_material(state, -102, tendon, seg_offset, latch_failure)
         if seg_active[left] == 0 or seg_active[right] == 0 or state.next_link[left] >= 0 or state.incoming[right] >= 0:
-            fail_tendon_material(state, -102, tendon, seg_offset)
-            return False
+            return reject_tendon_material(state, -102, tendon, seg_offset, latch_failure)
         for skipped in range(left + 1, right):
             if seg_active[skipped] != 0:
-                fail_tendon_material(state, -102, tendon, seg_offset)
-                return False
+                return reject_tendon_material(state, -102, tendon, seg_offset, latch_failure)
         state.next_link[left] = link
         state.incoming[right] = link
         if rolling:
@@ -180,14 +194,12 @@ def transfer_tendon_material_direct(
             link = state.next_link[previous]
         if link < 0:
             if count > 0:
-                project_tendon_component(state, row, count, tendon)
-                if state.failure[tendon] != 0:
+                if not project_tendon_component(state, row, count, tendon, latch_failure):
                     return False
             row = seg
             count = 0
         if count >= 32:
-            fail_tendon_material(state, -103, tendon, row)
-            return False
+            return reject_tendon_material(state, -103, tendon, row, latch_failure)
         index = row + count
         if state.ids[index] != seg:
             state.valid[row] = 0
@@ -208,8 +220,7 @@ def transfer_tendon_material_direct(
         count += 1
         previous = seg
     if count > 0:
-        project_tendon_component(state, row, count, tendon)
-        if state.failure[tendon] != 0:
+        if not project_tendon_component(state, row, count, tendon, latch_failure):
             return False
 
     # Publish only after every component on this tendon has passed its certificate.

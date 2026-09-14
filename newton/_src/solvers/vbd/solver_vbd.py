@@ -2585,6 +2585,9 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_sigmoid_transition_strain,
                 self.tendon_sigmoid_transition_width,
                 self._tendon_material_state,
+                # Latch a direct-material rejection only on the accepted pose. In-iteration poses
+                # (iteration 0 is the raw inertial predictor) are discarded by the solver itself.
+                int(report_unsupported_wrap),
             ],
             device=self.device,
         )

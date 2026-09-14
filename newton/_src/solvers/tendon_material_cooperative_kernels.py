@@ -488,7 +488,11 @@ def solve_tendon_material_cooperative(
     sigmoid_transition_strain: float,
     sigmoid_transition_width: float,
     direct: TendonMaterialState,
+    latch_failure: int,
 ):
+    # Launch-compatible with the scalar kernel. The cooperative CUDA path still latches every
+    # rejection, including ones taken on a discarded trial pose; narrowing it mirrors the scalar
+    # path's ``latch_failure`` plumbing and is left for a follow-up.
     tendon_id = wp.tid() // 32
     lane = wp.tid() % 32
     ready = int(0)

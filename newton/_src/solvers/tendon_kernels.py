@@ -1089,6 +1089,7 @@ def _make_solve_tendon_material(direct_enabled: bool):
         sigmoid_transition_strain: float,
         sigmoid_transition_width: float,
         direct: TendonMaterialState,
+        latch_failure: int,
     ):
         """Update free-span rest-length transfer for one tendon.
 
@@ -1225,6 +1226,7 @@ def _make_solve_tendon_material(direct_enabled: bool):
                     apply_rolling_transfer,
                     apply_pinhole_slip,
                     min_rest,
+                    latch_failure,
                 ):
                     return
             else:
