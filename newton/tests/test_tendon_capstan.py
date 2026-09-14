@@ -981,6 +981,74 @@ def build_interpenetrating_neighbor_route(device):
     return builder.finalize(device=device), upper, candidate_link
 
 
+# toy4 A.R0/A.R2 scale: two 5.8 mm rollers authored 20 mm apart (so the bypassed candidate
+# resolves from real tangent geometry), then driven to 8.51 mm - the centre distance the plant
+# reaches at its own dwell pose, 3.09 mm inside the 11.6 mm sum of the two radii.
+BYPASSED_OVERLAP_NEIGHBOR_RADIUS = 0.0058
+BYPASSED_OVERLAP_CANDIDATE_RADIUS = 0.003867
+BYPASSED_OVERLAP_APART_SEPARATION = 0.020
+BYPASSED_OVERLAP_SEPARATION = 0.0085147
+BYPASSED_OVERLAP_JITTER = 0.0015
+
+
+def build_bypassed_overlapping_neighbor_route(device):
+    """Build a bypassed dynamic candidate between rolling neighbors that can be made to overlap."""
+    builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+
+    lower = builder.add_body(xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.0)), mass=0.0, is_kinematic=True)
+    upper = builder.add_body(
+        xform=wp.transform(p=wp.vec3(0.0, 0.0, BYPASSED_OVERLAP_APART_SEPARATION)),
+        mass=0.0,
+        is_kinematic=True,
+    )
+    # Well off the bypass span, so the candidate is inactive from the first routing update on.
+    candidate = builder.add_body(xform=wp.transform(p=wp.vec3(0.012, 0.0, 0.010)), mass=0.0, is_kinematic=True)
+
+    builder.add_tendon()
+    builder.add_tendon_link(
+        body=lower,
+        link_type=int(TendonLinkType.ATTACHMENT),
+        offset=(0.02, 0.0, -0.01),
+        axis=(0.0, 1.0, 0.0),
+    )
+    builder.add_tendon_link(
+        body=lower,
+        link_type=int(TendonLinkType.ROLLING),
+        radius=BYPASSED_OVERLAP_NEIGHBOR_RADIUS,
+        orientation=1,
+        mu=0.0,
+        axis=(0.0, 1.0, 0.0),
+        rest_length=-1.0,
+    )
+    candidate_link = builder.add_tendon_link(
+        body=candidate,
+        link_type=int(TendonLinkType.ROLLING),
+        radius=BYPASSED_OVERLAP_CANDIDATE_RADIUS,
+        orientation=1,
+        mu=0.0,
+        dynamic=True,
+        axis=(0.0, 1.0, 0.0),
+        rest_length=-1.0,
+    )
+    builder.add_tendon_link(
+        body=upper,
+        link_type=int(TendonLinkType.ROLLING),
+        radius=BYPASSED_OVERLAP_NEIGHBOR_RADIUS,
+        orientation=-1,
+        mu=0.0,
+        axis=(0.0, 1.0, 0.0),
+        rest_length=-1.0,
+    )
+    builder.add_tendon_link(
+        body=upper,
+        link_type=int(TendonLinkType.ATTACHMENT),
+        offset=(-0.02, 0.0, 0.01),
+        axis=(0.0, 1.0, 0.0),
+        rest_length=-1.0,
+    )
+    return builder.finalize(device=device), upper, candidate_link
+
+
 # toy4 A.R1 scale: two 5.8 mm rollers 12.66 mm apart, wrapped in opposite senses, leave a
 # 5.07 mm internal-tangent bypass span - only 1.31 radii of the 3.867 mm candidate.
 SHORT_SPAN_NEIGHBOR_RADIUS = 0.0058
@@ -1785,6 +1853,61 @@ def test_dynamic_route_holds_state_when_neighbors_interpenetrate(test, device):
                 atol=1.0e-9,
                 err_msg=f"Route rest length stepped on an undefined bypass span at step {step}",
             )
+
+
+def test_bypassed_span_holds_attachments_when_neighbors_interpenetrate(test, device):
+    """Overlapping wrap circles have no common tangent, so the accepted attachments must hold."""
+    with wp.ScopedDevice(device):
+        model, upper, candidate_link = build_bypassed_overlapping_neighbor_route(device)
+        solver = newton.solvers.SolverXPBD(model, iterations=1)
+        # The bypassed candidate merges its two segments onto the left slot, so segment 1
+        # carries the free span between the two neighbors.
+        merged = 1
+        test.assertFalse(bool(solver.tendon_link_active.numpy()[candidate_link]))
+        # The neighbors are authored apart, so the initial route resolves from real tangents;
+        # the driven separation below puts their wrap circles inside each other.
+        test.assertGreater(BYPASSED_OVERLAP_APART_SEPARATION, 2.0 * BYPASSED_OVERLAP_NEIGHBOR_RADIUS)
+        test.assertLess(
+            float(np.hypot(BYPASSED_OVERLAP_SEPARATION, BYPASSED_OVERLAP_JITTER)),
+            2.0 * BYPASSED_OVERLAP_NEIGHBOR_RADIUS,
+        )
+
+        state_0, state_1 = model.state(), model.state()
+        control, contacts = model.control(), model.contacts()
+        attachments = []
+        lengths = []
+        route_rest = []
+        for step in range(8):
+            # Lateral pose noise of the kind a loaded maximal-coordinate chain carries. It
+            # sweeps the line through the two centers - the basin boundary of the degenerate
+            # fixed point - across the accepted tangent point.
+            lateral = BYPASSED_OVERLAP_JITTER * (1.0 if step % 2 else -1.0)
+            _set_body_translation(state_0, upper, (lateral, 0.0, BYPASSED_OVERLAP_SEPARATION))
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, contacts, 1.0 / 600.0)
+            state_0, state_1 = state_1, state_0
+            attachments.append(
+                np.concatenate(
+                    (
+                        solver.tendon_seg_attachment_l_local.numpy()[merged],
+                        solver.tendon_seg_attachment_r_local.numpy()[merged],
+                    )
+                )
+            )
+            lengths.append(float(solver.tendon_seg_length.numpy()[merged]))
+            route_rest.append(float(solver.tendon_seg_route_rest_length.numpy()[merged]))
+
+        test.assertEqual(int(solver.tendon_seg_active.numpy()[merged]), 1)
+        test.assertFalse(bool(solver.tendon_link_active.numpy()[candidate_link]))
+        test.assertLess(
+            float(np.abs(np.diff(np.array(attachments), axis=0)).max()),
+            1.0e-9,
+            "Tangent points slid on an undefined free span",
+        )
+        # Without the hold the fixed point lands on a circle intersection, which collapses the
+        # free span onto a point and drags the merged rest length down with it.
+        test.assertGreater(min(lengths), 1.0e-3)
+        test.assertLess(max(route_rest) - min(route_rest), 1.0e-9)
 
 
 def test_dynamic_route_holds_state_on_short_bypass_span(test, device):
@@ -4072,6 +4195,12 @@ add_test(
     "dynamic_route_holds_state_when_neighbors_interpenetrate",
     devices,
     test_dynamic_route_holds_state_when_neighbors_interpenetrate,
+)
+add_test(
+    TestTendonCapstan,
+    "bypassed_span_holds_attachments_when_neighbors_interpenetrate",
+    devices,
+    test_bypassed_span_holds_attachments_when_neighbors_interpenetrate,
 )
 add_test(
     TestTendonCapstan,

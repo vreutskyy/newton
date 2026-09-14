@@ -797,14 +797,34 @@ def update_tendon_attachments(
     if both_rolling and radius_l > 0.0 and radius_r > 0.0:
         new_al = seed_al
         new_ar = seed_ar
-        for _iter in range(10):
-            previous_al = new_al
-            previous_ar = new_ar
-            new_ar = tangent_point_circle(new_al, center_r, radius_r, normal_r, orient_r)
-            new_al = tangent_point_circle(new_ar, center_l, radius_l, normal_l, -orient_l)
-            tangent_delta_sq = wp.length_sq(new_al - previous_al) + wp.length_sq(new_ar - previous_ar)
-            if tangent_delta_sq == 0.0:
-                break
+        # Interpenetrating wrap circles have no common tangent of the required handedness, so
+        # the fixed point below runs on the inside-the-circle fallback of tangent_point_circle
+        # and settles on whichever of the two circle intersections the seed faces. Both are
+        # attractors, and pose noise that sweeps the centre line across the seed flips the pair
+        # between them, stepping the wrap arcs by tens of degrees and the free span with them.
+        # Hold the accepted tangents there, the same way update_tendon_link_active holds its
+        # decision on the matching degenerate bypass span. A seed that is not on its circle
+        # carries no accepted tangent to hold -- initialization seeds the link centre, and a
+        # route transition moves the endpoint to another link -- so those still take the
+        # fallback construction.
+        held = False
+        if wp.length(center_r - center_l) <= radius_l + radius_r + 1.0e-9:
+            radial_l = seed_al - center_l
+            radial_r = seed_ar - center_r
+            radial_l = radial_l - wp.dot(radial_l, normal_l) * normal_l
+            radial_r = radial_r - wp.dot(radial_r, normal_r) * normal_r
+            held = (wp.abs(wp.length(radial_l) - radius_l) <= 1.0e-3 * radius_l) and (
+                wp.abs(wp.length(radial_r) - radius_r) <= 1.0e-3 * radius_r
+            )
+        if not held:
+            for _iter in range(10):
+                previous_al = new_al
+                previous_ar = new_ar
+                new_ar = tangent_point_circle(new_al, center_r, radius_r, normal_r, orient_r)
+                new_al = tangent_point_circle(new_ar, center_l, radius_l, normal_l, -orient_l)
+                tangent_delta_sq = wp.length_sq(new_al - previous_al) + wp.length_sq(new_ar - previous_ar)
+                if tangent_delta_sq == 0.0:
+                    break
     elif type_l == int(TendonLinkType.ROLLING) and radius_l > 0.0:
         new_ar = center_r
         new_al = tangent_point_circle(center_r, center_l, radius_l, normal_l, -orient_l)
