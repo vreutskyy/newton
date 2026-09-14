@@ -428,11 +428,18 @@ def update_tendon_link_active(
         # alpha swing of 0.04, well past any usable band, while a healthy pose of the same
         # joint spans 19 mm (5.0 x). A span shorter than the candidate's own diameter
         # cannot place it between the neighbors at all, so hold the previous decision --
-        # except that the distance is still exact there, and an active candidate that has
-        # left its surface wraps a negative angle, which is never worth holding.
+        # except that the geometry is still exact there, and an active candidate the span no
+        # longer reaches wraps a negative angle, which is never worth holding. Measure that
+        # against the span itself, with the foot clamped to its ends, because the span-end
+        # gate below is skipped here: on a short span the infinite extension still runs close
+        # to a candidate parked several span lengths past the end (toy4 cable A at
+        # j0 = -90 deg sits at alpha 4.6, 3.3 mm from the extension of a 2.9 mm span against
+        # its own 3.9 mm radius, but 11.0 mm from the span).
         if span_length <= tendon_route_min_span_ratio * radius:
-            if tendon_link_active[link_idx] and distance > radius:
-                tendon_link_active[link_idx] = False
+            if tendon_link_active[link_idx]:
+                span_foot = wp.clamp(alpha, 0.0, 1.0) * span
+                if wp.length(candidate_offset - span_foot) > radius:
+                    tendon_link_active[link_idx] = False
             continue
 
         # Hysteresis band [m] on activation and on the span-end gate. The relative term

@@ -2001,6 +2001,37 @@ def test_dynamic_route_holds_state_on_short_bypass_span(test, device):
         test.assertIn(not held, jitter_history(loose))
 
 
+def test_dynamic_route_drops_candidate_past_short_span_end(test, device):
+    """A short span still has to release a candidate parked beyond its end."""
+    with wp.ScopedDevice(device):
+        model, candidate, candidate_link, span_l, span_r = build_short_span_neighbor_route(device)
+        span = span_r - span_l
+        span_length = float(np.linalg.norm(span))
+        along = span / span_length
+        side = np.cross(SHORT_SPAN_PLANE_NORMAL, along)
+        test.assertLess(span_length, 2.0 * SHORT_SPAN_CANDIDATE_RADIUS)
+
+        solver = newton.solvers.SolverXPBD(model, iterations=1)
+        test.assertTrue(bool(solver.tendon_link_active.numpy()[candidate_link]))
+
+        # toy4 cable A at j0 = -90 deg: the candidate sits several span lengths past the end of
+        # a 2.9 mm span, so the span's infinite extension still runs 3.3 mm from its center --
+        # inside the 3.9 mm radius -- while the span itself is 11 mm away and the candidate
+        # wraps -105 deg if it is kept.
+        body_q = model.body_q.numpy()
+        past_end = body_q[candidate, :3] + 3.6 * span_length * along
+        test.assertLess(abs(float(np.dot(past_end - span_r, side))), SHORT_SPAN_CANDIDATE_RADIUS)
+        test.assertGreater(float(np.linalg.norm(past_end - span_r)), SHORT_SPAN_CANDIDATE_RADIUS)
+
+        body_q[candidate, :3] = past_end
+        model.body_q.assign(body_q)
+        solver._update_tendon_link_active(model, model.body_q)
+        test.assertFalse(
+            bool(solver.tendon_link_active.numpy()[candidate_link]),
+            "Held a candidate on the extension of a short span it had left",
+        )
+
+
 def test_dynamic_route_hysteresis_band_absorbs_pose_jitter(test, device):
     """Pose jitter of +-band/2 inside the routing dead band must not flip the route."""
     with wp.ScopedDevice(device):
@@ -4261,6 +4292,12 @@ add_test(
     "dynamic_route_holds_state_on_short_bypass_span",
     devices,
     test_dynamic_route_holds_state_on_short_bypass_span,
+)
+add_test(
+    TestTendonCapstan,
+    "dynamic_route_drops_candidate_past_short_span_end",
+    devices,
+    test_dynamic_route_drops_candidate_past_short_span_end,
 )
 add_test(
     TestTendonCapstan,
