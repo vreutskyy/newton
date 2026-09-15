@@ -7,7 +7,7 @@ from ...core.types import override
 from ...sim import Contacts, Control, Model, State
 from ..flags import SolverNotifyFlags
 from ..solver import SolverBase
-from ..tendon_kernels import solve_tendon_material, update_tendon_attachments
+from ..tendon_kernels import update_tendon_attachments
 from ..tendon_state import TendonStateMixin
 from .kernels import (
     accumulate_weighted_contact_impulse,
@@ -87,6 +87,22 @@ class SolverXPBD(TendonStateMixin, SolverBase):
 
         See :ref:`Joint feature support` for the full comparison across solvers.
 
+    The experimental constructor option ``tendon_material_direct=True`` replaces
+    material sweeps with a finite-friction direct solve and matching rolling
+    reaction. It supports linear compliance >= 1e-25 m/N or the experimental
+    sigmoid law, at most 32 authored spans between attachments, and capstan
+    ratios up to 4. CUDA uses a cooperative warp for sigmoid projection; CPU
+    uses the scalar exact-block implementation. Geometry-dependent cap ratios
+    and numerical feasibility are checked at runtime. Differentiable simulation
+    is not supported in this mode. See ``docs/direct_tendon_material.md``.
+    ``tendon_max_sweeps`` and ``tendon_settle_tol`` do not control direct solves.
+    Select the mode at construction; reconstruct the solver to change it.
+
+    Call :meth:`check_tendon_material` after each step or graph replay, outside
+    capture and before consuming results. A failure prints an error and remains
+    latched; queued body solves are not rolled back, so the affected step/frame/
+    batch must be discarded. There is no fallback to material sweeps.
+
     Example
     -------
 
@@ -124,9 +140,11 @@ class SolverXPBD(TendonStateMixin, SolverBase):
         tendon_sigmoid_ea_ratio: float = 1.0,
         tendon_sigmoid_transition_strain: float = 0.0,
         tendon_sigmoid_transition_width: float = 1.0,
+        tendon_material_direct: bool = False,
     ):
         super().__init__(model=model)
         self.iterations = iterations
+        self.tendon_material_direct = tendon_material_direct
         # Routed-cable capstan cone relaxation: up to tendon_max_sweeps Gauss-Seidel passes, stopping
         # early once the relaxation has settled -- the max per-sweep tension change relative to the
         # first sweep's peak tension falls below tendon_settle_tol. Already-converged cables stop almost
@@ -330,6 +348,11 @@ class SolverXPBD(TendonStateMixin, SolverBase):
     @override
     def step(self, state_in: State, state_out: State, control: Control, contacts: Contacts, dt: float) -> None:
         requires_grad = state_in.requires_grad
+        if self.tendon_material_direct != self._tendon_material_state.enabled:
+            raise ValueError("Reconstruct SolverXPBD to change tendon_material_direct")
+        if self.tendon_material_direct and (requires_grad or state_out.requires_grad):
+            raise ValueError("tendon_material_direct does not support differentiable simulation")
+        self._validate_direct_tendon_law()
         self._particle_delta_counter = 0
         self._body_delta_counter = 0
 
@@ -772,8 +795,9 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                         self._update_tendon_cone_rows(model, body_q, i == 0)
 
                         wp.launch(
-                            kernel=solve_tendon_material,
-                            dim=model.tendon_count,
+                            kernel=self._tendon_material_kernel,
+                            dim=model.tendon_count * self._tendon_material_lanes,
+                            block_dim=self._tendon_material_block_dim,
                             inputs=[
                                 body_q,
                                 body_qd,
@@ -820,6 +844,7 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                                 self.tendon_sigmoid_ea_ratio,
                                 self.tendon_sigmoid_transition_strain,
                                 self.tendon_sigmoid_transition_width,
+                                self._tendon_material_state,
                             ],
                             device=model.device,
                         )
@@ -896,6 +921,7 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                                 self.tendon_seg_delta_lambda,
                                 self.joint_linear_relaxation,
                                 self.tendon_sigmoid_ea_low,
+                                self.tendon_material_direct,
                             ],
                             outputs=[body_deltas],
                             device=model.device,

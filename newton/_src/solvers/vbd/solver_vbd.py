@@ -21,7 +21,7 @@ from ...sim import (
 )
 from ..flags import SolverNotifyFlags
 from ..solver import SolverBase
-from ..tendon_kernels import solve_tendon_material, update_tendon_attachments
+from ..tendon_kernels import update_tendon_attachments
 from ..tendon_state import TendonStateMixin
 from ..xpbd.kernels import apply_joint_forces
 from .particle_vbd_kernels import (
@@ -264,6 +264,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
         tendon_alm: bool = False,
         tendon_alm_penalty_scale: float = 5.0,
         tendon_alm_min_stiffness_ratio: float = 50.0,
+        tendon_material_direct: bool = False,
     ):
         """
         Args:
@@ -403,6 +404,13 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 the ALM row is only worth its cost where that number is large. Decided once per tendon, at the
                 first step, and kept. 0 applies the ALM row to every tendon. The multiplier decays per step by
                 ``rigid_avbd_gamma``, like the joint multipliers.
+            tendon_material_direct: Use the experimental direct finite-friction material solve instead of
+                material sweeps. Supports linear compliance or the experimental sigmoid law,
+                at most 32 authored spans between attachments, and capstan ratios no greater than 4.
+                CUDA projects sigmoid components cooperatively; CPU uses scalar exact blocks.
+                Call :meth:`check_tendon_material` outside
+                CUDA graph capture to detect unsupported or infeasible runtime states. There is no fallback
+                to material sweeps; discard a failed step and reconstruct the solver after correcting its inputs.
 
         Note:
             - The `integrate_with_external_rigid_solver` argument enables one-way coupling between rigid body and soft body
@@ -456,6 +464,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
         self.tendon_alm = bool(tendon_alm)
         self.tendon_alm_penalty_scale = float(tendon_alm_penalty_scale)
         self.tendon_alm_min_stiffness_ratio = float(tendon_alm_min_stiffness_ratio)
+        self.tendon_material_direct = tendon_material_direct
         # Rigid integration mode: when True, rigid bodies are integrated by an external
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
         # participate in particle-rigid interaction on the particle side.
@@ -1704,6 +1713,12 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 depend on this argument.
             dt: Time step size.
         """
+        if self.tendon_material_direct != self._tendon_material_state.enabled:
+            raise ValueError("Reconstruct SolverVBD to change tendon_material_direct")
+        if self.tendon_material_direct and (state_in.requires_grad or state_out.requires_grad):
+            raise ValueError("tendon_material_direct does not support differentiable simulation")
+        self._validate_direct_tendon_law()
+
         update_rigid = self._update_rigid_history
         self._update_rigid_history = True
 
@@ -2520,8 +2535,9 @@ class SolverVBD(TendonStateMixin, SolverBase):
         self._update_tendon_cone_rows(model, state_in.body_q, report_unsupported_wrap)
 
         wp.launch(
-            kernel=solve_tendon_material,
-            dim=model.tendon_count,
+            kernel=self._tendon_material_kernel,
+            dim=model.tendon_count * self._tendon_material_lanes,
+            block_dim=self._tendon_material_block_dim,
             inputs=[
                 state_in.body_q,
                 state_in.body_qd,
@@ -2568,6 +2584,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_sigmoid_ea_ratio,
                 self.tendon_sigmoid_transition_strain,
                 self.tendon_sigmoid_transition_width,
+                self._tendon_material_state,
             ],
             device=self.device,
         )
@@ -2895,6 +2912,10 @@ class SolverVBD(TendonStateMixin, SolverBase):
                     self.tendon_seg_alm_lambda,
                     self.tendon_seg_alm_k,
                     int(self.tendon_alm),
+                    self.tendon_material_direct,
+                    self.tendon_link_cone_seg_l,
+                    self.tendon_link_cone_seg_r,
+                    self.tendon_link_cap_ratio,
                 ],
                 outputs=[
                     state_in.body_q,
