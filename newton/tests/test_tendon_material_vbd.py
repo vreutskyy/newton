@@ -520,6 +520,35 @@ class TestTendonMaterialVBD(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "BOUND_INCOMPATIBLE"):
                 solver.check_tendon_material()
 
+    def test_direct_material_skips_unsettled_opening_iterations(self):
+        """Hold the accepted rest lengths while VBD's opening iteration poses are unsettled.
+
+        The direct solve returns an exact allocation for whatever geometry it is handed, so the
+        opening poses of a substep — iteration 0 is the raw inertial predictor — produce
+        kilonewton-scale ones on toy4. Sweeps never reach them because each pass is bounded.
+        """
+        model = _chain_model("cpu")
+        for iterations, expected in ((1, 0), (3, 2), (8, 4), (32, 4)):
+            with self.subTest(iterations=iterations):
+                solver = _make_solver(model, iterations=iterations)
+                self.assertEqual(solver._tendon_direct_settle_iterations(), expected)
+
+        solver = _make_solver(model, iterations=8)
+        state = model.state()
+        solver.tendon_seg_route_rest_length.assign(np.full(model.tendon_segment_count, 0.5, dtype=np.float32))
+        held = solver.tendon_seg_rest_length.numpy().copy()
+
+        solver._update_tendon_routing(state, 0.001, False, skip_material=True)
+        np.testing.assert_array_equal(solver.tendon_seg_rest_length.numpy(), held)
+        # The route geometry itself is still refreshed for the body solve.
+        self.assertTrue(np.all(solver.tendon_seg_length.numpy() > 0.0))
+
+        solver._update_tendon_routing(state, 0.001, False)
+        self.assertFalse(
+            np.allclose(solver.tendon_seg_rest_length.numpy(), held, atol=1.0e-6),
+            "a settled iteration must still solve the material",
+        )
+
     def test_runtime_mode_and_nonlinear_changes_are_rejected(self):
         """Keep the experimental direct mode and selected material law immutable."""
         model = _chain_model("cpu")
