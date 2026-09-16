@@ -34,8 +34,41 @@ class TendonMaterialState:
     edge_ids: wp.array[int]
     next_link: wp.array[int]
     incoming: wp.array[int]
+    seg_length_iter: wp.array[float]
+    settle_tol: float
     failure: wp.array[int]
     failure_component: wp.array[int]
+
+
+@wp.func
+def tendon_material_direct_settled(
+    state: TendonMaterialState,
+    seg_offset: int,
+    num_segs: int,
+    seg_active: wp.array[int],
+    seg_length: wp.array[float],
+) -> bool:
+    """Whether a tendon's route geometry stopped moving since the previous solver iteration.
+
+    The direct transfer returns an exact allocation for the geometry it is handed, so it must
+    only act on a pose the surrounding solver keeps. VBD's iteration 0 is the raw inertial
+    predictor, in which every penalty-restrained joint is violated by ``F*dt^2/m`` and
+    ``tau*dt^2/I``; a light body carrying routing links moves tens of millimetres there and is
+    pulled back one iteration later. Compare the largest free-span length change over the
+    tendon's active spans against ``state.settle_tol`` times its total active length, which
+    separates that transient from the sub-tolerance motion of a converging iteration without
+    counting iterations.
+    """
+    total = float(0.0)
+    motion = float(0.0)
+    for s in range(num_segs):
+        seg = seg_offset + s
+        if seg_active[seg] == 0:
+            continue
+        length = seg_length[seg]
+        total += length
+        motion = wp.max(motion, wp.abs(length - state.seg_length_iter[seg]))
+    return motion <= state.settle_tol * total
 
 
 @wp.func

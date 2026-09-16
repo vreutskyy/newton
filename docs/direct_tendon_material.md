@@ -58,6 +58,19 @@ material state for the rest of the simulation. A genuine infeasibility is still
 reported within the same step. XPBD, initialization and the cooperative CUDA
 kernel latch every rejection.
 
+`SolverVBD` also solves the material only on iterations whose route geometry has
+stopped moving. The direct solve is exact for the geometry it is handed, so it
+must not act on a pose the solver is about to discard: iteration 0 is the raw
+inertial predictor, in which every penalty-restrained joint is violated by
+`F*dt^2/m` and `tau*dt^2/I`. A light body carrying routing links moves the route
+by tens of millimetres there, and the iterations restore it. Each iteration
+compares its longest free-span length change with
+`tendon_material_direct_settle_tol` (default 1e-2) times the tendon's total
+active length and keeps the last solved allocation when the route moved more
+than that; the accepted end-of-step pose always solves, so `0` restricts the
+material solve to that pose. The route geometry and cone rows still refresh
+every iteration, and material sweeps ignore the tolerance entirely.
+
 ## Formulation and implementation
 
 Each connected material component is solved at fixed body poses, span lengths,

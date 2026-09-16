@@ -13,7 +13,7 @@ from ..sim.tendon import TendonLinkType
 from .tendon_kernels import tendon_segment_length_rate, tendon_segment_length_rate_from_poses, wrapped_arc_length
 from .tendon_material_cooperative import solve_tendon_material_nonlinear_component as project_cooperative
 from .tendon_material_cooperative import warp_broadcast
-from .tendon_material_state import TendonMaterialState, fail_tendon_material
+from .tendon_material_state import TendonMaterialState, fail_tendon_material, tendon_material_direct_settled
 
 
 @wp.func
@@ -72,6 +72,7 @@ def prepare_material(
     sigmoid_transition_strain: float,
     sigmoid_transition_width: float,
     direct: TendonMaterialState,
+    latch_failure: int,
 ) -> int:
     if direct.failure[tendon_id] != 0:
         return 0
@@ -83,6 +84,11 @@ def prepare_material(
     if num_segs < 1:
         return 0
     seg_offset = link_start - tendon_id
+    # Trial poses only, as in the scalar kernel: hold the last solved pose's rest lengths while
+    # the route geometry is still moving. The accepted pose (``latch_failure``) always solves.
+    if latch_failure == 0:
+        if not tendon_material_direct_settled(direct, seg_offset, num_segs, seg_active, seg_length):
+            return 0
     min_rest = 1e-06
     for s in range(num_segs):
         seg = seg_offset + s
@@ -545,6 +551,7 @@ def solve_tendon_material_cooperative(
             sigmoid_transition_strain,
             sigmoid_transition_width,
             direct,
+            latch_failure,
         )
     ready = warp_broadcast(ready)
     if ready == 0:
