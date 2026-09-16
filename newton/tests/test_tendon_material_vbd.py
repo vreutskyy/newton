@@ -10,6 +10,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.tendon_material_cooperative_kernels import solve_tendon_material_cooperative
 from newton._src.solvers.vbd.tendon_kernels import (
     TendonForceElementAdjacencyInfo,
     evaluate_tendon_force_hessians,
@@ -261,6 +262,24 @@ def _offset_pulley(*, same_body_attachment=False, mu=0.1):
     return builder.finalize(device="cpu"), body
 
 
+def _unequal_pinhole_chain():
+    """Build a 1.0 m / 0.2 m pinhole chain whose equal-tension split no allocation can hold."""
+    builder = newton.ModelBuilder(gravity=0.0)
+    body = builder.add_body(mass=0.0, is_kinematic=True)
+    builder.add_tendon()
+    for index, offset in enumerate(((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.2, 0.0, 0.0))):
+        builder.add_tendon_link(
+            body=body,
+            link_type=int(newton.TendonLinkType.ATTACHMENT if index in (0, 2) else newton.TendonLinkType.PINHOLE),
+            offset=offset,
+            compliance=1.0e-3,
+            rest_length=0.99,
+            mu=0.1,
+        )
+    builder.color()
+    return builder.finalize(device="cpu")
+
+
 class TestTendonMaterialVBD(unittest.TestCase):
     """Check the normal VBD path against independently derived physical results."""
 
@@ -475,28 +494,17 @@ class TestTendonMaterialVBD(unittest.TestCase):
         span reproduces the same infeasible component deterministically.
         """
         with wp.ScopedDevice("cpu"):
-            builder = newton.ModelBuilder(gravity=0.0)
-            body = builder.add_body(mass=0.0, is_kinematic=True)
-            builder.add_tendon()
-            for index, offset in enumerate(((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.2, 0.0, 0.0))):
-                builder.add_tendon_link(
-                    body=body,
-                    link_type=int(
-                        newton.TendonLinkType.ATTACHMENT if index in (0, 2) else newton.TendonLinkType.PINHOLE
-                    ),
-                    offset=offset,
-                    compliance=1.0e-3,
-                    rest_length=0.99,
-                    mu=0.1,
-                )
-            builder.color()
-            model = builder.finalize(device="cpu")
+            model = _unequal_pinhole_chain()
             solver = _make_solver(model, iterations=1)
             state = model.state()
             workspace = solver._tendon_material_state
 
             def set_route(rest):
                 solver.tendon_seg_route_rest_length.assign(np.full(model.tendon_segment_count, rest, dtype=np.float32))
+
+            # Settle the route first: an iteration whose geometry is still moving is held before
+            # it reaches the material solve, and would pass the assertions below vacuously.
+            solver._update_tendon_routing(state, 0.001, False)
 
             # Equal tensions across the frictionless pinhole split the component's 1.2 m of
             # extension evenly, so the 0.2 m span cannot hold its 0.6 m share: BOUND_INCOMPATIBLE.
@@ -519,6 +527,55 @@ class TestTendonMaterialVBD(unittest.TestCase):
             solver._update_tendon_routing(state, 0.001, True)
             with self.assertRaisesRegex(RuntimeError, "BOUND_INCOMPATIBLE"):
                 solver.check_tendon_material()
+
+    def test_cooperative_kernel_latches_and_reports_the_offending_span(self):
+        """Apply the accepted-pose latch rule in the cooperative kernel, and name the bad span.
+
+        The cooperative kernel is only selected on CUDA, but its warp primitives fall back to
+        scalars off the device (as in ``test_tendon_material_cooperative``), so the same launch
+        shape exercises it here. Without the rule, a rejection taken on the discarded predictor
+        pose freezes the tendon's material state for the rest of the simulation.
+        """
+        with wp.ScopedDevice("cpu"):
+            model = _unequal_pinhole_chain()
+            solver = newton.solvers.SolverVBD(
+                model,
+                iterations=1,
+                tendon_settle_tol=0.0,
+                tendon_material_direct=True,
+                tendon_sigmoid_ea_low=500.0,
+                tendon_sigmoid_ea_ratio=10.0,
+                tendon_sigmoid_transition_strain=0.01,
+                tendon_sigmoid_transition_width=0.003,
+            )
+            solver._tendon_material_kernel = solve_tendon_material_cooperative
+            solver._tendon_material_lanes = 32
+            solver._tendon_material_block_dim = 32
+            state = model.state()
+            workspace = solver._tendon_material_state
+
+            def set_route(rest):
+                solver.tendon_seg_route_rest_length.assign(np.full(model.tendon_segment_count, rest, dtype=np.float32))
+
+            # Settle the route before asking the material solve for an infeasible allocation.
+            solver._update_tendon_routing(state, 0.001, False)
+
+            set_route(1.0e-6)
+            solver._update_tendon_routing(state, 0.001, False)
+            np.testing.assert_array_equal(workspace.failure.numpy(), np.zeros(model.tendon_count, dtype=np.int32))
+            solver.check_tendon_material()
+
+            # The accepted pose latches, and reports the span that carries the tightest bound.
+            solver._update_tendon_routing(state, 0.001, True)
+            self.assertLess(int(workspace.failure.numpy()[0]), 0)
+            span = int(workspace.failure_seg.numpy()[0])
+            self.assertIn(span, (0, 1))
+            with self.assertRaisesRegex(RuntimeError, f"Span {span} carries the tightest bound"):
+                solver.check_tendon_material()
+            self.assertAlmostEqual(float(workspace.failure_length.numpy()[0]), (1.0, 0.2)[span], delta=1.0e-6)
+            self.assertAlmostEqual(float(workspace.failure_compliance.numpy()[0]), 1.0e-3, delta=1.0e-9)
+            self.assertGreater(float(workspace.failure_tension.numpy()[0]), 0.0)
+            self.assertLess(float(workspace.failure_upper.numpy()[0]), (1.0, 0.2)[span])
 
     def test_direct_material_skips_unsettled_iterations(self):
         """Hold the last solved rest lengths while an iteration's route geometry is still moving.

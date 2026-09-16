@@ -158,7 +158,13 @@ class TendonStateMixin:
         state.seg_length_iter = self.tendon_seg_length_iter
         state.settle_tol = self.tendon_material_direct_settle_tol
         state.failure = wp.zeros(model.tendon_count, dtype=int, device=model.device)
+        # Failure record: the component, then the span inside it that carries the tightest bound,
+        # with the numbers a diagnosis needs (its free length, compliance, demanded tension and
+        # rest-length upper bound). -1 segment means the failure localized no single span.
         state.failure_component = wp.full(model.tendon_count, -1, dtype=int, device=model.device)
+        state.failure_seg = wp.full(model.tendon_count, -1, dtype=int, device=model.device)
+        for name in ("failure_length", "failure_compliance", "failure_tension", "failure_upper"):
+            setattr(state, name, wp.zeros(model.tendon_count, dtype=float, device=model.device))
         state.nonlinear_enabled = self.tendon_sigmoid_ea_low > 0.0
         if state.nonlinear_enabled:
             state.ea_low = self.tendon_sigmoid_ea_low
@@ -225,9 +231,18 @@ class TendonStateMixin:
             except ValueError:
                 reason = names.get(code, "UNKNOWN_FAILURE")
             component = int(state.failure_component.numpy()[tendon])
+            span = ""
+            seg = int(state.failure_seg.numpy()[tendon])
+            if seg >= 0:
+                span = (
+                    f" Span {seg} carries the tightest bound: length {float(state.failure_length.numpy()[tendon]):g} m, "
+                    f"compliance {float(state.failure_compliance.numpy()[tendon]):g} m/N, demanded tension "
+                    f"{float(state.failure_tension.numpy()[tendon]):g} N, rest-length bound "
+                    f"{float(state.failure_upper.numpy()[tendon]):g} m."
+                )
             raise RuntimeError(
                 f"Direct tendon material solve failed: {reason} ({code}), tendon {tendon}, "
-                f"component starting at segment {component}. Discard this step/frame/batch; "
+                f"component starting at segment {component}.{span} Discard this step/frame/batch; "
                 "correct the input and reconstruct the solver. No sweep fallback was applied."
             )
 

@@ -48,15 +48,19 @@ Call `solver.check_tendon_material()` outside capture after a step or graph
 replay, before consuming its results. A failure is latched; discard the affected
 step/frame/batch and correct the input before reconstructing the solver. There
 is no fallback to material sweeps. `tendon_max_sweeps` and `tendon_settle_tol`
-control sweeps only, not the direct solve.
+control sweeps only, not the direct solve. The report names the failing tendon
+and component, and — when the failure localizes to one span — that span's index,
+free length, compliance, demanded tension and rest-length upper bound, which is
+what distinguishes an over-tensioned route from an under-authored one.
 
 `SolverVBD` latches only rejections taken on the accepted end-of-step pose. Its
 iteration 0 solves the raw inertial-predictor pose, which the solver itself
 discards one iteration later; a rejection there keeps that iteration's rest
 lengths and is re-tried, so a transient trial geometry cannot freeze a tendon's
 material state for the rest of the simulation. A genuine infeasibility is still
-reported within the same step. XPBD, initialization and the cooperative CUDA
-kernel latch every rejection.
+reported within the same step. The cooperative CUDA kernel follows the same
+rule; XPBD and initialization latch every rejection, as both solve only accepted
+poses.
 
 `SolverVBD` also solves the material only on iterations whose route geometry has
 stopped moving. The direct solve is exact for the geometry it is handed, so it

@@ -13,7 +13,12 @@ from ..sim.tendon import TendonLinkType
 from .tendon_kernels import tendon_segment_length_rate, tendon_segment_length_rate_from_poses, wrapped_arc_length
 from .tendon_material_cooperative import solve_tendon_material_nonlinear_component as project_cooperative
 from .tendon_material_cooperative import warp_broadcast
-from .tendon_material_state import TendonMaterialState, fail_tendon_material, tendon_material_direct_settled
+from .tendon_material_state import (
+    TendonMaterialState,
+    record_tendon_material_failure_span,
+    reject_tendon_material,
+    tendon_material_direct_settled,
+)
 
 
 @wp.func
@@ -188,13 +193,13 @@ def pack_material(
     apply_rolling_transfer: int,
     apply_pinhole_slip: int,
     min_rest: float,
+    latch: int,
 ) -> bool:
     for s in range(num_segs):
         seg = seg_offset + s
         raw_compliance = state.raw_compliance[seg]
         if not wp.isfinite(raw_compliance) or raw_compliance < 1e-25:
-            fail_tendon_material(state, -1, tendon, seg_offset)
-            return False
+            return reject_tendon_material(state, -1, tendon, seg_offset, latch)
         state.next_link[seg] = -1
         state.incoming[seg] = -1
     for i in range(1, num_links - 1):
@@ -209,20 +214,17 @@ def pack_material(
         if left < 0 or right < 0:
             continue
         if left < seg_offset or right >= seg_offset + num_segs or left >= right:
-            fail_tendon_material(state, -102, tendon, seg_offset)
-            return False
+            return reject_tendon_material(state, -102, tendon, seg_offset, latch)
         if (
             seg_active[left] == 0
             or seg_active[right] == 0
             or state.next_link[left] >= 0
             or (state.incoming[right] >= 0)
         ):
-            fail_tendon_material(state, -102, tendon, seg_offset)
-            return False
+            return reject_tendon_material(state, -102, tendon, seg_offset, latch)
         for skipped in range(left + 1, right):
             if seg_active[skipped] != 0:
-                fail_tendon_material(state, -102, tendon, seg_offset)
-                return False
+                return reject_tendon_material(state, -102, tendon, seg_offset, latch)
         state.next_link[left] = link
         state.incoming[right] = link
         if rolling:
@@ -250,8 +252,7 @@ def pack_material(
             row = seg
             count = 0
         if count >= 32:
-            fail_tendon_material(state, -103, tendon, row)
-            return False
+            return reject_tendon_material(state, -103, tendon, row, latch)
         index = row + count
         if state.ids[index] != seg:
             state.valid[row] = 0
@@ -348,6 +349,7 @@ def transfer_cooperative(
     apply_pinhole_slip: int,
     min_rest: float,
     lane: int,
+    latch: int,
 ) -> bool:
     ready = int(0)
     if lane == 0:
@@ -374,6 +376,7 @@ def transfer_cooperative(
                 apply_rolling_transfer,
                 apply_pinhole_slip,
                 min_rest,
+                latch,
             )
         )
     ready = warp_broadcast(ready)
@@ -412,7 +415,8 @@ def transfer_cooperative(
         failed = int(0)
         if lane == 0:
             if state.status[row] < 0:
-                fail_tendon_material(state, state.status[row] - 200, tendon, row)
+                reject_tendon_material(state, state.status[row] - 200, tendon, row, latch)
+                record_tendon_material_failure_span(state, tendon, row, count, seg_length, seg_compliance, latch)
                 failed = 1
         failed = warp_broadcast(failed)
         if failed != 0:
@@ -496,9 +500,9 @@ def solve_tendon_material_cooperative(
     direct: TendonMaterialState,
     latch_failure: int,
 ):
-    # Launch-compatible with the scalar kernel. The cooperative CUDA path still latches every
-    # rejection, including ones taken on a discarded trial pose; narrowing it mirrors the scalar
-    # path's ``latch_failure`` plumbing and is left for a follow-up.
+    # Launch-compatible with the scalar kernel, including its ``latch_failure`` semantics: a
+    # rejection taken on a discarded trial pose keeps that iteration's rest lengths and is
+    # re-tried, and only the accepted pose latches.
     tendon_id = wp.tid() // 32
     lane = wp.tid() % 32
     ready = int(0)
@@ -584,6 +588,7 @@ def solve_tendon_material_cooperative(
         apply_pinhole_slip,
         min_rest,
         lane,
+        latch_failure,
     ):
         return
     if lane == 0:

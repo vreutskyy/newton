@@ -38,6 +38,11 @@ class TendonMaterialState:
     settle_tol: float
     failure: wp.array[int]
     failure_component: wp.array[int]
+    failure_seg: wp.array[int]
+    failure_length: wp.array[float]
+    failure_compliance: wp.array[float]
+    failure_tension: wp.array[float]
+    failure_upper: wp.array[float]
 
 
 @wp.func
@@ -100,6 +105,48 @@ def reject_tendon_material(state: TendonMaterialState, code: int, tendon: int, c
     if latch != 0:
         fail_tendon_material(state, code, tendon, component)
     return False
+
+
+@wp.func
+def record_tendon_material_failure_span(
+    state: TendonMaterialState,
+    tendon: int,
+    row: int,
+    count: int,
+    seg_length: wp.array[float],
+    seg_compliance: wp.array[float],
+    latch: int,
+):
+    """Record the span carrying the tightest bound of a failing component.
+
+    A component's index alone does not say which of its spans the solve could not satisfy, and
+    that span's own numbers are what a diagnosis needs. Report the span whose demanded extension
+    exceeds its rest-length bound by the most, or the most loaded one when all bounds hold.
+    """
+    if latch == 0:
+        return
+    if state.failure_seg[tendon] >= 0:
+        return
+    worst = int(-1)
+    margin = float(0.0)
+    for slot in range(count):
+        index = row + slot
+        violation = state.initial[index] - state.upper[index]
+        if worst < 0 or violation > margin:
+            worst = index
+            margin = violation
+    if worst < 0:
+        return
+    seg = state.ids[worst]
+    if seg < 0:
+        return
+    state.failure_seg[tendon] = seg
+    state.failure_length[tendon] = seg_length[seg]
+    state.failure_compliance[tendon] = seg_compliance[seg]
+    # Linear-law tension of the extension the component was asked to hold. The sigmoid law
+    # reports its own tension through the same ratio, which is exact only at low strain.
+    state.failure_tension[tendon] = state.initial[worst] / state.compliance[worst]
+    state.failure_upper[tendon] = state.upper[worst]
 
 
 @wp.func
@@ -228,6 +275,9 @@ def transfer_tendon_material_direct(
         if link < 0:
             if count > 0:
                 if not project_tendon_component(state, row, count, tendon, latch_failure):
+                    record_tendon_material_failure_span(
+                        state, tendon, row, count, seg_length, seg_compliance, latch_failure
+                    )
                     return False
             row = seg
             count = 0
@@ -254,6 +304,7 @@ def transfer_tendon_material_direct(
         previous = seg
     if count > 0:
         if not project_tendon_component(state, row, count, tendon, latch_failure):
+            record_tendon_material_failure_span(state, tendon, row, count, seg_length, seg_compliance, latch_failure)
             return False
 
     # Publish only after every component on this tendon has passed its certificate.
