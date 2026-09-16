@@ -151,12 +151,6 @@ class TendonStateMixin:
             setattr(state, name, wp.zeros(model.tendon_segment_count, dtype=int, device=model.device))
         for name in ("ids", "edge_ids"):
             setattr(state, name, wp.full(model.tendon_segment_count, -1, dtype=int, device=model.device))
-        # Free-span lengths at the previous solver iteration [m], shape [tendon_segment_count]:
-        # the settle gate that keeps the direct transfer off unsettled trial poses compares
-        # against these. Only the direct path needs them, so sweeps allocate nothing.
-        self.tendon_seg_length_iter = wp.zeros(model.tendon_segment_count, dtype=float, device=model.device)
-        state.seg_length_iter = self.tendon_seg_length_iter
-        state.settle_tol = self.tendon_material_direct_settle_tol
         state.failure = wp.zeros(model.tendon_count, dtype=int, device=model.device)
         # Failure record: the component, then the span inside it that carries the tightest bound,
         # with the numbers a diagnosis needs (its free length, compliance, demanded tension and
@@ -251,7 +245,6 @@ class TendonStateMixin:
         self._tendon_material_state = TendonMaterialState()
         self._tendon_material_state.enabled = False
         self._tendon_material_kernel = solve_tendon_material
-        self.tendon_seg_length_iter = None
         self._tendon_material_lanes = 1
         self._tendon_material_block_dim = 256
         self._has_dynamic_tendon_links = False
@@ -260,10 +253,6 @@ class TendonStateMixin:
             self.tendon_max_sweeps = 256
         if not hasattr(self, "tendon_settle_tol"):
             self.tendon_settle_tol = 1.0e-3
-        if not hasattr(self, "tendon_material_direct_settle_tol"):
-            # Fraction of a tendon's total active length its longest free span may move between
-            # solver iterations and still be treated as settled by the direct material transfer.
-            self.tendon_material_direct_settle_tol = 1.0e-2
         if not hasattr(self, "tendon_activation_tol"):
             self.tendon_activation_tol = 2.0e-3
         if not hasattr(self, "tendon_route_hysteresis"):
@@ -289,10 +278,6 @@ class TendonStateMixin:
             raise ValueError(f"tendon_max_sweeps must be between 1 and 256, got {self.tendon_max_sweeps}")
         if self.tendon_settle_tol < 0.0:
             raise ValueError(f"tendon_settle_tol must be non-negative, got {self.tendon_settle_tol}")
-        if self.tendon_material_direct_settle_tol < 0.0:
-            raise ValueError(
-                f"tendon_material_direct_settle_tol must be non-negative, got {self.tendon_material_direct_settle_tol}"
-            )
         if not 0.0 <= self.tendon_activation_tol < 1.0:
             raise ValueError(
                 f"tendon_activation_tol must be between 0 (inclusive) and 1 (exclusive), "
@@ -329,7 +314,6 @@ class TendonStateMixin:
             self.tendon_seg_attachment_l = None
             self.tendon_seg_attachment_r = None
             self.tendon_seg_length = None
-            self.tendon_seg_length_iter = None
             self.tendon_seg_attachment_l_local = None
             self.tendon_seg_attachment_r_local = None
             self.tendon_seg_attachment_l_local_step = None

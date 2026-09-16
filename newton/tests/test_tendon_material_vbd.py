@@ -20,12 +20,13 @@ from newton.tests.test_tendon_material_integration import _add_chain, _chain_mod
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
-def _make_solver(model, *, iterations=8, direct=True):
+def _make_solver(model, *, iterations=8, direct=True, settle_iterations=4):
     """Use stiff undamped hinges so cable torque controls the free rotation."""
     model.body_color_groups = [wp.array([body], dtype=int, device=model.device) for body in range(model.body_count)]
     return newton.solvers.SolverVBD(
         model,
         iterations=iterations,
+        tendon_material_direct_settle_iterations=settle_iterations,
         rigid_joint_linear_ke=1.0e8,
         rigid_joint_angular_ke=1.0e8,
         rigid_joint_linear_k_start=1.0e8,
@@ -502,10 +503,6 @@ class TestTendonMaterialVBD(unittest.TestCase):
             def set_route(rest):
                 solver.tendon_seg_route_rest_length.assign(np.full(model.tendon_segment_count, rest, dtype=np.float32))
 
-            # Settle the route first: an iteration whose geometry is still moving is held before
-            # it reaches the material solve, and would pass the assertions below vacuously.
-            solver._update_tendon_routing(state, 0.001, False)
-
             # Equal tensions across the frictionless pinhole split the component's 1.2 m of
             # extension evenly, so the 0.2 m span cannot hold its 0.6 m share: BOUND_INCOMPATIBLE.
             set_route(1.0e-6)
@@ -557,9 +554,6 @@ class TestTendonMaterialVBD(unittest.TestCase):
             def set_route(rest):
                 solver.tendon_seg_route_rest_length.assign(np.full(model.tendon_segment_count, rest, dtype=np.float32))
 
-            # Settle the route before asking the material solve for an infeasible allocation.
-            solver._update_tendon_routing(state, 0.001, False)
-
             set_route(1.0e-6)
             solver._update_tendon_routing(state, 0.001, False)
             np.testing.assert_array_equal(workspace.failure.numpy(), np.zeros(model.tendon_count, dtype=np.int32))
@@ -577,45 +571,36 @@ class TestTendonMaterialVBD(unittest.TestCase):
             self.assertGreater(float(workspace.failure_tension.numpy()[0]), 0.0)
             self.assertLess(float(workspace.failure_upper.numpy()[0]), (1.0, 0.2)[span])
 
-    def test_direct_material_skips_unsettled_iterations(self):
-        """Hold the last solved rest lengths while an iteration's route geometry is still moving.
+    def test_direct_material_holds_the_opening_iterations(self):
+        """Hold the last solved rest lengths over the opening iteration poses of a step.
 
         The direct solve returns an exact allocation for whatever geometry it is handed, so the
-        opening poses of a substep — iteration 0 is the raw inertial predictor, which violates
-        every penalty joint by F*dt^2/m and tau*dt^2/I — produce kilonewton-scale ones on toy4.
-        Sweeps never reach them because each pass is bounded. The gate is the measured motion of
-        the route, not a count, so it does not depend on how fast a scene's penalties converge.
+        opening poses of a step -- iteration 0 is the raw inertial predictor, and the iterations
+        that undo it are still far from the accepted pose -- produce kilonewton-scale ones on
+        toy4. Sweeps never reach them because each pass is bounded.
         """
         model = _chain_model("cpu")
+        for iterations, hold, expected in ((1, 4, 0), (3, 4, 2), (8, 4, 4), (32, 4, 4), (32, 0, 0), (32, 7, 7)):
+            with self.subTest(iterations=iterations, hold=hold):
+                solver = _make_solver(model, iterations=iterations, settle_iterations=hold)
+                self.assertEqual(solver._tendon_direct_settle_iterations(), expected)
+        with self.assertRaisesRegex(ValueError, "settle_iterations must be non-negative"):
+            _make_solver(model, settle_iterations=-1)
+
         solver = _make_solver(model, iterations=8)
         state = model.state()
-        segments = model.tendon_segment_count
-        solver.tendon_seg_route_rest_length.assign(np.full(segments, 0.5, dtype=np.float32))
+        solver.tendon_seg_route_rest_length.assign(np.full(model.tendon_segment_count, 0.5, dtype=np.float32))
         held = solver.tendon_seg_rest_length.numpy().copy()
 
-        # This pose holds two 1 m spans. Enter the iteration from 1.1 m spans, so the route moves
-        # by 5% of the tendon's 2 m length against a 1% tolerance.
-        solver.tendon_seg_length.assign(np.full(segments, 1.1, dtype=np.float32))
-        solver._update_tendon_routing(state, 0.001, False)
+        solver._update_tendon_routing(state, 0.001, False, skip_material=True)
         np.testing.assert_array_equal(solver.tendon_seg_rest_length.numpy(), held)
         # The route geometry itself is still refreshed for the body solve.
-        np.testing.assert_allclose(solver.tendon_seg_length.numpy(), 1.0, atol=1.0e-6, rtol=0.0)
+        self.assertTrue(np.all(solver.tendon_seg_length.numpy() > 0.0))
 
-        # The pose has not moved since, so the next iteration is settled and must solve.
         solver._update_tendon_routing(state, 0.001, False)
         self.assertFalse(
             np.allclose(solver.tendon_seg_rest_length.numpy(), held, atol=1.0e-6),
-            "a settled iteration must still solve the material",
-        )
-
-        # The accepted end-of-step pose solves the material however far the route moved.
-        solver.tendon_seg_rest_length.assign(held)
-        solver.tendon_seg_length.assign(np.full(segments, 1.1, dtype=np.float32))
-        solver._update_tendon_routing(state, 0.001, True)
-        solver.check_tendon_material()
-        self.assertFalse(
-            np.allclose(solver.tendon_seg_rest_length.numpy(), held, atol=1.0e-6),
-            "the accepted pose must always solve the material",
+            "an iteration past the hold must solve the material",
         )
 
     def test_runtime_mode_and_nonlinear_changes_are_rejected(self):

@@ -7,11 +7,7 @@ import warp as wp
 
 from ..math import quat_velocity
 from ..sim.tendon import TendonLinkFlags, TendonLinkType
-from .tendon_material_state import (
-    TendonMaterialState,
-    tendon_material_direct_settled,
-    transfer_tendon_material_direct,
-)
+from .tendon_material_state import TendonMaterialState, transfer_tendon_material_direct
 
 
 @wp.func
@@ -1120,14 +1116,6 @@ def _make_solve_tendon_material(direct_enabled: bool):
         # Each preceding tendon contributes one fewer segment than links, so the
         # segment prefix is the link prefix minus the number of preceding tendons.
         seg_offset = link_start - tendon_id
-
-        if wp.static(direct_enabled):
-            # Trial poses only. Keep the rest lengths of the last solved pose while the route
-            # geometry is still moving, and leave the allocation to the iterations that see a
-            # pose the solver keeps. The accepted pose (``latch_failure``) always solves.
-            if latch_failure == 0:
-                if not tendon_material_direct_settled(direct, seg_offset, num_segs, seg_active, seg_length):
-                    return
 
         min_rest = 1.0e-6
 

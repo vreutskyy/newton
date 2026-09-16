@@ -62,18 +62,26 @@ reported within the same step. The cooperative CUDA kernel follows the same
 rule; XPBD and initialization latch every rejection, as both solve only accepted
 poses.
 
-`SolverVBD` also solves the material only on iterations whose route geometry has
-stopped moving. The direct solve is exact for the geometry it is handed, so it
+`SolverVBD` also holds the material solve over the opening iterations of a step,
+`tendon_material_direct_settle_iterations` of them (default 4, capped at
+`iterations - 1`). The direct solve is exact for the geometry it is handed, so it
 must not act on a pose the solver is about to discard: iteration 0 is the raw
 inertial predictor, in which every penalty-restrained joint is violated by
 `F*dt^2/m` and `tau*dt^2/I`. A light body carrying routing links moves the route
-by tens of millimetres there, and the iterations restore it. Each iteration
-compares its longest free-span length change with
-`tendon_material_direct_settle_tol` (default 1e-2) times the tendon's total
-active length and keeps the last solved allocation when the route moved more
-than that; the accepted end-of-step pose always solves, so `0` restricts the
-material solve to that pose. The route geometry and cone rows still refresh
-every iteration, and material sweeps ignore the tolerance entirely.
+by tens of millimetres there. Those iterations keep the last solved pose's rest
+lengths; the route geometry and cone rows still refresh every iteration, the
+accepted end-of-step pose always solves, and material sweeps ignore the setting.
+A scene whose penalty joints settle over more iterations needs a larger value.
+
+Gating the transfer on *measured* route motion instead of a count was tried and
+is worse on the rig this was measured on. The motion signal does separate the
+predictor pose (4.4% of the tendon's length at 20 substeps) from a converged
+iteration (0.001%), but it does not separate iteration 2 from iteration 4: any
+tolerance either admits iteration 2 (1e-3 and up) or waits so long that steps
+with a noisy route never settle at all (3e-4 and below) and are left to the
+accepted pose alone, which is the worst of the three. Both ends were measured on
+the 20x32 direct+ALM cells and grade worse than the count, so the count stays
+until a signal that separates those iterations is found.
 
 ## Formulation and implementation
 

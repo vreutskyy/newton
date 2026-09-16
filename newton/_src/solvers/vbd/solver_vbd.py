@@ -265,7 +265,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
         tendon_alm_penalty_scale: float = 5.0,
         tendon_alm_min_stiffness_ratio: float = 50.0,
         tendon_material_direct: bool = False,
-        tendon_material_direct_settle_tol: float = 1.0e-2,
+        tendon_material_direct_settle_iterations: int = 4,
     ):
         """
         Args:
@@ -412,16 +412,20 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 Call :meth:`check_tendon_material` outside
                 CUDA graph capture to detect unsupported or infeasible runtime states. There is no fallback
                 to material sweeps; discard a failed step and reconstruct the solver after correcting its inputs.
-            tendon_material_direct_settle_tol: Fraction of a tendon's total active free length that its
-                longest free span may move between iterations for the direct material solve to act on that
-                iteration's pose. The direct solve is exact for the geometry it is handed, so it must not act
-                on the opening poses of a step: iteration 0 is the raw inertial predictor, which violates every
-                penalty joint by ``F*dt^2/m`` and ``tau*dt^2/I`` and is discarded one iteration later. On the
-                planar two-cable rig that motivated the default, that transient moves a span by 23% of the
-                tendon's length while a converged iteration moves it by 0.03%; ``1e-2`` sits between them with
-                more than an order of magnitude of margin on each side. The accepted end-of-step pose always
-                solves the material, so ``0`` restricts the material solve to that pose. Ignored by material
-                sweeps.
+            tendon_material_direct_settle_iterations: Opening iterations of a step whose pose the direct
+                material solve does not act on. The direct solve is exact for the geometry it is handed, so
+                it must not act on the opening poses: iteration 0 is the raw inertial predictor, which
+                violates every penalty joint by ``F*dt^2/m`` and ``tau*dt^2/I``, and the iterations that
+                undo it are still far from the pose the step accepts. Those iterations keep the rest lengths
+                of the last solved pose; the route geometry still refreshes every iteration and the accepted
+                end-of-step pose always solves the material. Measured on the planar two-cable rig that
+                motivated the default (20 substeps x 32 iterations): the driven span's peak tension falls
+                158 / 39.4 / 22.4 / 20.0 / 11.4 N and the worst inner-segment peak 139.7 / 112.2 / 123.5 /
+                11.4 N as this count goes 0 to 4, and solving only the accepted pose is worse again
+                (2.4 kN). The count is capped at ``iterations - 1`` so a short iteration budget keeps one
+                in-loop update. A scene whose penalty joints settle in more iterations needs a larger value;
+                gating on measured route motion instead was tried and is worse (see
+                ``docs/direct_tendon_material.md``). Ignored by material sweeps.
 
         Note:
             - The `integrate_with_external_rigid_solver` argument enables one-way coupling between rigid body and soft body
@@ -476,7 +480,12 @@ class SolverVBD(TendonStateMixin, SolverBase):
         self.tendon_alm_penalty_scale = float(tendon_alm_penalty_scale)
         self.tendon_alm_min_stiffness_ratio = float(tendon_alm_min_stiffness_ratio)
         self.tendon_material_direct = tendon_material_direct
-        self.tendon_material_direct_settle_tol = tendon_material_direct_settle_tol
+        if tendon_material_direct_settle_iterations < 0:
+            raise ValueError(
+                "tendon_material_direct_settle_iterations must be non-negative, "
+                f"got {tendon_material_direct_settle_iterations}"
+            )
+        self.tendon_material_direct_settle_iterations = int(tendon_material_direct_settle_iterations)
         # Rigid integration mode: when True, rigid bodies are integrated by an external
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
         # participate in particle-rigid interaction on the particle side.
@@ -1772,6 +1781,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 contacts,
                 dt,
                 report_unsupported_wrap=False,
+                iteration=iter_num,
             )
             self._solve_particle_iteration(state_in, state_out, contacts, dt, iter_num)
 
@@ -2505,17 +2515,25 @@ class SolverVBD(TendonStateMixin, SolverBase):
 
         wp.copy(state_out.particle_q, state_in.particle_q)
 
-    def _update_tendon_routing(self, state_in: State, dt: float, report_unsupported_wrap: bool) -> None:
-        """Update VBD routed-tendon geometry and rolling rest transfer for this iteration."""
+    def _tendon_direct_settle_iterations(self) -> int:
+        """Opening iterations whose pose the direct material solve does not act on.
+
+        Always leave the last iteration to the material solve, so a short iteration budget keeps
+        its in-loop update.
+        """
+        return min(self.tendon_material_direct_settle_iterations, max(self.iterations - 1, 0))
+
+    def _update_tendon_routing(
+        self, state_in: State, dt: float, report_unsupported_wrap: bool, skip_material: bool = False
+    ) -> None:
+        """Update VBD routed-tendon geometry and rolling rest transfer for this iteration.
+
+        ``skip_material`` refreshes the route geometry but leaves the rest lengths from the
+        previous solved pose in place.
+        """
         model = self.model
         if model.tendon_segment_count == 0 or state_in.body_q is None:
             return
-
-        if self.tendon_seg_length_iter is not None:
-            # Direct mode only. Keep the lengths this call is about to overwrite, so the material
-            # transfer can tell a settled pose from the unsettled opening ones (see
-            # tendon_material_direct_settled).
-            wp.copy(self.tendon_seg_length_iter, self.tendon_seg_length)
 
         wp.launch(
             kernel=update_tendon_attachments,
@@ -2551,6 +2569,17 @@ class SolverVBD(TendonStateMixin, SolverBase):
         )
 
         self._update_tendon_cone_rows(model, state_in.body_q, report_unsupported_wrap)
+
+        if skip_material:
+            # Direct mode only. The opening iterations run on poses the solver has not settled
+            # yet: iteration 0 is the raw inertial predictor, which on toy4 swings each copy's
+            # penalty-pinned base by 39-51 deg and its routing links by tens of millimetres. The
+            # direct solve computes an exact allocation for whatever geometry it is given, so
+            # those poses yield kilonewton-scale ones; material sweeps are bounded per pass and
+            # never reach them. Keep the last solved pose's rest lengths for this iteration. The
+            # route geometry above is still refreshed, and the accepted pose at the end of the
+            # step always solves the material.
+            return
 
         wp.launch(
             kernel=self._tendon_material_kernel,
@@ -2729,6 +2758,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
         contacts: Contacts | None,
         dt: float,
         report_unsupported_wrap: bool,
+        iteration: int = 0,
     ):
         """Solve one AVBD iteration for rigid bodies (per-iteration phase).
 
@@ -2773,7 +2803,12 @@ class SolverVBD(TendonStateMixin, SolverBase):
         self.body_hessian_al.zero_()
         self.body_hessian_ll.zero_()
 
-        self._update_tendon_routing(state_in, dt, report_unsupported_wrap)
+        self._update_tendon_routing(
+            state_in,
+            dt,
+            report_unsupported_wrap,
+            skip_material=self.tendon_material_direct and iteration < self._tendon_direct_settle_iterations(),
+        )
 
         body_color_groups = model.body_color_groups
 
