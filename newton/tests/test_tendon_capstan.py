@@ -1961,7 +1961,9 @@ def test_bypassed_span_holds_attachments_when_neighbors_interpenetrate(test, dev
         # Without the hold the fixed point lands on a circle intersection, which collapses the
         # free span onto a point and drags the merged rest length down with it.
         test.assertGreater(min(lengths), 1.0e-3)
-        test.assertLess(max(route_rest) - min(route_rest), 1.0e-9)
+        # The rest length is a float32 of magnitude 1.6e-2 m, whose ULP is 1.9e-9: the CUDA
+        # tangent solve lands on either of two adjacent floats. Hold the spread relatively.
+        test.assertLess(max(route_rest) - min(route_rest), 1.0e-6 * max(route_rest))
 
 
 def test_dynamic_route_holds_state_on_short_bypass_span(test, device):

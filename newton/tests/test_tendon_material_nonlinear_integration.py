@@ -299,7 +299,15 @@ for _test in (
     test_nonlinear_route_repacking,
     test_nonlinear_graph_failure,
 ):
-    add_function_test(TestTendonMaterialNonlinearIntegration, _test.__name__, _test, devices=get_test_devices())
+    add_function_test(
+        TestTendonMaterialNonlinearIntegration,
+        _test.__name__,
+        _test,
+        devices=get_test_devices(),
+        # The graph-failure test drives a latched failure on purpose and the solver reports it on
+        # stdout; the integration module registers the same function with check_output=False too.
+        check_output=_test is not test_nonlinear_graph_failure,
+    )
 
 if __name__ == "__main__":
     unittest.main()
