@@ -1921,6 +1921,53 @@ def test_vbd_tendon_alm_guarded_tendon_matches_flag_off(test, device):
             )
 
 
+def test_vbd_tendon_alm_multiplier_shared_across_frictional_roller(test, device):
+    """The ALM multiplier stays one number per tendon across a live frictional roller.
+
+    The material transfer bands the material row across the roller (the Euler-Eytelwein ratio), and the row applies
+    the compliance-weighted mean of that row on both sides: the band lives in the rest lengths, not in the span
+    forces. Carrying the band on the row was measured on the planar two-cable rig with the direct material solve and
+    rejected both ways (one multiplier per run of spans between frictional rollers converges to a band-edge allocation
+    left by a transient, 10 N -> 140-283 N; per-span copies scaled by the material profile chatter, hold ripple
+    65 deg), so this pins the shared level: equal on both sides, equal to the compliance-weighted mean of the banded
+    material row, while the material row itself keeps the capstan differential.
+    """
+    with wp.ScopedDevice(device):
+        model, _left_idx, _right_idx, _pulley_idx = build_kinematic_pulley_atwood(mu=10.0)
+        _set_serial_body_coloring(model)
+        solver = newton.solvers.SolverVBD(
+            model, **TENDON_VBD_SOLVER_KWARGS, tendon_alm=True, tendon_alm_min_stiffness_ratio=0.0
+        )
+        state_0, state_1 = model.state(), model.state()
+        control, contacts = model.control(), model.contacts()
+        dt = 1.0 / 60.0 / 12.0
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+        for _ in range(40):
+            for _ in range(12):
+                state_0.clear_forces()
+                model.collide(state_0, contacts)
+                solver.step(state_0, state_1, control, contacts, dt)
+                state_0, state_1 = state_1, state_0
+
+        lam = solver.tendon_seg_alm_lambda.numpy()
+        length = np.linalg.norm(solver.tendon_seg_attachment_r.numpy() - solver.tendon_seg_attachment_l.numpy(), axis=1)
+        compliance = solver.tendon_seg_active_compliance.numpy()
+        stretch = length - solver.tendon_seg_rest_length.numpy()
+        material = np.maximum(stretch, 0.0) / compliance
+        cap_ratio = float(solver.tendon_link_cap_ratio.numpy()[1])
+
+        test.assertGreater(cap_ratio, 1.0, "the pulley must be a live frictional link")
+        test.assertGreater(
+            float(material.max()) / float(material.min()), 1.2, f"material row must be banded: {material}"
+        )
+        test.assertLessEqual(float(material.max()) / float(material.min()), cap_ratio * 1.01, f"band: {material}")
+        test.assertEqual(float(lam[0]), float(lam[1]), f"one multiplier per tendon across the roller: {lam}")
+        mean = float(np.sum(compliance * material) / np.sum(compliance))
+        test.assertAlmostEqual(
+            float(lam[0]), mean, delta=0.05 * mean, msg=f"level {lam[0]:.3f} N vs compliance-weighted mean {mean:.3f} N"
+        )
+
+
 def test_vbd_tendon_alm_disabled_leaves_state_untouched(test, device):
     """With the default flag the ALM arrays stay zero and no multiplier is reported."""
     with wp.ScopedDevice(device):
@@ -1960,6 +2007,12 @@ add_test(
     "vbd_tendon_alm_guarded_tendon_matches_flag_off",
     devices,
     test_vbd_tendon_alm_guarded_tendon_matches_flag_off,
+)
+add_test(
+    TestTendonVBD,
+    "vbd_tendon_alm_multiplier_shared_across_frictional_roller",
+    devices,
+    test_vbd_tendon_alm_multiplier_shared_across_frictional_roller,
 )
 add_test(
     TestTendonVBD,

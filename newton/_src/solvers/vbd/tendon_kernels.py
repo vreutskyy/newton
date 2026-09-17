@@ -257,7 +257,18 @@ def _rolling_spin_axis_component(
 # step-start pose; a tendon whose K_sec is below min_stiffness_ratio*support keeps the legacy penalty row (rho = 0).
 # The ascent divides the force residual by K_s (a stretch) while the force row divides by row_k = K_s + D/dt: the
 # stationary point is unaffected; with heavy damping the ascent gain is slightly under-scaled (deliberate, simpler).
-# Limitations: the shared multiplier is exact for frictionless routes (mu = 0); a route change (dynamic routing)
+# Limitations: the shared multiplier is exact for frictionless routes (mu = 0). Across a link with friction the
+# material solve bands the tension by the Euler-Eytelwein ratio, and the row still applies the compliance-weighted
+# mean on both sides: the capstan differential lives in the rest lengths (the material row), not in the force the
+# bodies feel, so span tensions are force-transparent to roller friction under this row (only the rim-moment limiter
+# carries it). This is deliberate. The two ways of carrying the band on the row were measured on the planar two-cable
+# rig with the direct material solve (20 substeps x 32 iterations, static base) and both fail: one multiplier per run
+# of spans between frictional rollers converges to the band-edge allocation the transfer happens to have published
+# during a transient (10 N command, 140-283 N on the tip side); per-span copies scaled by the material row's tension
+# profile chatter because the direct allocation is a discontinuous function of the pose (band edge selected by the
+# transfer direction, minimum-transfer flat branches) and the bodies then feel every flip (hold ripple 65 deg,
+# 52-70 N on the slider span, against 0.01 deg / 0.01 N with the shared row). The shared row is stable because the
+# bodies only see the tendon's total stretch, which the material transfer conserves. A route change (dynamic routing)
 # resets the tendon's multiplier, so a roller that activates every step keeps the row soft until the ascent rebuilds it.
 
 _TENDON_ALM_STRETCH_EPS = wp.constant(1.0e-9)

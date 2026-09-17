@@ -83,6 +83,20 @@ accepted pose alone, which is the worst of the three. Both ends were measured on
 the 20x32 direct+ALM cells and grade worse than the count, so the count stays
 until a signal that separates those iterations is found.
 
+With `SolverVBD(tendon_alm=True)` the bodies are driven by the compliant-ALM
+stretch row, whose tension multiplier is shared along each tendon. The direct
+solve bands the *material* row across every frictional link, and the ALM row
+applies the compliance-weighted mean of that row on both sides of the link: the
+capstan differential is carried by the rest lengths, not by the span forces the
+bodies feel (the rim-moment limiter still carries it). Splitting the multiplier
+at frictional rollers or scaling the per-span copies by the material row's
+tension profile were both measured on the planar two-cable rig and rejected:
+the direct allocation is a discontinuous function of the pose, and a row that
+feeds it back into the body forces every iteration chatters or converges to a
+band-edge allocation left by a transient, while the shared row is stable
+because the bodies only see the total stretch the transfer conserves. At rest
+the two rows agree (on that rig, every span within 1 N of the 10 N command).
+
 ## Formulation and implementation
 
 Each connected material component is solved at fixed body poses, span lengths,
