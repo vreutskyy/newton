@@ -27,7 +27,7 @@ from newton.examples.cable.example_tendon_capstan_friction import Example as Dyn
 from newton.examples.cable.example_tendon_mujoco_switch import Example as MujocoSwitchExample
 from newton.examples.cable.example_tendon_mujoco_switch_matrix import Example as MujocoSwitchMatrixExample
 from newton.examples.cable.example_tendon_mujoco_wrap import Example as MujocoWrapExample
-from newton.tests.unittest_utils import sanitize_identifier
+from newton.tests.unittest_utils import StdOutCapture, sanitize_identifier
 
 SIGMOID_TENDON_MATERIAL = {
     "tendon_sigmoid_ea_low": 2000.0,
@@ -925,7 +925,7 @@ def build_force_driven_dynamic_route(device):
     return builder.finalize(device=device), candidate, candidate_link
 
 
-def build_oriented_dynamic_route(orientation, device):
+def build_oriented_dynamic_route(orientation, device, dynamic=True):
     """Build a straight tendon with a kinematic rolling candidate."""
     builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
 
@@ -956,7 +956,7 @@ def build_oriented_dynamic_route(orientation, device):
         link_type=int(TendonLinkType.ROLLING),
         radius=0.1,
         orientation=orientation,
-        dynamic=True,
+        dynamic=dynamic,
         axis=(0.0, 1.0, 0.0),
         rest_length=-1.0,
     )
@@ -1785,11 +1785,11 @@ def test_force_driven_dynamic_route_updates_inside_solver(test, device):
                 att_r_local = solver.tendon_seg_attachment_r_local.numpy()
                 radius_l = att_r_local[0] - candidate_center
                 radius_r = att_l_local[1] - candidate_center
-                theta = abs(
-                    np.atan2(
-                        np.dot(np.cross(radius_l, radius_r), candidate_axis),
-                        np.dot(radius_l, radius_r),
-                    )
+                # The oriented angle, not its magnitude: a candidate that has grazed past zero
+                # wrap carries a negative arc, which is what the route merge conserves.
+                theta = float(model.tendon_link_orientation.numpy()[candidate_link]) * np.atan2(
+                    np.dot(np.cross(radius_l, radius_r), candidate_axis),
+                    np.dot(radius_l, radius_r),
                 )
                 material_length += theta * float(model.tendon_link_radius.numpy()[candidate_link])
             if candidate_active != previous_active:
@@ -2249,6 +2249,150 @@ def test_dynamic_route_hysteresis_band_absorbs_pose_jitter(test, device):
                         seed_active,
                         f"orientation={orientation}, seed_active={seed_active}, sample={sample}",
                     )
+
+
+def _oriented_wrap_angle_at_link(solver, model, state, link_idx):
+    """Oriented wrap angle of a rolling link that carries one span on each side."""
+    body_q = state.body_q.numpy()
+    center = body_q[model.tendon_link_body.numpy()[link_idx]][:3] + model.tendon_link_offset.numpy()[link_idx]
+    normal = model.tendon_link_axis.numpy()[link_idx]
+    radial_in = solver.tendon_seg_attachment_r.numpy()[link_idx - 1] - center
+    radial_out = solver.tendon_seg_attachment_l.numpy()[link_idx] - center
+    radial_in -= np.dot(radial_in, normal) * normal
+    radial_out -= np.dot(radial_out, normal) * normal
+    orientation = float(model.tendon_link_orientation.numpy()[link_idx])
+    return orientation * float(np.atan2(np.dot(np.cross(radial_in, radial_out), normal), np.dot(radial_in, radial_out)))
+
+
+def _oriented_route_material_length(solver, model, state, link_idx):
+    """Active free-span rest length plus the link's oriented wrap arc.
+
+    The rolling transfer credits the neighboring spans with the signed swept arc, so this sum
+    is the quantity the route conserves - including when the wrap turns negative.
+    """
+    active = solver.tendon_seg_active.numpy().astype(bool)
+    material = float(np.sum(solver.tendon_seg_rest_length.numpy()[active]))
+    if solver.tendon_link_active.numpy()[link_idx]:
+        angle = _oriented_wrap_angle_at_link(solver, model, state, link_idx)
+        material += angle * float(model.tendon_link_radius.numpy()[link_idx])
+    return material
+
+
+def _settle_graze_candidate(device, dt):
+    """Settle a dynamic candidate 2 mm inside its bypass chord, wrapped by a positive angle."""
+    model, candidate, candidate_link = build_force_driven_dynamic_route(device)
+    solver = newton.solvers.SolverXPBD(model, iterations=1, joint_linear_relaxation=1.0)
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+
+    radius = float(model.tendon_link_radius.numpy()[candidate_link])
+    body_q = state_0.body_q.numpy()
+    body_q[candidate, 0] = radius - 0.002
+    state_0.body_q.assign(body_q)
+    for _ in range(4):
+        solver.step(state_0, state_1, model.control(), None, dt)
+        state_0, state_1 = state_1, state_0
+    return model, solver, state_0, state_1, candidate, candidate_link, radius
+
+
+def _step_candidate_to(solver, model, state_0, state_1, candidate, target_x, dt):
+    """Run one substep that ends with the candidate at ``target_x``.
+
+    Routing decides on the accepted step-start pose, so a substep can end past the surface
+    while the candidate is still active - the one-substep graze at the activation boundary.
+    """
+    body_qd = state_0.body_qd.numpy()
+    body_qd[candidate, 0] = (target_x - float(state_0.body_q.numpy()[candidate, 0])) / dt
+    state_0.body_qd.assign(body_qd)
+    solver.step(state_0, state_1, model.control(), None, dt)
+    return state_1, state_0
+
+
+def test_dynamic_route_deactivation_conserves_negative_wrap_material(test, device):
+    """A candidate grazing past zero wrap must not inject rest length when its route merges."""
+    with wp.ScopedDevice(device):
+        dt = 1.0 / 1200.0
+        model, solver, state_0, state_1, candidate, candidate_link, radius = _settle_graze_candidate(device, dt)
+        test.assertTrue(solver.tendon_link_active.numpy()[candidate_link])
+        material_before = _oriented_route_material_length(solver, model, state_0, candidate_link)
+
+        # Graze substep: it ends 0.1 mm past the surface, which the activation test only sees
+        # at the start of the next substep, so the accepted pose carries a negative wrap.
+        graze_x = radius + 1.0e-4
+        state_0, state_1 = _step_candidate_to(solver, model, state_0, state_1, candidate, graze_x, dt)
+        angle = _oriented_wrap_angle_at_link(solver, model, state_0, candidate_link)
+        test.assertTrue(solver.tendon_link_active.numpy()[candidate_link])
+        test.assertLess(angle, 0.0, "the graze substep must end with a negative oriented wrap")
+        test.assertGreater(
+            2.0 * abs(angle) * radius,
+            1.0e-5,
+            "the graze must be wide enough that the 2 r |theta| injection is measurable",
+        )
+
+        # Merge substep: the candidate deactivates and its two spans merge.
+        state_0, state_1 = _step_candidate_to(solver, model, state_0, state_1, candidate, graze_x, dt)
+        test.assertFalse(solver.tendon_link_active.numpy()[candidate_link])
+        material_after = _oriented_route_material_length(solver, model, state_0, candidate_link)
+        test.assertAlmostEqual(material_after, material_before, delta=1.0e-6)
+
+
+def test_dynamic_route_deactivation_keeps_positive_wrap_arc(test, device):
+    """A deactivation from a positive wrap must still merge the full arc into the bypass span."""
+    with wp.ScopedDevice(device):
+        dt = 1.0 / 1200.0
+        model, solver, state_0, state_1, candidate, candidate_link, _radius = _settle_graze_candidate(device, dt)
+        angle = _oriented_wrap_angle_at_link(solver, model, state_0, candidate_link)
+        test.assertGreater(angle, 0.0)
+        arc = angle * float(model.tendon_link_radius.numpy()[candidate_link])
+        rest_step = solver.tendon_seg_rest_length.numpy().copy()
+
+        # Move the candidate clear of the chord before the substep starts, so the same substep
+        # both deactivates it and merges the positive wrap it still carries.
+        body_q = state_0.body_q.numpy()
+        body_q[candidate, 0] = 0.25
+        state_0.body_q.assign(body_q)
+        solver.step(state_0, state_1, model.control(), None, dt)
+
+        test.assertFalse(solver.tendon_link_active.numpy()[candidate_link])
+        merged = float(solver.tendon_seg_route_rest_length.numpy()[candidate_link - 1])
+        test.assertAlmostEqual(merged, float(rest_step[0] + rest_step[1]) + arc, delta=2.0e-7)
+
+
+def test_negative_wrap_report_separates_graze_from_static_roller(test, device):
+    """The report must drop the dynamic-routing advice for a link that is already dynamic."""
+    with wp.ScopedDevice(device):
+        dt = 1.0 / 1200.0
+        model, solver, state_0, state_1, candidate, _candidate_link, radius = _settle_graze_candidate(device, dt)
+        capture = StdOutCapture()
+        capture.begin()
+        try:
+            _step_candidate_to(solver, model, state_0, state_1, candidate, radius + 1.0e-4, dt)
+            wp.synchronize()
+        finally:
+            graze_output = capture.end()
+
+        test.assertIn("WARNING", graze_output)
+        test.assertIn("grazed a negative oriented wrap", graze_output)
+        test.assertIn("dynamic activation boundary", graze_output)
+        test.assertNotIn("use dynamic routing", graze_output)
+
+        static_model, static_body, _static_link = build_oriented_dynamic_route(1, device, dynamic=False)
+        static_solver = newton.solvers.SolverXPBD(static_model, iterations=1)
+        static_0, static_1 = static_model.state(), static_model.state()
+        body_q = static_0.body_q.numpy()
+        body_q[static_body, 0] = 0.25
+        static_0.body_q.assign(body_q)
+        capture = StdOutCapture()
+        capture.begin()
+        try:
+            static_solver.step(static_0, static_1, static_model.control(), None, dt)
+            wp.synchronize()
+        finally:
+            static_output = capture.end()
+
+        test.assertIn("ERROR", static_output)
+        test.assertIn("crossed the supported wrap range", static_output)
+        test.assertIn("use dynamic routing", static_output)
 
 
 def test_dynamic_route_deactivates_when_wrap_angle_crosses_zero(test, device):
@@ -4501,6 +4645,24 @@ add_test(
     "dynamic_route_deactivates_when_wrap_angle_crosses_zero",
     devices,
     test_dynamic_route_deactivates_when_wrap_angle_crosses_zero,
+)
+add_test(
+    TestTendonCapstan,
+    "dynamic_route_deactivation_conserves_negative_wrap_material",
+    devices,
+    test_dynamic_route_deactivation_conserves_negative_wrap_material,
+)
+add_test(
+    TestTendonCapstan,
+    "dynamic_route_deactivation_keeps_positive_wrap_arc",
+    devices,
+    test_dynamic_route_deactivation_keeps_positive_wrap_arc,
+)
+add_test(
+    TestTendonCapstan,
+    "negative_wrap_report_separates_graze_from_static_roller",
+    devices,
+    test_negative_wrap_report_separates_graze_from_static_roller,
 )
 add_test(
     TestTendonCapstan,

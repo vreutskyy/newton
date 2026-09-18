@@ -249,6 +249,40 @@ def wrapped_arc_length(
 
 
 @wp.func
+def oriented_wrap_arc_length(
+    pt_left: wp.vec3,
+    pt_right: wp.vec3,
+    center: wp.vec3,
+    radius: float,
+    plane_normal: wp.vec3,
+    orientation: int,
+) -> float:
+    """Arc length between two points on a rolling link, signed by the link orientation.
+
+    ``wrapped_arc_length`` takes the absolute angle, so a route whose chord has crossed to the far
+    side of the link reports ``|theta| * radius`` of cable that is not on the link: the wrap is a
+    retrace there, not material. The rolling transfer keeps crediting the neighboring spans with
+    the signed swept arc across that crossing, so the route conserves ``spans + theta * radius``
+    with ``theta`` signed. Merging a deactivating link with the absolute arc therefore creates
+    ``2 * |theta| * radius`` of rest length. The angle is formed exactly as in
+    ``update_tendon_cone_rows``' diagnostic, so the sign matches the state that diagnostic reports.
+    """
+    r_left = pt_left - center
+    r_right = pt_right - center
+    r_left = r_left - wp.dot(r_left, plane_normal) * plane_normal
+    r_right = r_right - wp.dot(r_right, plane_normal) * plane_normal
+    len_left = wp.length(r_left)
+    len_right = wp.length(r_right)
+    if radius <= 0.0 or len_left <= 1.0e-8 or len_right <= 1.0e-8:
+        return 0.0
+
+    u_left = r_left / len_left
+    u_right = r_right / len_right
+    theta = wp.atan2(wp.dot(wp.cross(u_left, u_right), plane_normal), wp.dot(u_left, u_right))
+    return theta * float(orientation) * radius
+
+
+@wp.func
 def advance_point_on_circle(
     old_pt: wp.vec3,
     center: wp.vec3,
@@ -626,6 +660,7 @@ def prepare_tendon_route(
     tendon_link_type: wp.array[int],
     tendon_link_flags: wp.array[int],
     tendon_link_radius: wp.array[float],
+    tendon_link_orientation: wp.array[int],
     tendon_link_offset: wp.array[wp.vec3],
     tendon_link_axis: wp.array[wp.vec3],
     seg_rest_length_step: wp.array[float],
@@ -706,7 +741,14 @@ def prepare_tendon_route(
             merged_rest = (
                 seg_rest_length_step[seg_left]
                 + seg_rest_length_step[seg_right]
-                + wrapped_arc_length(pt_left, pt_right, center, tendon_link_radius[link_idx], normal)
+                + oriented_wrap_arc_length(
+                    pt_left,
+                    pt_right,
+                    center,
+                    tendon_link_radius[link_idx],
+                    normal,
+                    tendon_link_orientation[link_idx],
+                )
             )
         elif merged_rest <= 0.0:
             # Initialization seeds the inactive merged segment from the authored bypass route.
@@ -878,6 +920,7 @@ def update_tendon_cone_rows(
     tendon_link_tendon: wp.array[int],
     tendon_link_body: wp.array[int],
     tendon_link_type: wp.array[int],
+    tendon_link_flags: wp.array[int],
     tendon_link_radius: wp.array[float],
     tendon_link_orientation: wp.array[int],
     tendon_link_mu: wp.array[float],
@@ -981,14 +1024,28 @@ def update_tendon_cone_rows(
             signed_wrap_angle = wp.atan2(wp.dot(wp.cross(u_left, u_right), normal), wp.dot(u_left, u_right))
             oriented_wrap_angle = signed_wrap_angle * float(tendon_link_orientation[link_idx])
             if oriented_wrap_angle < 0.0:
-                wp.printf(
-                    "ERROR: Tendon %d ROLLING link %d crossed the supported wrap range [0, pi] "
-                    "(oriented angle %f deg). Cable rest length and tension may be invalid. "
-                    "Correct the link orientation or route geometry, or use dynamic routing.\n",
-                    tendon_id,
-                    link_idx,
-                    oriented_wrap_angle * 180.0 / wp.pi,
-                )
+                if (tendon_link_flags[link_idx] & int(TendonLinkFlags.DYNAMIC)) != 0:
+                    # A dynamic candidate decides on the pose accepted one substep earlier, so it
+                    # grazes past zero wrap for the substep before it deactivates. The route merge
+                    # takes the signed arc there, so no rest length is injected.
+                    wp.printf(
+                        "WARNING: Tendon %d ROLLING link %d grazed a negative oriented wrap "
+                        "(%f deg) at the dynamic activation boundary; the link deactivates on the "
+                        "next substep and the route merge keeps the signed wrap arc. Repeated "
+                        "reports for one link mean the negative wrap persists.\n",
+                        tendon_id,
+                        link_idx,
+                        oriented_wrap_angle * 180.0 / wp.pi,
+                    )
+                else:
+                    wp.printf(
+                        "ERROR: Tendon %d ROLLING link %d crossed the supported wrap range [0, pi] "
+                        "(oriented angle %f deg). Cable rest length and tension may be invalid. "
+                        "Correct the link orientation or route geometry, or use dynamic routing.\n",
+                        tendon_id,
+                        link_idx,
+                        oriented_wrap_angle * 180.0 / wp.pi,
+                    )
 
     link_first = seg_active_link_r[seg_left]
     link_last = seg_active_link_l[seg_right]
