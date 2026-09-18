@@ -1079,6 +1079,90 @@ def build_bypassed_overlapping_neighbor_route(device):
     return builder.finalize(device=device), upper, candidate_link
 
 
+# toy4 A.R0/A.R2 scale again, but wrapped in the same sense: the cable runs down the far side
+# of both rollers on their external common tangent, which stays well defined while the circles
+# touch and only disappears once the smaller circle is inside the larger one.
+SAME_WINDING_LEFT_RADIUS = 0.0058
+SAME_WINDING_RIGHT_RADIUS = 0.0040
+SAME_WINDING_APART_SEPARATION = 0.030
+SAME_WINDING_ANCHOR_OFFSET = (0.05, 0.0, 0.0)
+SAME_WINDING_PLANE_NORMAL = np.array([0.0, 1.0, 0.0])
+
+
+def build_same_winding_roller_pair(device):
+    """Build two same-winding rollers on kinematic bodies that can be driven onto each other."""
+    builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+
+    lower = builder.add_body(xform=wp.transform(), mass=0.0, is_kinematic=True)
+    upper = builder.add_body(
+        xform=wp.transform(p=wp.vec3(0.0, 0.0, SAME_WINDING_APART_SEPARATION)),
+        mass=0.0,
+        is_kinematic=True,
+    )
+
+    builder.add_tendon()
+    builder.add_tendon_link(
+        body=lower,
+        link_type=int(TendonLinkType.ATTACHMENT),
+        offset=SAME_WINDING_ANCHOR_OFFSET,
+        axis=(0.0, 1.0, 0.0),
+    )
+    builder.add_tendon_link(
+        body=lower,
+        link_type=int(TendonLinkType.ROLLING),
+        radius=SAME_WINDING_LEFT_RADIUS,
+        orientation=1,
+        mu=0.0,
+        axis=(0.0, 1.0, 0.0),
+        rest_length=-1.0,
+    )
+    builder.add_tendon_link(
+        body=upper,
+        link_type=int(TendonLinkType.ROLLING),
+        radius=SAME_WINDING_RIGHT_RADIUS,
+        orientation=1,
+        mu=0.0,
+        axis=(0.0, 1.0, 0.0),
+        rest_length=-1.0,
+    )
+    builder.add_tendon_link(
+        body=upper,
+        link_type=int(TendonLinkType.ATTACHMENT),
+        offset=SAME_WINDING_ANCHOR_OFFSET,
+        axis=(0.0, 1.0, 0.0),
+        rest_length=-1.0,
+    )
+    builder.color()
+    return builder.finalize(device=device), upper
+
+
+def _same_winding_external_tangent(center_r):
+    """Analytic external tangent of the same-winding pair for a given right-roller center."""
+    return _segment_attachment_points_np(
+        np.zeros(3),
+        np.asarray(center_r, dtype=np.float64),
+        int(TendonLinkType.ROLLING),
+        int(TendonLinkType.ROLLING),
+        SAME_WINDING_LEFT_RADIUS,
+        SAME_WINDING_RIGHT_RADIUS,
+        1,
+        1,
+        SAME_WINDING_PLANE_NORMAL,
+        SAME_WINDING_PLANE_NORMAL,
+    )
+
+
+def _oriented_wrap_angle(entry, exit_, center, orientation):
+    """Wrap angle a rolling link turns the cable through, signed by its orientation."""
+    radial_in = entry - center
+    radial_out = exit_ - center
+    normal = SAME_WINDING_PLANE_NORMAL
+    radial_in = radial_in - np.dot(radial_in, normal) * normal
+    radial_out = radial_out - np.dot(radial_out, normal) * normal
+    cross = float(np.dot(np.cross(radial_in, radial_out), normal))
+    return float(orientation) * float(np.atan2(cross, float(np.dot(radial_in, radial_out))))
+
+
 # toy4 A.R1 scale: two 5.8 mm rollers 12.66 mm apart, wrapped in opposite senses, leave a
 # 5.07 mm internal-tangent bypass span - only 1.31 radii of the 3.867 mm candidate.
 SHORT_SPAN_NEIGHBOR_RADIUS = 0.0058
@@ -1964,6 +2048,98 @@ def test_bypassed_span_holds_attachments_when_neighbors_interpenetrate(test, dev
         # The rest length is a float32 of magnitude 1.6e-2 m, whose ULP is 1.9e-9: the CUDA
         # tangent solve lands on either of two adjacent floats. Hold the spread relatively.
         test.assertLess(max(route_rest) - min(route_rest), 1.0e-6 * max(route_rest))
+
+
+def test_same_winding_touching_rollers_keep_external_tangent(test, device):
+    """Touching wrap circles still have an external tangent when both links wrap the same way."""
+    touching = SAME_WINDING_LEFT_RADIUS + SAME_WINDING_RIGHT_RADIUS
+    radii = (SAME_WINDING_LEFT_RADIUS, SAME_WINDING_RIGHT_RADIUS)
+    span = 1
+    with wp.ScopedDevice(device):
+        for solver_cls in (newton.solvers.SolverXPBD, newton.solvers.SolverVBD):
+            for separation in (touching - 1.0e-4, touching + 1.0e-4):
+                model, upper = build_same_winding_roller_pair(device)
+                solver = solver_cls(model, iterations=1)
+                state_0, state_1 = model.state(), model.state()
+                control, contacts = model.control(), model.contacts()
+
+                # Step one places the pair, step two nudges the right roller sideways: a hold
+                # that fires here keeps step one's tangents on a pose they no longer touch.
+                for lateral in (0.0, 3.0e-4):
+                    center_r = np.array([lateral, 0.0, separation])
+                    # The first variant keeps the circles overlapping throughout, which is
+                    # where the old sum-of-radii hold fired; the second stays just outside.
+                    test.assertEqual(float(np.linalg.norm(center_r)) < touching, separation < touching)
+                    _set_body_translation(state_0, upper, center_r)
+                    state_0.clear_forces()
+                    solver.step(state_0, state_1, control, contacts, 1.0 / 600.0)
+                    state_0, state_1 = state_1, state_0
+
+                    why = f"{solver_cls.__name__}, separation={separation}, lateral={lateral}"
+                    att_l = solver.tendon_seg_attachment_l.numpy()
+                    att_r = solver.tendon_seg_attachment_r.numpy()
+                    test.assertTrue(np.all(np.isfinite(att_l)) and np.all(np.isfinite(att_r)), why)
+
+                    endpoints = (att_l[span], att_r[span])
+                    direction = endpoints[1] - endpoints[0]
+                    direction = direction / np.linalg.norm(direction)
+                    centers = (np.zeros(3), center_r)
+                    for point, center, radius in zip(endpoints, centers, radii, strict=True):
+                        radial = point - center
+                        radial = radial - np.dot(radial, SAME_WINDING_PLANE_NORMAL) * SAME_WINDING_PLANE_NORMAL
+                        test.assertLess(abs(float(np.dot(radial, direction))), 1.0e-6 * radius, why)
+                        test.assertAlmostEqual(float(np.linalg.norm(radial)) / radius, 1.0, delta=1.0e-6, msg=why)
+
+                    # Both rollers have to keep turning the cable the way their orientation says.
+                    test.assertGreater(_oriented_wrap_angle(att_r[0], att_l[1], centers[0], 1), 0.0, why)
+                    test.assertGreater(_oriented_wrap_angle(att_r[1], att_l[2], centers[1], 1), 0.0, why)
+
+                    # The span is the pose's external tangent, not a value carried from before.
+                    expected_l, expected_r = _same_winding_external_tangent(center_r)
+                    np.testing.assert_allclose(endpoints[0], expected_l, rtol=0.0, atol=1.0e-8, err_msg=why)
+                    np.testing.assert_allclose(endpoints[1], expected_r, rtol=0.0, atol=1.0e-8, err_msg=why)
+
+
+def test_same_winding_nested_rollers_hold_attachments(test, device):
+    """One wrap circle inside the other leaves no external tangent, so the hold must fire."""
+    nested = abs(SAME_WINDING_LEFT_RADIUS - SAME_WINDING_RIGHT_RADIUS) - 1.0e-4
+    jitter = 1.5e-4
+    span = 1
+    with wp.ScopedDevice(device):
+        for solver_cls in (newton.solvers.SolverXPBD, newton.solvers.SolverVBD):
+            # Authored apart, so the accepted attachments come from real tangent geometry.
+            model, upper = build_same_winding_roller_pair(device)
+            solver = solver_cls(model, iterations=1)
+            state_0, state_1 = model.state(), model.state()
+            control, contacts = model.control(), model.contacts()
+
+            local = []
+            for step in range(6):
+                lateral = jitter * (1.0 if step % 2 else -1.0)
+                test.assertLess(
+                    float(np.hypot(nested, lateral)),
+                    abs(SAME_WINDING_LEFT_RADIUS - SAME_WINDING_RIGHT_RADIUS),
+                )
+                _set_body_translation(state_0, upper, (lateral, 0.0, nested))
+                state_0.clear_forces()
+                solver.step(state_0, state_1, control, contacts, 1.0 / 600.0)
+                state_0, state_1 = state_1, state_0
+                local.append(
+                    np.concatenate(
+                        (
+                            solver.tendon_seg_attachment_l_local.numpy()[span],
+                            solver.tendon_seg_attachment_r_local.numpy()[span],
+                        )
+                    )
+                )
+
+            history = np.array(local)
+            test.assertTrue(np.all(np.isfinite(history)), solver_cls.__name__)
+            test.assertLess(
+                float(np.abs(np.diff(history, axis=0)).max()),
+                1.0e-9,
+                f"{solver_cls.__name__}: tangent points slid on an undefined free span",
+            )
 
 
 def test_dynamic_route_holds_state_on_short_bypass_span(test, device):
@@ -4289,6 +4465,18 @@ add_test(
     "bypassed_span_holds_attachments_when_neighbors_interpenetrate",
     devices,
     test_bypassed_span_holds_attachments_when_neighbors_interpenetrate,
+)
+add_test(
+    TestTendonCapstan,
+    "same_winding_touching_rollers_keep_external_tangent",
+    devices,
+    test_same_winding_touching_rollers_keep_external_tangent,
+)
+add_test(
+    TestTendonCapstan,
+    "same_winding_nested_rollers_hold_attachments",
+    devices,
+    test_same_winding_nested_rollers_hold_attachments,
 )
 add_test(
     TestTendonCapstan,

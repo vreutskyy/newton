@@ -805,18 +805,27 @@ def update_tendon_attachments(
     if both_rolling and radius_l > 0.0 and radius_r > 0.0:
         new_al = seed_al
         new_ar = seed_ar
-        # Interpenetrating wrap circles have no common tangent of the required handedness, so
-        # the fixed point below runs on the inside-the-circle fallback of tangent_point_circle
-        # and settles on whichever of the two circle intersections the seed faces. Both are
-        # attractors, and pose noise that sweeps the centre line across the seed flips the pair
-        # between them, stepping the wrap arcs by tens of degrees and the free span with them.
-        # Hold the accepted tangents there, the same way update_tendon_link_active holds its
-        # decision on the matching degenerate bypass span. A seed that is not on its circle
-        # carries no accepted tangent to hold -- initialization seeds the link centre, and a
-        # route transition moves the endpoint to another link -- so those still take the
-        # fallback construction.
+        # Wrap circles that overlap far enough have no common tangent of the required
+        # handedness, so the fixed point below runs on the inside-the-circle fallback of
+        # tangent_point_circle and settles on whichever of the two circle intersections the
+        # seed faces. Both are attractors, and pose noise that sweeps the centre line across
+        # the seed flips the pair between them, stepping the wrap arcs by tens of degrees and
+        # the free span with them. Hold the accepted tangents there, the same way
+        # update_tendon_link_active holds its decision on the matching degenerate bypass span.
+        # How far is far enough depends on the handedness the span needs. The right endpoint is
+        # built with orient_r and the left one with -orient_l, which puts both tangent points on
+        # the same side of the centre line exactly when orient_l * orient_r * (normal_l . normal_r)
+        # is positive: the two links then wrap the same way and the span rides their external
+        # tangent, which exists down to one circle sitting inside the other, d <= |r_l - r_r|.
+        # Opposite wraps instead need the crossed internal tangent, which is already gone once
+        # the circles touch, d <= r_l + r_r. A seed that is not on its circle carries no accepted
+        # tangent to hold -- initialization seeds the link centre, and a route transition moves
+        # the endpoint to another link -- so those still take the fallback construction.
         held = False
-        if wp.length(center_r - center_l) <= radius_l + radius_r + 1.0e-9:
+        missing_tangent_distance = radius_l + radius_r
+        if float(orient_l * orient_r) * wp.dot(normal_l, normal_r) > 0.0:
+            missing_tangent_distance = wp.abs(radius_l - radius_r)
+        if wp.length(center_r - center_l) <= missing_tangent_distance + 1.0e-9:
             radial_l = seed_al - center_l
             radial_r = seed_ar - center_r
             radial_l = radial_l - wp.dot(radial_l, normal_l) * normal_l
