@@ -264,8 +264,11 @@ def oriented_wrap_arc_length(
     retrace there, not material. The rolling transfer keeps crediting the neighboring spans with
     the signed swept arc across that crossing, so the route conserves ``spans + theta * radius``
     with ``theta`` signed. Merging a deactivating link with the absolute arc therefore creates
-    ``2 * |theta| * radius`` of rest length. The angle is formed exactly as in
-    ``update_tendon_cone_rows``' diagnostic, so the sign matches the state that diagnostic reports.
+    ``2 * |theta| * radius`` of rest length, and splitting an activating link with the absolute
+    arc when its accepted pose already wraps negatively removes the same amount: the activation
+    split, the rolling transfer and the deactivation merge must all book the signed arc. The
+    angle is formed exactly as in ``update_tendon_cone_rows``' diagnostic, so the sign matches
+    the state that diagnostic reports.
     """
     r_left = pt_left - center
     r_right = pt_right - center
@@ -1117,6 +1120,7 @@ def _make_solve_tendon_material(direct_enabled: bool):
         tendon_link_body: wp.array[int],
         tendon_link_type: wp.array[int],
         tendon_link_radius: wp.array[float],
+        tendon_link_orientation: wp.array[int],
         tendon_link_offset: wp.array[wp.vec3],
         tendon_link_axis: wp.array[wp.vec3],
         seg_rest_length: wp.array[float],
@@ -1207,8 +1211,17 @@ def _make_solve_tendon_material(direct_enabled: bool):
             pose = body_q[body]
             center = wp.transform_point(pose, tendon_link_offset[link_idx])
             normal = wp.transform_vector(pose, tendon_link_axis[link_idx])
-            arc_rest = wrapped_arc_length(
-                seg_attachment_r[seg_left], seg_attachment_l[seg_right], center, tendon_link_radius[link_idx], normal
+            # The oriented arc, so the split books the same signed ledger that the rolling
+            # transfer and the deactivation merge use: a candidate whose accepted pose has
+            # already crossed to a negative wrap otherwise removes |theta| * radius here and
+            # gets theta * radius back at the merge, losing 2 * |theta| * radius of cable.
+            arc_rest = oriented_wrap_arc_length(
+                seg_attachment_r[seg_left],
+                seg_attachment_l[seg_right],
+                center,
+                tendon_link_radius[link_idx],
+                normal,
+                tendon_link_orientation[link_idx],
             )
             free_rest = seg_rest_length_step[seg_left] - arc_rest
             if free_rest < 2.0 * min_rest:

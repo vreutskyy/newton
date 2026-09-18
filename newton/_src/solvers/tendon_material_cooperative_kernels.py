@@ -10,7 +10,7 @@ extensions. All lanes participate in each connected component's force solve.
 import warp as wp
 
 from ..sim.tendon import TendonLinkType
-from .tendon_kernels import tendon_segment_length_rate, tendon_segment_length_rate_from_poses, wrapped_arc_length
+from .tendon_kernels import oriented_wrap_arc_length, tendon_segment_length_rate, tendon_segment_length_rate_from_poses
 from .tendon_material_cooperative import solve_tendon_material_nonlinear_component as project_cooperative
 from .tendon_material_cooperative import warp_broadcast
 from .tendon_material_state import (
@@ -38,6 +38,7 @@ def prepare_material(
     tendon_link_body: wp.array[int],
     tendon_link_type: wp.array[int],
     tendon_link_radius: wp.array[float],
+    tendon_link_orientation: wp.array[int],
     tendon_link_offset: wp.array[wp.vec3],
     tendon_link_axis: wp.array[wp.vec3],
     seg_rest_length: wp.array[float],
@@ -108,8 +109,13 @@ def prepare_material(
         pose = body_q[body]
         center = wp.transform_point(pose, tendon_link_offset[link_idx])
         normal = wp.transform_vector(pose, tendon_link_axis[link_idx])
-        arc_rest = wrapped_arc_length(
-            seg_attachment_r[seg_left], seg_attachment_l[seg_right], center, tendon_link_radius[link_idx], normal
+        arc_rest = oriented_wrap_arc_length(
+            seg_attachment_r[seg_left],
+            seg_attachment_l[seg_right],
+            center,
+            tendon_link_radius[link_idx],
+            normal,
+            tendon_link_orientation[link_idx],
         )
         free_rest = seg_rest_length_step[seg_left] - arc_rest
         if free_rest < 2.0 * min_rest:
@@ -453,6 +459,7 @@ def solve_tendon_material_cooperative(
     tendon_link_body: wp.array[int],
     tendon_link_type: wp.array[int],
     tendon_link_radius: wp.array[float],
+    tendon_link_orientation: wp.array[int],
     tendon_link_offset: wp.array[wp.vec3],
     tendon_link_axis: wp.array[wp.vec3],
     seg_rest_length: wp.array[float],
@@ -510,6 +517,7 @@ def solve_tendon_material_cooperative(
             tendon_link_body,
             tendon_link_type,
             tendon_link_radius,
+            tendon_link_orientation,
             tendon_link_offset,
             tendon_link_axis,
             seg_rest_length,

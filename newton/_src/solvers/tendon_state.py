@@ -780,6 +780,7 @@ class TendonStateMixin:
                 model.tendon_link_body,
                 model.tendon_link_type,
                 model.tendon_link_radius,
+                model.tendon_link_orientation,
                 model.tendon_link_offset,
                 model.tendon_link_axis,
                 self.tendon_seg_rest_length,

@@ -2358,6 +2358,60 @@ def test_dynamic_route_deactivation_keeps_positive_wrap_arc(test, device):
         test.assertAlmostEqual(merged, float(rest_step[0] + rest_step[1]) + arc, delta=2.0e-7)
 
 
+def test_dynamic_route_one_substep_negative_wrap_conserves_material(test, device):
+    """A candidate activated on a pose inside its chord, whose accepted pose the same substep has already
+    crossed far past it, must book and return the same arc when it merges back one substep later.
+
+    toy4's A.R1 does this while the mechanism snaps: activated 0.12 mm inside the R0-R2 chord, it ends the
+    substep at -14.8 deg and deactivates on the next. Splitting with |theta| and merging with the signed
+    arc loses 2 r |theta| = 2.0 mm of cable there.
+    """
+    with wp.ScopedDevice(device):
+        dt = 1.0 / 1200.0
+        model, candidate, candidate_link = build_force_driven_dynamic_route(device)
+        solver = newton.solvers.SolverXPBD(model, iterations=1, joint_linear_relaxation=1.0)
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+        radius = float(model.tendon_link_radius.numpy()[candidate_link])
+        bypass_seg = candidate_link - 1
+
+        # Settle the candidate clear of the chord, inactive, so the merged bypass span carries the cable.
+        for _ in range(4):
+            solver.step(state_0, state_1, model.control(), None, dt)
+            state_0, state_1 = state_1, state_0
+        test.assertFalse(solver.tendon_link_active.numpy()[candidate_link])
+        material_before = _oriented_route_material_length(solver, model, state_0, candidate_link)
+        stretch_before = float(
+            solver.tendon_seg_length.numpy()[bypass_seg] - solver.tendon_seg_rest_length.numpy()[bypass_seg]
+        )
+
+        # Step-start pose 1 mm inside the chord: the activation test accepts it. The substep then carries
+        # the candidate well past the chord, so the accepted pose of the activation substep wraps negatively.
+        body_q = state_0.body_q.numpy()
+        body_q[candidate, 0] = radius - 1.0e-3
+        state_0.body_q.assign(body_q)
+        state_0, state_1 = _step_candidate_to(solver, model, state_0, state_1, candidate, radius + 0.06, dt)
+        test.assertTrue(solver.tendon_link_active.numpy()[candidate_link])
+        angle = _oriented_wrap_angle_at_link(solver, model, state_0, candidate_link)
+        test.assertLess(angle, -np.radians(10.0), "the activation substep must end with a large negative wrap")
+        test.assertAlmostEqual(
+            _oriented_route_material_length(solver, model, state_0, candidate_link), material_before, delta=1.0e-6
+        )
+
+        # Merge substep: the candidate deactivates and its two spans merge back into the bypass span.
+        state_0, state_1 = _step_candidate_to(solver, model, state_0, state_1, candidate, radius + 0.06, dt)
+        test.assertFalse(solver.tendon_link_active.numpy()[candidate_link])
+        test.assertAlmostEqual(
+            _oriented_route_material_length(solver, model, state_0, candidate_link), material_before, delta=1.0e-6
+        )
+        # The chord between the two kinematic attachments is fixed, so a conserved rest length means the
+        # merged span sees no tension step either.
+        stretch_after = float(
+            solver.tendon_seg_length.numpy()[bypass_seg] - solver.tendon_seg_rest_length.numpy()[bypass_seg]
+        )
+        test.assertAlmostEqual(stretch_after, stretch_before, delta=1.0e-6)
+
+
 def test_negative_wrap_report_separates_graze_from_static_roller(test, device):
     """The report must drop the dynamic-routing advice for a link that is already dynamic."""
     with wp.ScopedDevice(device):
@@ -4657,6 +4711,12 @@ add_test(
     "dynamic_route_deactivation_keeps_positive_wrap_arc",
     devices,
     test_dynamic_route_deactivation_keeps_positive_wrap_arc,
+)
+add_test(
+    TestTendonCapstan,
+    "dynamic_route_one_substep_negative_wrap_conserves_material",
+    devices,
+    test_dynamic_route_one_substep_negative_wrap_conserves_material,
 )
 add_test(
     TestTendonCapstan,
