@@ -837,6 +837,8 @@ class TendonStateMixin:
         link_radius_np = model.tendon_link_radius.numpy()
         link_offset_np = model.tendon_link_offset.numpy()
         link_axis_np = model.tendon_link_axis.numpy()
+        link_orientation_np = model.tendon_link_orientation.numpy()
+        link_flags_np = model.tendon_link_flags.numpy()
         link_active_np = self.tendon_link_active.numpy()
         seg_active_np = self.tendon_seg_active.numpy()
         seg_active_link_l_np = self.tendon_seg_active_link_l.numpy()
@@ -879,7 +881,38 @@ class TendonStateMixin:
                     r_r = pt_right - center
                     cross_val = np.dot(np.cross(r_l, r_r), normal)
                     dot_val = np.dot(r_l, r_r)
-                    theta = abs(np.arctan2(cross_val, dot_val))
+                    # The oriented arc: the rolling transfer, the activation split and the
+                    # deactivation merge all book the signed wrap, so this is the quantity the
+                    # route conserves. A link that starts at a negative wrap has no valid route,
+                    # and the two conventions differ by 2 * radius * |theta| there.
+                    theta = float(np.arctan2(cross_val, dot_val)) * float(link_orientation_np[i])
+                    # At antipodal tangents the two atan2 signs denote the same
+                    # half-circle. Do not classify a fixed half-turn as retracing
+                    # solely because signed zero selected the negative branch.
+                    if (
+                        (link_flags_np[i] & int(TendonLinkFlags.DYNAMIC)) == 0
+                        and theta < 0.0
+                        and abs(theta + np.pi) <= 1.0e-6
+                    ):
+                        theta = float(np.pi)
+                    if theta < 0.0:
+                        dynamic_note = ""
+                        if (link_flags_np[i] & int(TendonLinkFlags.DYNAMIC)) != 0:
+                            dynamic_note = (
+                                " A dynamic candidate starts active here only when its bypass span is "
+                                "undefined (its neighbors' wrap circles overlap or the span collapsed), so "
+                                "the activation test held the all-active initial state."
+                            )
+                        warnings.warn(
+                            f"Tendon {t}: ROLLING link {i} starts at an oriented wrap of "
+                            f"{np.degrees(theta):.1f} deg. A cable cannot wrap a roller negatively, so the "
+                            f"initial pose has no valid route through this link: its free spans are measured "
+                            f"along a self-crossing path, and the cable material is ambiguous by "
+                            f"2 * radius * |theta| = {2.0 * abs(theta) * radius * 1.0e3:.2f} mm between the "
+                            f"oriented arc the solver conserves and the absolute arc. Correct the route "
+                            f"geometry or the initial pose.{dynamic_note}",
+                            stacklevel=2,
+                        )
                     cable_len += theta * radius
             total_cable[t] = cable_len
             seg += num_links - 1

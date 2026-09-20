@@ -2412,6 +2412,128 @@ def test_dynamic_route_one_substep_negative_wrap_conserves_material(test, device
         test.assertAlmostEqual(stretch_after, stretch_before, delta=1.0e-6)
 
 
+def test_dynamic_route_flapping_conserves_oriented_material(test, device):
+    """A candidate that activates and deactivates on alternate substeps must conserve ``spans + theta * r``.
+
+    Every life here is the one-substep graze at its worst: the candidate is activated on a pose inside its
+    chord, ends that substep past the chord at a negative wrap, and merges back on the next substep. Twenty
+    such lives in a row must leave the ledger where it started.
+    """
+    with wp.ScopedDevice(device):
+        dt = 1.0 / 1200.0
+        model, solver, state_0, state_1, candidate, candidate_link, radius = _settle_graze_candidate(device, dt)
+        test.assertTrue(solver.tendon_link_active.numpy()[candidate_link])
+        material_before = _oriented_route_material_length(solver, model, state_0, candidate_link)
+
+        lives = 20
+        toggles = 0
+        worst_drift = 0.0
+        min_active_angle = 0.0
+        previous_active = True
+        for _life in range(lives):
+            # 60 mm past the chord ends each activation substep near -13.5 deg, toy4's snap depth.
+            for target_x in (radius + 0.06, radius - 2.0e-3):
+                state_0, state_1 = _step_candidate_to(solver, model, state_0, state_1, candidate, target_x, dt)
+                active = bool(solver.tendon_link_active.numpy()[candidate_link])
+                toggles += int(active != previous_active)
+                previous_active = active
+                if active:
+                    min_active_angle = min(
+                        min_active_angle, _oriented_wrap_angle_at_link(solver, model, state_0, candidate_link)
+                    )
+                material = _oriented_route_material_length(solver, model, state_0, candidate_link)
+                worst_drift = max(worst_drift, abs(material - material_before))
+
+        # The first substep only carries the settled candidate past the chord; every later one switches.
+        test.assertEqual(toggles, 2 * lives - 1)
+        test.assertLess(min_active_angle, 0.0, "each life must end its activation substep at a negative wrap")
+        test.assertLessEqual(worst_drift, 1.0e-7)
+
+
+def test_fixed_half_turn_books_positive_arc_for_both_windings(test, device):
+    """Mirrored physical half-circle routes have the same positive initial cable length."""
+    with wp.ScopedDevice(device):
+        for solver_type in (newton.solvers.SolverVBD, newton.solvers.SolverXPBD):
+            for winding in (1, -1):
+                with test.subTest(solver=solver_type.__name__, winding=winding):
+                    radius = 0.15
+                    builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
+                    pulley = builder.add_body(xform=wp.transform(p=wp.vec3(0.0, 0.0, 1.0)), mass=0.0, is_kinematic=True)
+                    ends = [
+                        builder.add_body(
+                            xform=wp.transform(p=wp.vec3(sign * winding * radius, 0.0, 0.0)),
+                            mass=1.0,
+                            inertia=wp.mat33(np.eye(3) * 1.0e-3),
+                        )
+                        for sign in (-1.0, 1.0)
+                    ]
+                    builder.add_tendon()
+                    axis = (0.0, 1.0, 0.0)
+                    builder.add_tendon_link(body=ends[0], link_type=int(TendonLinkType.ATTACHMENT), axis=axis)
+                    builder.add_tendon_link(
+                        body=pulley,
+                        link_type=int(TendonLinkType.ROLLING),
+                        radius=radius,
+                        orientation=winding,
+                        axis=axis,
+                        compliance=1.0e-5,
+                        rest_length=-1.0,
+                    )
+                    builder.add_tendon_link(
+                        body=ends[1],
+                        link_type=int(TendonLinkType.ATTACHMENT),
+                        axis=axis,
+                        compliance=1.0e-5,
+                        rest_length=-1.0,
+                    )
+                    builder.color()
+                    model = builder.finalize(device=device)
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("always")
+                        solver = solver_type(model, iterations=1)
+                    test.assertAlmostEqual(
+                        float(solver.tendon_total_cable.numpy()[0]), 2.0 + math.pi * radius, delta=1.0e-6
+                    )
+                    test.assertFalse(any("oriented wrap" in str(w.message) for w in caught))
+
+
+def test_initial_negative_wrap_warns_and_books_oriented_arc(test, device):
+    """A rolling link that starts at a negative oriented wrap has no valid route: the solver must say so
+    once and publish the oriented material it conserves, not the absolute arc.
+
+    toy4's customer geometry initializes A.R1 this way: the R0/R2 wrap circles overlap at the flex pose, so
+    the activation test holds the all-active initial state and R1 starts at -101 deg. The two arc conventions
+    differ by 2 r |theta| = 13.6 mm there, which read as lost cable the first time R1 deactivated and its
+    signed arc was merged.
+    """
+    with wp.ScopedDevice(device):
+        model, _body, link = build_oriented_dynamic_route(1, device, dynamic=False)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            solver = newton.solvers.SolverXPBD(model, iterations=1)
+        messages = [str(w.message) for w in caught if "oriented wrap" in str(w.message)]
+        test.assertEqual(len(messages), 1, messages)
+        test.assertIn(f"Tendon 0: ROLLING link {link} starts at an oriented wrap of -", messages[0])
+
+        state = model.state()
+        test.assertLess(_oriented_wrap_angle_at_link(solver, model, state, link), 0.0)
+        test.assertAlmostEqual(
+            float(solver.tendon_total_cable.numpy()[0]),
+            _oriented_route_material_length(solver, model, state, link),
+            delta=1.0e-6,
+        )
+
+        # A route whose links all start wrapped positively is silent.
+        positive_model, _upper, positive_link = build_interpenetrating_neighbor_route(device)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            positive_solver = newton.solvers.SolverXPBD(positive_model, iterations=1)
+        test.assertEqual([str(w.message) for w in caught if "oriented wrap" in str(w.message)], [])
+        test.assertGreater(
+            _oriented_wrap_angle_at_link(positive_solver, positive_model, positive_model.state(), positive_link), 0.0
+        )
+
+
 def test_negative_wrap_report_separates_graze_from_static_roller(test, device):
     """The report must drop the dynamic-routing advice for a link that is already dynamic."""
     with wp.ScopedDevice(device):
@@ -4509,6 +4631,13 @@ cuda_devices = [device for device in devices if device.startswith("cuda")]
 
 add_test(
     TestTendonCapstan,
+    "fixed_half_turn_books_positive_arc_for_both_windings",
+    devices,
+    test_fixed_half_turn_books_positive_arc_for_both_windings,
+)
+
+add_test(
+    TestTendonCapstan,
     "material_transfer_delta_reaches_capstan_bound",
     devices,
     test_material_transfer_delta_reaches_capstan_bound,
@@ -4717,6 +4846,18 @@ add_test(
     "dynamic_route_one_substep_negative_wrap_conserves_material",
     devices,
     test_dynamic_route_one_substep_negative_wrap_conserves_material,
+)
+add_test(
+    TestTendonCapstan,
+    "dynamic_route_flapping_conserves_oriented_material",
+    devices,
+    test_dynamic_route_flapping_conserves_oriented_material,
+)
+add_test(
+    TestTendonCapstan,
+    "initial_negative_wrap_warns_and_books_oriented_arc",
+    devices,
+    test_initial_negative_wrap_warns_and_books_oriented_arc,
 )
 add_test(
     TestTendonCapstan,
