@@ -2528,8 +2528,8 @@ class SolverVBD(TendonStateMixin, SolverBase):
     ) -> None:
         """Update VBD routed-tendon geometry and rolling rest transfer for this iteration.
 
-        ``skip_material`` refreshes the route geometry but leaves the rest lengths from the
-        previous solved pose in place.
+        ``skip_material`` refreshes the route geometry and re-bases the rest lengths on the
+        step-start route (deactivation merge, activation split) but transfers no material.
         """
         model = self.model
         if model.tendon_segment_count == 0 or state_in.body_q is None:
@@ -2570,16 +2570,19 @@ class SolverVBD(TendonStateMixin, SolverBase):
 
         self._update_tendon_cone_rows(model, state_in.body_q, report_unsupported_wrap)
 
-        if skip_material:
-            # Direct mode only. The opening iterations run on poses the solver has not settled
-            # yet: iteration 0 is the raw inertial predictor, which on toy4 swings each copy's
-            # penalty-pinned base by 39-51 deg and its routing links by tens of millimetres. The
-            # direct solve computes an exact allocation for whatever geometry it is given, so
-            # those poses yield kilonewton-scale ones; material sweeps are bounded per pass and
-            # never reach them. Keep the last solved pose's rest lengths for this iteration. The
-            # route geometry above is still refreshed, and the accepted pose at the end of the
-            # step always solves the material.
-            return
+        # Direct mode only. The opening iterations run on poses the solver has not settled
+        # yet: iteration 0 is the raw inertial predictor, which on toy4 swings each copy's
+        # penalty-pinned base by 39-51 deg and its routing links by tens of millimetres. The
+        # direct solve computes an exact allocation for whatever geometry it is given, so
+        # those poses yield kilonewton-scale ones; material sweeps are bounded per pass and
+        # never reach them. Transfer no material on those iterations: with both transfer
+        # flags off the kernel only re-bases the rest lengths on the step-start route and
+        # splits a newly activated roller, so the force kernel reads rest lengths for the
+        # spans it evaluates. Skipping the kernel outright left a dynamic candidate that
+        # changed state at step start with the previous route's rest lengths: its merged span
+        # (or 1 um split span) carried a phantom stretch of half a span for the whole hold.
+        # The accepted pose at the end of the step always solves the material.
+        apply_transfer = int(not skip_material)
 
         wp.launch(
             kernel=self._tendon_material_kernel,
@@ -2623,8 +2626,8 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_cone_sweep_count,
                 1,
                 dt,
-                1,
-                1,
+                apply_transfer,
+                apply_transfer,
                 1,
                 self.tendon_max_sweeps,
                 self.tendon_settle_tol,

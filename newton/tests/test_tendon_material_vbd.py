@@ -15,6 +15,7 @@ from newton._src.solvers.vbd.tendon_kernels import (
     TendonForceElementAdjacencyInfo,
     evaluate_tendon_force_hessians,
 )
+from newton.tests.test_tendon_capstan import _oriented_route_material_length, build_force_driven_dynamic_route
 from newton.tests.test_tendon_material_dynamics import _make_pulley, _PulleyTrajectory
 from newton.tests.test_tendon_material_integration import _add_chain, _chain_model, _two_tendon_model
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -572,12 +573,13 @@ class TestTendonMaterialVBD(unittest.TestCase):
             self.assertLess(float(workspace.failure_upper.numpy()[0]), (1.0, 0.2)[span])
 
     def test_direct_material_holds_the_opening_iterations(self):
-        """Hold the last solved rest lengths over the opening iteration poses of a step.
+        """Transfer no material over the opening iteration poses of a step.
 
         The direct solve returns an exact allocation for whatever geometry it is handed, so the
         opening poses of a step -- iteration 0 is the raw inertial predictor, and the iterations
         that undo it are still far from the accepted pose -- produce kilonewton-scale ones on
-        toy4. Sweeps never reach them because each pass is bounded.
+        toy4. Sweeps never reach them because each pass is bounded. The rest lengths are still
+        re-based on the step-start route, so the force kernel reads the spans it evaluates.
         """
         model = _chain_model("cpu")
         for iterations, hold, expected in ((1, 4, 0), (3, 4, 2), (8, 4, 4), (32, 4, 4), (32, 0, 0), (32, 7, 7)):
@@ -591,9 +593,11 @@ class TestTendonMaterialVBD(unittest.TestCase):
         state = model.state()
         solver.tendon_seg_route_rest_length.assign(np.full(model.tendon_segment_count, 0.5, dtype=np.float32))
         held = solver.tendon_seg_rest_length.numpy().copy()
+        stretch = solver.tendon_seg_stretch.numpy().copy()
 
         solver._update_tendon_routing(state, 0.001, False, skip_material=True)
-        np.testing.assert_array_equal(solver.tendon_seg_rest_length.numpy(), held)
+        np.testing.assert_array_equal(solver.tendon_seg_rest_length.numpy(), 0.5)
+        np.testing.assert_array_equal(solver.tendon_seg_stretch.numpy(), stretch)
         # The route geometry itself is still refreshed for the body solve.
         self.assertTrue(np.all(solver.tendon_seg_length.numpy() > 0.0))
 
@@ -618,6 +622,96 @@ class TestTendonMaterialVBD(unittest.TestCase):
         solver.tendon_sigmoid_ea_low = 2000.0
         with self.assertRaisesRegex(ValueError, "Reconstruct.*material law"):
             solver.step(model.state(), model.state(), model.control(), None, 0.001)
+
+    def test_direct_hold_reads_merged_rest_length_at_deactivation(self):
+        """The hold iterations of the step that bypasses a roller must see its merged span's rest length.
+
+        ``prepare_tendon_route`` rewires the two spans of a deactivated candidate into one and writes
+        the merged rest length to the route ledger; only the material kernel re-bases the rest lengths
+        the force kernel reads from it. Skipped for the settle hold, the merged span was evaluated
+        against the rest length of one half-span: a phantom stretch of half the span (17.7 mm, 795 N
+        to 1.7 kN on toy4's cable A) that injected 1.1 J into a 20 g arm in one substep.
+        """
+        dt = 1.0 / 1200.0
+        model, candidate, candidate_link = build_force_driven_dynamic_route("cpu")
+        solver = _make_solver(model)
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+        radius = float(model.tendon_link_radius.numpy()[candidate_link])
+        for _ in range(4):
+            _teleport(solver, state_0, candidate, radius - 2.0e-3)
+            solver.step(state_0, state_1, model.control(), None, dt)
+            state_0, state_1 = state_1, state_0
+        self.assertTrue(solver.tendon_link_active.numpy()[candidate_link])
+        driving = float(np.max(solver.tendon_seg_material_tension.numpy()))
+        self.assertGreater(driving, 0.0)
+
+        # Step-start pose clear of the chord: this step deactivates the candidate and merges its spans.
+        _teleport(solver, state_0, candidate, 0.25)
+        tension = _hold_iteration_tension(solver, model, state_0, dt)
+        self.assertFalse(solver.tendon_link_active.numpy()[candidate_link])
+        np.testing.assert_array_equal(
+            solver.tendon_seg_rest_length.numpy(), solver.tendon_seg_route_rest_length.numpy()
+        )
+        # The merged straight span is shorter than the wrapped route it replaces, so it cannot
+        # carry more than the tension of the accepted pose (the half-span rest gave 50 N here).
+        self.assertLessEqual(tension, driving)
+
+    def test_direct_hold_splits_rest_length_at_activation(self):
+        """The hold iterations of the step that activates a roller must see its split spans' rest lengths.
+
+        The split of the merged bypass rest length onto the two new spans also runs only in the
+        material kernel; skipped, the new span kept its 1 um placeholder rest length against its full
+        length (18.25 mm and 839 N on toy4's cable A at re-activation).
+        """
+        dt = 1.0 / 1200.0
+        model, candidate, candidate_link = build_force_driven_dynamic_route("cpu")
+        solver = _make_solver(model)
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+        for _ in range(4):
+            solver.step(state_0, state_1, model.control(), None, dt)
+            state_0, state_1 = state_1, state_0
+        self.assertFalse(solver.tendon_link_active.numpy()[candidate_link])
+        material_before = _oriented_route_material_length(solver, model, state_0, candidate_link)
+
+        # Step-start pose 1 mm inside the chord: this step activates the candidate and splits the span.
+        radius = float(model.tendon_link_radius.numpy()[candidate_link])
+        _teleport(solver, state_0, candidate, radius - 1.0e-3)
+        tension = _hold_iteration_tension(solver, model, state_0, dt)
+        self.assertTrue(solver.tendon_link_active.numpy()[candidate_link])
+        material_hold = _oriented_route_material_length(solver, model, state_0, candidate_link)
+        # The split leaves both spans with the strain of the accepted route (the placeholder gave 50 N).
+        solver._update_tendon_routing(state_0, dt, False)
+        driving = _span_tension(solver)
+        self.assertGreater(driving, 0.0)
+        self.assertLessEqual(tension, 2.0 * driving)
+        self.assertAlmostEqual(material_hold, material_before, delta=1.0e-6)
+
+
+def _teleport(solver, state, body, x):
+    """Place a dynamic body at rest: ``body_q``, the solver's ``body_q_prev`` and ``body_qd`` together."""
+    body_q = state.body_q.numpy()
+    body_q[body, 0] = x
+    state.body_q.assign(body_q)
+    state.body_qd.zero_()
+    solver.body_q_prev.assign(state.body_q)
+
+
+def _span_tension(solver):
+    """Largest linear-law tension the force kernel derives from the current rest lengths."""
+    active = solver.tendon_seg_active.numpy().astype(bool)
+    stretch = solver.tendon_seg_length.numpy() - solver.tendon_seg_rest_length.numpy()
+    return float(np.max(np.maximum(stretch[active], 0.0) / solver.tendon_seg_active_compliance.numpy()[active]))
+
+
+def _hold_iteration_tension(solver, model, state, dt):
+    """Run the step-start route update and one settle-hold routing update, as ``step`` does."""
+    solver._snapshot_tendon_step_state()
+    solver._update_tendon_link_active(model, state.body_q)
+    solver._prepare_tendon_route(model, state.body_q, 1.0e-8)
+    solver._update_tendon_routing(state, dt, False, skip_material=True)
+    return _span_tension(solver)
 
 
 def test_direct_vbd_failure_after_graph_replay(test, device):
