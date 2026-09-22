@@ -10,6 +10,7 @@ extensions. All lanes participate in each connected component's force solve.
 import warp as wp
 
 from ..sim.tendon import TendonLinkType
+from .tendon_alm_material import project_alm_material_cooperative
 from .tendon_kernels import oriented_wrap_arc_length, tendon_segment_length_rate, tendon_segment_length_rate_from_poses
 from .tendon_material_cooperative import solve_tendon_material_nonlinear_component as project_cooperative
 from .tendon_material_cooperative import warp_broadcast
@@ -78,6 +79,8 @@ def prepare_material(
     sigmoid_transition_width: float,
     direct: TendonMaterialState,
 ) -> int:
+    if direct.process_changed_routes and direct.changed_routes[tendon_id] == 0:
+        return 0
     if direct.failure[tendon_id] != 0:
         return 0
     link_start = tendon_start[tendon_id]
@@ -256,6 +259,8 @@ def pack_material(
         if state.ids[index] != seg:
             state.valid[row] = 0
         state.ids[index] = seg
+        if state.segment_alm:
+            state.alm.reference[index] = seg_stretch[seg]
         state.initial[index] = seg_stretch[seg] + seg_compliance[seg] * seg_damping[seg]
         state.compliance[index] = seg_compliance[seg]
         state.upper[index] = seg_length[seg] - min_rest + seg_compliance[seg] * seg_damping[seg]
@@ -315,8 +320,10 @@ def publish_material(
         elif state.next_link[previous] < 0:
             row = seg
             count = 0
-        if state.nonlinear_enabled:
+        if state.nonlinear_enabled or state.segment_alm:
             seg_stretch[seg] = state.output[row + count]
+            if state.segment_alm and state.alm.force[row + count] == 0.0:
+                state.alm.multiplier[seg] = 0.0
         else:
             seg_stretch[seg] = state.output[row + count] - seg_compliance[seg] * seg_damping[seg]
         count += 1
@@ -395,26 +402,51 @@ def transfer_cooperative(
             previous = seg
             continue
         count = state.count[row]
-        project_cooperative(
-            state.nonlinear,
-            count,
-            1,
-            row,
-            1,
-            1,
-            state.ea_low,
-            state.ea_ratio,
-            state.transition_strain,
-            state.transition_width,
-            min_rest,
-            64,
-            1e-05,
-            lane,
-        )
+        if state.segment_alm:
+            project_alm_material_cooperative(
+                state.alm,
+                state.ids,
+                state.initial,
+                state.compliance,
+                state.cap,
+                state.upper,
+                state.output,
+                state.status,
+                state.faces,
+                state.valid,
+                state.pieces,
+                row,
+                count,
+                state.ea_low,
+                state.ea_ratio,
+                state.transition_strain,
+                state.transition_width,
+                lane,
+            )
+        else:
+            project_cooperative(
+                state.nonlinear,
+                count,
+                1,
+                row,
+                1,
+                1,
+                state.ea_low,
+                state.ea_ratio,
+                state.transition_strain,
+                state.transition_width,
+                min_rest,
+                64,
+                1e-05,
+                lane,
+            )
         failed = int(0)
         if lane == 0:
             if state.status[row] < 0:
-                reject_tendon_material(state, state.status[row] - 200, tendon, row, latch)
+                code = state.status[row]
+                if not state.segment_alm:
+                    code -= 200
+                reject_tendon_material(state, code, tendon, row, latch)
                 record_tendon_material_failure_span(state, tendon, row, count, seg_length, seg_compliance, latch)
                 failed = 1
         failed = warp_broadcast(failed)

@@ -23,6 +23,7 @@ from ..flags import SolverNotifyFlags
 from ..solver import SolverBase
 from ..tendon_alm_material import TendonALMMaterialState
 from ..tendon_kernels import solve_tendon_material_direct, update_tendon_attachments
+from ..tendon_material_cooperative_kernels import solve_tendon_material_cooperative
 from ..tendon_state import TendonStateMixin
 from ..xpbd.kernels import apply_joint_forces
 from .particle_vbd_kernels import (
@@ -410,7 +411,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 large values fall back towards penalty behaviour.
             tendon_alm_per_segment: Experimental. Retain a multiplier per segment and use the same ALM
                 tension in the direct material projection and roller reactions. Requires ``tendon_alm``
-                and ``tendon_material_direct``. Nonlinear/damped rows use an experimental scalar
+                and ``tendon_material_direct``. Nonlinear/damped rows use an experimental nonlinear
                 projection certified against the actual ALM forces. Positive damping is limited to
                 the taut extension created during the step, giving continuous slack engagement.
                 Check projection failures with :meth:`check_tendon_material`. Route changes reset
@@ -550,11 +551,16 @@ class SolverVBD(TendonStateMixin, SolverBase):
             alm.damping_force = self.tendon_seg_damping_tension
             alm.multiplier = self.tendon_seg_alm_lambda
             alm.penalty = self.tendon_seg_alm_k
-            # Reference implementation: the nonlinear outer iteration uses the scalar
-            # global projection on both CPU and CUDA, without falling back to sweeps.
-            self._tendon_material_kernel = solve_tendon_material_direct
-            self._tendon_material_lanes = 1
-            self._tendon_material_block_dim = 256
+            # Share the nonlinear force law and certificate with the scalar CPU
+            # reference, but evaluate segment coefficients concurrently on CUDA.
+            if self.device.is_cuda:
+                self._tendon_material_kernel = solve_tendon_material_cooperative
+                self._tendon_material_lanes = 32
+                self._tendon_material_block_dim = 32
+            else:
+                self._tendon_material_kernel = solve_tendon_material_direct
+                self._tendon_material_lanes = 1
+                self._tendon_material_block_dim = 256
 
         # Initialize rigid body system and rigid-particle (body-particle) interaction state
         self._init_rigid_system(

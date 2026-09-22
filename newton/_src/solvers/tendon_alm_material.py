@@ -11,6 +11,7 @@ the actual ALM forces and transfer directions. Nonconvergence is explicit.
 import warp as wp
 
 from .tendon_material import TendonMaterialStatus, solve_tendon_material_component
+from .tendon_material_cooperative import warp_broadcast
 from .tendon_material_nonlinear import _secant_compliance_float
 
 
@@ -132,164 +133,221 @@ def alm_material_linearization(
     return c, offset
 
 
-@wp.func
-def project_alm_material(
-    state: TendonALMMaterialState,
-    ids: wp.array[int],
-    initial: wp.array[float],
-    compliance: wp.array[float],
-    cap: wp.array[float],
-    upper: wp.array[float],
-    output: wp.array[float],
-    status: wp.array[int],
-    faces: wp.array[int],
-    valid: wp.array[int],
-    pieces: wp.array[int],
-    row: int,
-    count: int,
-    ea_low: float,
-    ea_ratio: float,
-    knee: float,
-    width: float,
-) -> bool:
-    reference_sum = float(0.0)
-    for slot in range(count):
-        i = row + slot
-        state.extension[i] = state.reference[i]
-        reference_sum += state.reference[i]
-    state.iterations[row] = 0
-    for iteration in range(128):
-        state.iterations[row] = iteration + 1
+@wp.func_native("""
+#ifdef __CUDA_ARCH__
+return __shfl_sync(0xffffffffu, value, 0);
+#else
+return value;
+#endif
+""")
+def _broadcast_float(value: float) -> float: ...
+
+
+def _make_project_alm_material(cooperative: bool):
+    """Share the force law and certificate between scalar and full-warp execution."""
+
+    @wp.func
+    def project_alm_material(
+        state: TendonALMMaterialState,
+        ids: wp.array[int],
+        initial: wp.array[float],
+        compliance: wp.array[float],
+        cap: wp.array[float],
+        upper: wp.array[float],
+        output: wp.array[float],
+        status: wp.array[int],
+        faces: wp.array[int],
+        valid: wp.array[int],
+        pieces: wp.array[int],
+        row: int,
+        count: int,
+        ea_low: float,
+        ea_ratio: float,
+        knee: float,
+        width: float,
+        lane: int = 0,
+    ) -> bool:
+        stride = int(1)
+        if wp.static(cooperative):
+            stride = 32
+        reference_sum = float(0.0)
         for slot in range(count):
-            i = row + slot
-            seg = ids[i]
-            trial_extension = state.extension[i]
-            if iteration == 0 and reference_sum <= 0.0:
-                # Try the all-slack branch first when the material inventory permits it.
-                # Publication still requires the full-force certificate below.
-                trial_extension = wp.min(trial_extension, 0.0)
-            c, offset = alm_material_linearization(state, seg, trial_extension, ea_low, ea_ratio, knee, width)
-            initial[i] = state.reference[i] + offset
-            compliance[i] = c
-            state.offset[i] = offset
-            upper[i] = state.length[seg] - 1.0e-6 + offset
-        solve_tendon_material_component(
-            initial,
-            compliance,
-            cap,
-            upper,
-            output,
-            status,
-            faces,
-            valid,
-            pieces,
-            count,
-            1,
-            row,
-            1,
-            1,
-        )
-        if status[row] == -3:
-            # A tangent's unconstrained root can cross the physical rest-length
-            # boundary even when the nonlinear root is feasible. Obtain its
-            # direction, then limit the outer step below; never publish it.
-            for slot in range(count):
-                upper[row + slot] = 1.0e30
-            solve_tendon_material_component(
-                initial, compliance, cap, upper, output, status, faces, valid, pieces, count, 1, row, 1, 1
-            )
-        if status[row] < 0:
-            return False
-        force_scale = float(1.0e-5)
-        flow_scale = float(1.0e-12)
-        for slot in range(count):
-            i = row + slot
-            seg = ids[i]
-            output[i] = output[i] - state.offset[i]
-            c, offset = alm_material_coefficients(state, seg, output[i], ea_low, ea_ratio, knee, width)
-            state.force[i] = wp.max((output[i] + offset) / c, 0.0)
-            if status[row] == int(TendonMaterialStatus.SLACK_UNCHANGED) or status[row] == int(
-                TendonMaterialStatus.SLACK_REDISTRIBUTED
-            ):
-                # The inner solution has zero force. Undoing its offset can
-                # leave a positive roundoff residue, including subnormals.
-                # Retain zero only within the local arithmetic error bound;
-                # a genuinely positive nonlinear force still needs iteration.
-                roundoff = 8.0 * 1.1920928955078125e-7 * (wp.abs(output[i]) + wp.abs(offset)) / c
-                if state.force[i] <= roundoff:
-                    state.force[i] = 0.0
-            force_scale = wp.max(force_scale, state.force[i])
-            flow_scale += wp.abs(state.reference[i]) + wp.abs(output[i]) + wp.abs(state.offset[i])
-            # Keep the actual row coefficients for a float backward-error bound.
-            # A small net force may subtract a large viscous/dual offset, so its
-            # relative rounding error cannot be bounded by the net force alone.
-            compliance[i] = c
-            state.offset[i] = offset
-            upper[i] = state.length[seg] - 1.0e-6 + offset
-        force_tol = 2.0e-5 * force_scale
-        flow_tol = 2.0e-6 * flow_scale
-        flow = float(0.0)
-        certified = bool(True)
-        step_fraction = float(0.5)
-        adjusted_metric = bool(False)
-        for slot in range(count):
-            i = row + slot
-            flow += state.reference[i] - output[i]
-            if not wp.isfinite(output[i]) or not wp.isfinite(state.force[i]):
-                certified = False
-            bound = state.length[ids[i]] - 1.0e-6
-            if output[i] > bound:
-                certified = False
-                direction = output[i] - state.extension[i]
-                if direction > 0.0:
-                    step_fraction = wp.min(step_fraction, 0.9 * wp.max(bound - state.extension[i], 0.0) / direction)
+            reference_sum += state.reference[row + slot]
+        for slot in range(lane, count, stride):
+            state.extension[row + slot] = state.reference[row + slot]
+        if wp.static(cooperative):
+            warp_broadcast(0)
+        for iteration in range(128):
+            if lane == 0:
+                state.iterations[row] = iteration + 1
+            for slot in range(lane, count, stride):
+                i = row + slot
                 seg = ids[i]
-                if state.penalty[seg] > 0.0 and state.extension[i] >= bound - 0.01 * wp.abs(bound):
-                    # A finite ALM penalty puts an artificial force ceiling on
-                    # a short span, even when the physical material is feasible.
-                    # Once Newton reaches that ceiling, strengthen this row's
-                    # metric and restart the projection. Body/dual evaluation
-                    # shares this array, so it sees the same adjusted force law.
-                    physical_c = wp.max(state.physical_compliance[seg], 1.0e-8)
-                    if ea_low > 0.0:
-                        physical_c = _secant_compliance_float(state.length[seg], bound, ea_low, ea_ratio, knee, width)
-                    limit = (1.0 / physical_c + state.damping[seg] / state.dt) / 1.1920928955078125e-7
-                    rho = wp.min(2.0 * state.penalty[seg], limit)
-                    if rho > state.penalty[seg]:
-                        state.penalty[seg] = rho
-                        adjusted_metric = True
-            if slot + 1 < count:
-                tl = state.force[i]
-                tr = state.force[i + 1]
-                ratio = cap[i]
-                left_roundoff = (
-                    8.0 * 1.1920928955078125e-7 * (wp.abs(output[i]) + wp.abs(state.offset[i])) / compliance[i]
+                trial_extension = state.extension[i]
+                if iteration == 0 and reference_sum <= 0.0:
+                    # Try the all-slack branch first when the material inventory permits it.
+                    # Publication still requires the full-force certificate below.
+                    trial_extension = wp.min(trial_extension, 0.0)
+                c, offset = alm_material_linearization(state, seg, trial_extension, ea_low, ea_ratio, knee, width)
+                initial[i] = state.reference[i] + offset
+                compliance[i] = c
+                state.offset[i] = offset
+                upper[i] = state.length[seg] - 1.0e-6 + offset
+            if wp.static(cooperative):
+                warp_broadcast(0)
+            if lane == 0:
+                solve_tendon_material_component(
+                    initial,
+                    compliance,
+                    cap,
+                    upper,
+                    output,
+                    status,
+                    faces,
+                    valid,
+                    pieces,
+                    count,
+                    1,
+                    row,
+                    1,
+                    1,
                 )
-                right_roundoff = (
-                    8.0
-                    * 1.1920928955078125e-7
-                    * (wp.abs(output[i + 1]) + wp.abs(state.offset[i + 1]))
-                    / compliance[i + 1]
-                )
-                positive_tol = force_tol + left_roundoff + ratio * right_roundoff
-                negative_tol = force_tol + right_roundoff + ratio * left_roundoff
-                if tl > ratio * tr + positive_tol or tr > ratio * tl + negative_tol:
+            if wp.static(cooperative):
+                warp_broadcast(0)
+            if status[row] == -3:
+                # A tangent's unconstrained root can cross the physical rest-length
+                # boundary even when the nonlinear root is feasible. Obtain its
+                # direction, then limit the outer step below; never publish it.
+                for slot in range(lane, count, stride):
+                    upper[row + slot] = 1.0e30
+                if wp.static(cooperative):
+                    warp_broadcast(0)
+                if lane == 0:
+                    solve_tendon_material_component(
+                        initial, compliance, cap, upper, output, status, faces, valid, pieces, count, 1, row, 1, 1
+                    )
+                if wp.static(cooperative):
+                    warp_broadcast(0)
+            if status[row] < 0:
+                return False
+            force_scale = float(1.0e-5)
+            flow_scale = float(1.0e-12)
+            if lane == 0:
+                for slot in range(count):
+                    i = row + slot
+                    # Use the linearized offset before the parallel evaluation
+                    # replaces it with the actual force-row offset below.
+                    physical_extension = output[i] - state.offset[i]
+                    flow_scale += wp.abs(state.reference[i]) + wp.abs(physical_extension) + wp.abs(state.offset[i])
+            if wp.static(cooperative):
+                warp_broadcast(0)
+            for slot in range(lane, count, stride):
+                i = row + slot
+                seg = ids[i]
+                output[i] = output[i] - state.offset[i]
+                c, offset = alm_material_coefficients(state, seg, output[i], ea_low, ea_ratio, knee, width)
+                state.force[i] = wp.max((output[i] + offset) / c, 0.0)
+                if status[row] == int(TendonMaterialStatus.SLACK_UNCHANGED) or status[row] == int(
+                    TendonMaterialStatus.SLACK_REDISTRIBUTED
+                ):
+                    # The inner solution has zero force. Undoing its offset can
+                    # leave a positive roundoff residue, including subnormals.
+                    # Retain zero only within the local arithmetic error bound;
+                    # a genuinely positive nonlinear force still needs iteration.
+                    roundoff = 8.0 * 1.1920928955078125e-7 * (wp.abs(output[i]) + wp.abs(offset)) / c
+                    if state.force[i] <= roundoff:
+                        state.force[i] = 0.0
+                # Keep the actual row coefficients for a float backward-error bound.
+                # A small net force may subtract a large viscous/dual offset, so its
+                # relative rounding error cannot be bounded by the net force alone.
+                compliance[i] = c
+                state.offset[i] = offset
+                upper[i] = state.length[seg] - 1.0e-6 + offset
+            if wp.static(cooperative):
+                warp_broadcast(0)
+            certified = bool(True)
+            step_fraction = float(0.5)
+            adjusted_metric = bool(False)
+            if lane == 0:
+                for slot in range(count):
+                    i = row + slot
+                    force_scale = wp.max(force_scale, state.force[i])
+                force_tol = 2.0e-5 * force_scale
+                flow_tol = 2.0e-6 * flow_scale
+                flow = float(0.0)
+                for slot in range(count):
+                    i = row + slot
+                    flow += state.reference[i] - output[i]
+                    if not wp.isfinite(output[i]) or not wp.isfinite(state.force[i]):
+                        certified = False
+                    bound = state.length[ids[i]] - 1.0e-6
+                    if output[i] > bound:
+                        certified = False
+                        direction = output[i] - state.extension[i]
+                        if direction > 0.0:
+                            step_fraction = wp.min(
+                                step_fraction, 0.9 * wp.max(bound - state.extension[i], 0.0) / direction
+                            )
+                        seg = ids[i]
+                        if state.penalty[seg] > 0.0 and state.extension[i] >= bound - 0.01 * wp.abs(bound):
+                            # A finite ALM penalty puts an artificial force ceiling on
+                            # a short span, even when the physical material is feasible.
+                            # Once Newton reaches that ceiling, strengthen this row's
+                            # metric and restart the projection. Body/dual evaluation
+                            # shares this array, so it sees the same adjusted force law.
+                            physical_c = wp.max(state.physical_compliance[seg], 1.0e-8)
+                            if ea_low > 0.0:
+                                physical_c = _secant_compliance_float(
+                                    state.length[seg], bound, ea_low, ea_ratio, knee, width
+                                )
+                            limit = (1.0 / physical_c + state.damping[seg] / state.dt) / 1.1920928955078125e-7
+                            rho = wp.min(2.0 * state.penalty[seg], limit)
+                            if rho > state.penalty[seg]:
+                                state.penalty[seg] = rho
+                                adjusted_metric = True
+                    if slot + 1 < count:
+                        tl = state.force[i]
+                        tr = state.force[i + 1]
+                        ratio = cap[i]
+                        left_roundoff = (
+                            8.0 * 1.1920928955078125e-7 * (wp.abs(output[i]) + wp.abs(state.offset[i])) / compliance[i]
+                        )
+                        right_roundoff = (
+                            8.0
+                            * 1.1920928955078125e-7
+                            * (wp.abs(output[i + 1]) + wp.abs(state.offset[i + 1]))
+                            / compliance[i + 1]
+                        )
+                        positive_tol = force_tol + left_roundoff + ratio * right_roundoff
+                        negative_tol = force_tol + right_roundoff + ratio * left_roundoff
+                        if tl > ratio * tr + positive_tol or tr > ratio * tl + negative_tol:
+                            certified = False
+                        if flow > flow_tol and wp.abs(tl - ratio * tr) > positive_tol:
+                            certified = False
+                        if flow < -flow_tol and wp.abs(tr - ratio * tl) > negative_tol:
+                            certified = False
+                if wp.abs(flow) > flow_tol:
                     certified = False
-                if flow > flow_tol and wp.abs(tl - ratio * tr) > positive_tol:
-                    certified = False
-                if flow < -flow_tol and wp.abs(tr - ratio * tl) > negative_tol:
-                    certified = False
-        if wp.abs(flow) > flow_tol:
-            certified = False
-        if certified:
-            return True
-        if adjusted_metric:
-            for slot in range(count):
-                state.extension[row + slot] = state.reference[row + slot]
-            continue
-        # Damping limits steps that cross a sigmoid knee or a unilateral engagement boundary.
-        for slot in range(count):
-            i = row + slot
-            state.extension[i] += step_fraction * (output[i] - state.extension[i])
-    status[row] = -120
-    return False
+            if wp.static(cooperative):
+                certified = bool(warp_broadcast(int(certified)))
+                adjusted_metric = bool(warp_broadcast(int(adjusted_metric)))
+                step_fraction = _broadcast_float(step_fraction)
+            if certified:
+                return True
+            if adjusted_metric:
+                for slot in range(lane, count, stride):
+                    state.extension[row + slot] = state.reference[row + slot]
+                continue
+            # Damping limits steps that cross a sigmoid knee or a unilateral engagement boundary.
+            for slot in range(lane, count, stride):
+                i = row + slot
+                state.extension[i] += step_fraction * (output[i] - state.extension[i])
+        if lane == 0:
+            status[row] = -120
+        return False
+
+    return project_alm_material
+
+
+project_alm_material = _make_project_alm_material(False)
+project_alm_material_cooperative = _make_project_alm_material(True)
