@@ -56,6 +56,7 @@ from .particle_vbd_kernels import (
 )
 from .rigid_vbd_kernels import (
     _NUM_CONTACT_THREADS_PER_BODY,
+    RevoluteLimitALMState,
     RigidContactHistory,
     RigidForceElementAdjacencyInfo,
     _count_num_adjacent_joints,
@@ -80,6 +81,7 @@ from .rigid_vbd_kernels import (
     update_duals_body_body_contacts,
     update_duals_body_particle_contacts,
     update_duals_joint,
+    update_revolute_limit_alm,
 )
 from .tendon_kernels import (
     TendonForceElementAdjacencyInfo,
@@ -252,6 +254,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
         rigid_joint_angular_k_start: float = 1.0e1,  # Angular penalty seed (used when angular beta > 0)
         rigid_joint_linear_kd: float = 0.0,  # Rayleigh damping for non-cable linear joint constraints
         rigid_joint_angular_kd: float = 0.0,  # Rayleigh damping for non-cable angular joint constraints
+        rigid_joint_limit_alm: bool = False,
         rigid_tendon_relaxation: float = 0.7,  # Compatibility parameter; ignored
         tendon_max_sweeps: int = 256,
         tendon_settle_tol: float = 1.0e-3,
@@ -376,6 +379,9 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 Negative values are clamped to 0.
             rigid_joint_angular_kd: Rayleigh damping coefficient for non-cable angular joint constraints.
                 Negative values are clamped to 0.
+            rigid_joint_limit_alm: Experimental compliant augmented-Lagrangian revolute limits.
+                Retains the authored limit stiffness, with damping applied to penetration rate.
+                Other joint limits and structural joint constraints are unchanged. Default False.
             rigid_tendon_relaxation: Compatibility parameter retained for existing callers. Native VBD tendon
                 force elements do not use XPBD relaxation.
             tendon_max_sweeps: Maximum capstan material-relaxation sweeps per VBD iteration.
@@ -504,6 +510,10 @@ class SolverVBD(TendonStateMixin, SolverBase):
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
         # participate in particle-rigid interaction on the particle side.
         self.integrate_with_external_rigid_solver = integrate_with_external_rigid_solver
+        self._revolute_limit_alm = RevoluteLimitALMState()
+        self._revolute_limit_alm.enabled = rigid_joint_limit_alm
+        self._revolute_limit_alm.multiplier = wp.zeros(model.joint_count, dtype=wp.vec2, device=self.device)
+        self._revolute_limit_alm.penalty = wp.zeros(model.joint_count, dtype=float, device=self.device)
 
         # Initialize particle system
         self._init_particle_system(
@@ -2228,6 +2238,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
 
             if model.joint_count > 0:
                 # Warm-started lambda decays by alpha * gamma, while penalty k uses gamma only.
+                self._update_revolute_limits(state_in, dt, initialize=True)
                 joint_lambda_decay = self.rigid_joint_alpha * self.rigid_avbd_gamma
                 wp.launch(
                     kernel=step_joint_C0_lambda,
@@ -2836,6 +2847,38 @@ class SolverVBD(TendonStateMixin, SolverBase):
             device=self.device,
         )
 
+    def _update_revolute_limits(self, state, dt, *, initialize=False):
+        if not self._revolute_limit_alm.enabled or self.model.joint_count == 0:
+            return
+        model = self.model
+        wp.launch(
+            update_revolute_limit_alm,
+            dim=model.joint_count,
+            inputs=[
+                initialize,
+                dt,
+                state.body_q,
+                self.body_q_prev,
+                model.body_q,
+                self.body_inv_inertia_effective,
+                model.joint_type,
+                model.joint_enabled,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_X_p,
+                model.joint_X_c,
+                model.joint_axis,
+                model.joint_qd_start,
+                self.joint_rest_angle,
+                model.joint_limit_lower,
+                model.joint_limit_upper,
+                model.joint_limit_ke,
+                model.joint_limit_kd,
+                self._revolute_limit_alm,
+            ],
+            device=self.device,
+        )
+
     def _solve_rigid_body_iteration(
         self,
         state_in: State,
@@ -3026,6 +3069,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
                     self.rigid_joint_alpha,
                     model.joint_dof_dim,
                     self.joint_rest_angle,
+                    self._revolute_limit_alm,
                     self.body_forces,
                     self.body_torques,
                     self.body_hessian_ll,
@@ -3158,6 +3202,8 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 ],
                 device=self.device,
             )
+
+        self._update_revolute_limits(state_in, dt)
 
         if self.tendon_alm and model.tendon_segment_count > 0:
             # Dual ascent on the pose just produced by the colour sweeps, with the rest lengths

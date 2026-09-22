@@ -58,6 +58,34 @@ _STICK_FLAG_ANCHOR = wp.constant(1)
 _STICK_FLAG_DEADZONE = wp.constant(2)
 """contact_stick_flag value: anti-creep deadzone (sticking dynamic-dynamic contacts)"""
 
+
+@wp.struct
+class RevoluteLimitALMState:
+    """Optional per-joint lower/upper force multipliers and numerical penalty."""
+
+    enabled: bool
+    multiplier: wp.array[wp.vec2]
+    penalty: wp.array[float]
+
+
+@wp.func
+def compliant_limit_row(g: float, g_prev: float, ke: float, kd: float, dt: float, rho: float, lam: float):
+    """Unilateral compliant ALM row; at convergence lambda equals the physical force.
+
+    Eliminating the compliant auxiliary coordinate gives a Hessian rho*K/(rho+K)
+    rather than K. Updating lambda to this traction enforces the physical law
+    without putting its potentially enormous stiffness in each body-local solve.
+    """
+    # Damping acts on penetration, not on travel through the inactive gap.
+    stiffness = ke + kd / dt
+    force = stiffness * g - kd / dt * wp.max(g_prev, 0.0)
+    traction = wp.max((rho * force + stiffness * lam) / (rho + stiffness), 0.0)
+    hessian = float(0.0)
+    if traction > 0.0:
+        hessian = rho * stiffness / (rho + stiffness)
+    return traction, hessian
+
+
 # ---------------------------------
 # Helper classes and device functions
 # ---------------------------------
@@ -1013,6 +1041,87 @@ def _zero_force_hessian():
     return wp.vec3(0.0), wp.vec3(0.0), wp.mat33(0.0), wp.mat33(0.0), wp.mat33(0.0)
 
 
+@wp.kernel
+def update_revolute_limit_alm(
+    initialize: bool,
+    dt: float,
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    body_q_rest: wp.array[wp.transform],
+    body_inv_inertia: wp.array[wp.mat33],
+    joint_type: wp.array[int],
+    joint_enabled: wp.array[bool],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_qd_start: wp.array[int],
+    joint_rest_angle: wp.array[float],
+    joint_limit_lower: wp.array[float],
+    joint_limit_upper: wp.array[float],
+    joint_limit_ke: wp.array[float],
+    joint_limit_kd: wp.array[float],
+    state: RevoluteLimitALMState,
+):
+    j = wp.tid()
+    if joint_type[j] != JointType.REVOLUTE or not joint_enabled[j]:
+        state.multiplier[j] = wp.vec2(0.0)
+        return
+    dof = joint_qd_start[j]
+    if joint_limit_ke[dof] <= 0.0:
+        state.multiplier[j] = wp.vec2(0.0)
+        return
+    p = joint_parent[j]
+    c = joint_child[j]
+    qp = wp.transform_get_rotation(joint_X_p[j])
+    qp_prev = qp
+    qp_rest = qp
+    if p >= 0:
+        qp = wp.transform_get_rotation(body_q[p] * joint_X_p[j])
+        qp_prev = wp.transform_get_rotation(body_q_prev[p] * joint_X_p[j])
+        qp_rest = wp.transform_get_rotation(body_q_rest[p] * joint_X_p[j])
+    qc = wp.transform_get_rotation(body_q[c] * joint_X_c[j])
+    qc_prev = wp.transform_get_rotation(body_q_prev[c] * joint_X_c[j])
+    qc_rest = wp.transform_get_rotation(body_q_rest[c] * joint_X_c[j])
+    a = wp.normalize(joint_axis[dof])
+    kappa, _jac = compute_kappa_and_jacobian(qp, qc, qp_rest, qc_rest)
+    kappa_prev, jac_prev = compute_kappa_and_jacobian(qp_prev, qc_prev, qp_rest, qc_rest)
+    theta = wp.dot(a, kappa) + joint_rest_angle[dof]
+    theta_prev = wp.dot(a, kappa_prev) + joint_rest_angle[dof]
+    if initialize:
+        # Inertial-scale numerical penalty; the constitutive stiffness is unchanged.
+        axis = wp.transpose(jac_prev) * a
+        ac = wp.quat_rotate_inv(wp.transform_get_rotation(body_q_prev[c]), axis)
+        w = wp.dot(ac, body_inv_inertia[c] * ac)
+        if p >= 0:
+            ap = wp.quat_rotate_inv(wp.transform_get_rotation(body_q_prev[p]), axis)
+            w = w + wp.dot(ap, body_inv_inertia[p] * ap)
+        state.penalty[j] = 4.0 / wp.max(w * dt * dt, 1.0e-12)
+        state.multiplier[j] = wp.vec2(0.0)
+    else:
+        lam = state.multiplier[j]
+        lower, _h_lower = compliant_limit_row(
+            joint_limit_lower[dof] - theta,
+            joint_limit_lower[dof] - theta_prev,
+            joint_limit_ke[dof],
+            0.5 * joint_limit_kd[dof],
+            dt,
+            state.penalty[j],
+            lam[0],
+        )
+        upper, _h_upper = compliant_limit_row(
+            theta - joint_limit_upper[dof],
+            theta_prev - joint_limit_upper[dof],
+            joint_limit_ke[dof],
+            0.5 * joint_limit_kd[dof],
+            dt,
+            state.penalty[j],
+            lam[1],
+        )
+        state.multiplier[j] = wp.vec2(lower, upper)
+
+
 @wp.func
 def evaluate_joint_force_hessian(
     body_index: int,
@@ -1052,6 +1161,7 @@ def evaluate_joint_force_hessian(
     avbd_alpha: float,
     joint_dof_dim: wp.array2d[int],
     joint_rest_angle: wp.array[float],
+    limit_alm: RevoluteLimitALMState,
     dt: float,
 ):
     """Compute AVBD joint force and Hessian contributions for one body.
@@ -1069,7 +1179,8 @@ def evaluate_joint_force_hessian(
           - PRISMATIC: 3 scalars -> [linear, angular, lin_drive_limit]
           - D6: 2 + lin_count + ang_count scalars -> [linear, angular, per-DOF drive/limit]
         Drive/limit slots use AVBD-ramped stiffness via min(avbd_ke, model_ke).
-        Drive/limit forces remain penalty-only (no lambda or C0 state).
+        Drive/limit forces remain penalty-only unless the experimental revolute
+        limit ALM state is enabled.
     """
     jt = joint_type[joint_index]
     if (
@@ -1400,7 +1511,36 @@ def evaluate_joint_force_hessian(
             mode, err_pos = resolve_drive_limit_mode(theta_abs, target_pos, lim_lower, lim_upper, has_drive, has_limits)
             f_scalar = float(0.0)
             H_scalar = float(0.0)
-            if mode == _DRIVE_LIMIT_MODE_LIMIT_LOWER or mode == _DRIVE_LIMIT_MODE_LIMIT_UPPER:
+            if limit_alm.enabled and has_limits:
+                kappa_prev, _J_prev = compute_kappa_and_jacobian(q_wp_prev, q_wc_prev, q_wp_rest, q_wc_rest)
+                theta_prev = wp.dot(kappa_prev, a) + joint_rest_angle[dof_idx]
+                lam = limit_alm.multiplier[joint_index]
+                rho = limit_alm.penalty[joint_index]
+                lower, h_lower = compliant_limit_row(
+                    lim_lower - theta_abs,
+                    lim_lower - theta_prev,
+                    model_limit_ke,
+                    0.5 * lim_kd,
+                    dt,
+                    rho,
+                    lam[0],
+                )
+                upper, h_upper = compliant_limit_row(
+                    theta_abs - lim_upper,
+                    theta_prev - lim_upper,
+                    model_limit_ke,
+                    0.5 * lim_kd,
+                    dt,
+                    rho,
+                    lam[1],
+                )
+                f_scalar = upper - lower
+                H_scalar = h_lower + h_upper
+                if H_scalar == 0.0 and mode == _DRIVE_LIMIT_MODE_DRIVE:
+                    drive_d = 0.5 * drive_kd
+                    f_scalar = drive_ke * err_pos + drive_d * (dtheta_dt - target_vel)
+                    H_scalar = drive_ke + drive_d * inv_dt
+            elif mode == _DRIVE_LIMIT_MODE_LIMIT_LOWER or mode == _DRIVE_LIMIT_MODE_LIMIT_UPPER:
                 lim_d = 0.5 * lim_kd
                 f_scalar = lim_ke * err_pos + lim_d * dtheta_dt
                 H_scalar = lim_ke + lim_d * inv_dt
@@ -2941,6 +3081,7 @@ def solve_rigid_body(
     avbd_alpha: float,
     joint_dof_dim: wp.array2d[int],
     joint_rest_angle: wp.array[float],
+    limit_alm: RevoluteLimitALMState,
     external_forces: wp.array[wp.vec3],
     external_torques: wp.array[wp.vec3],
     external_hessian_ll: wp.array[wp.mat33],  # Linear-linear block from rigid contacts
@@ -3176,6 +3317,7 @@ def solve_rigid_body(
             avbd_alpha,
             joint_dof_dim,
             joint_rest_angle,
+            limit_alm,
             dt,
         )
 
