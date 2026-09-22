@@ -6,6 +6,7 @@
 import warp as wp
 
 from ..sim.tendon import TendonLinkType
+from .tendon_alm_material import TendonALMMaterialState, project_alm_material
 from .tendon_material import solve_tendon_material_component
 from .tendon_material_nonlinear import TendonMaterialNonlinearState, solve_tendon_material_nonlinear_component
 
@@ -13,6 +14,10 @@ from .tendon_material_nonlinear import TendonMaterialNonlinearState, solve_tendo
 @wp.struct
 class TendonMaterialState:
     enabled: bool
+    segment_alm: bool
+    process_changed_routes: bool
+    changed_routes: wp.array[int]
+    alm: TendonALMMaterialState
     nonlinear_enabled: bool
     nonlinear: TendonMaterialNonlinearState
     ea_low: float
@@ -121,6 +126,28 @@ def project_tendon_component(state: TendonMaterialState, row: int, count: int, t
     if state.count[row] != count:
         state.valid[row] = 0
     state.count[row] = count
+    if state.segment_alm:
+        if not project_alm_material(
+            state.alm,
+            state.ids,
+            state.initial,
+            state.compliance,
+            state.cap,
+            state.upper,
+            state.output,
+            state.status,
+            state.faces,
+            state.valid,
+            state.pieces,
+            row,
+            count,
+            state.ea_low,
+            state.ea_ratio,
+            state.transition_strain,
+            state.transition_width,
+        ):
+            return reject_tendon_material(state, state.status[row], tendon, row, latch)
+        return True
     if state.nonlinear_enabled:
         solve_tendon_material_nonlinear_component(
             state.nonlinear,
@@ -254,9 +281,13 @@ def transfer_tendon_material_direct(
         if state.ids[index] != seg:
             state.valid[row] = 0
         state.ids[index] = seg
-        state.initial[index] = seg_stretch[seg] + seg_compliance[seg] * seg_damping[seg]
-        state.compliance[index] = seg_compliance[seg]
-        state.upper[index] = (seg_length[seg] - min_rest) + seg_compliance[seg] * seg_damping[seg]
+        if state.segment_alm:
+            state.alm.reference[index] = seg_stretch[seg]
+        compliance = seg_compliance[seg]
+        offset = compliance * seg_damping[seg]
+        state.initial[index] = seg_stretch[seg] + offset
+        state.compliance[index] = compliance
+        state.upper[index] = (seg_length[seg] - min_rest) + offset
         if state.nonlinear_enabled:
             state.nonlinear.reference[index] = seg_stretch[seg]
             state.nonlinear.length[index] = seg_length[seg]
@@ -288,10 +319,17 @@ def transfer_tendon_material_direct(
         elif state.next_link[previous] < 0:
             row = seg
             count = 0
-        if state.nonlinear_enabled:
+        if state.nonlinear_enabled or state.segment_alm:
             seg_stretch[seg] = state.output[row + count]
+            if state.segment_alm and state.alm.force[row + count] == 0.0:
+                # Release a certified zero-force row exactly. Reconstructing a
+                # float rest length can erase its tiny negative extension; using
+                # that rounded extension for dual ascent would otherwise leave
+                # a positive multiplier decaying indefinitely towards underflow.
+                state.alm.multiplier[seg] = 0.0
         else:
-            seg_stretch[seg] = state.output[row + count] - seg_compliance[seg] * seg_damping[seg]
+            offset = seg_compliance[seg] * seg_damping[seg]
+            seg_stretch[seg] = state.output[row + count] - offset
         count += 1
         previous = seg
     return True

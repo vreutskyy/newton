@@ -21,7 +21,7 @@ from newton.tests.test_tendon_material_integration import _add_chain, _chain_mod
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
-def _make_solver(model, *, iterations=8, direct=True, settle_iterations=4):
+def _make_solver(model, *, iterations=8, direct=True, settle_iterations=4, **solver_options):
     """Use stiff undamped hinges so cable torque controls the free rotation."""
     model.body_color_groups = [wp.array([body], dtype=int, device=model.device) for body in range(model.body_count)]
     return newton.solvers.SolverVBD(
@@ -34,15 +34,19 @@ def _make_solver(model, *, iterations=8, direct=True, settle_iterations=4):
         rigid_joint_angular_k_start=1.0e8,
         tendon_settle_tol=0.0,
         tendon_material_direct=direct,
+        **solver_options,
     )
 
 
-def _simulate_pulley(*, dt=0.001, iterations=8, duration=0.18, velocity=0.2, preload=10.0, mu=1.0):
+def _simulate_pulley(
+    *, dt=0.001, iterations=8, duration=0.18, velocity=0.2, preload=10.0, mu=1.0, solver_options=None, damping=0.0
+):
     """Observe accepted poses and independent spring energy in the VBD path."""
     with wp.ScopedDevice("cpu"):
         model, pulley = _make_pulley()
         model.tendon_link_mu.fill_(mu)
-        solver = _make_solver(model, iterations=iterations)
+        model.tendon_seg_damping.fill_(damping)
+        solver = _make_solver(model, iterations=iterations, **(solver_options or {}))
         state, next_state, control = model.state(), model.state(), model.control()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state)
         body_velocity = state.body_qd.numpy().copy()
@@ -139,12 +143,17 @@ def _evaluate_body(
     cone_l: wp.array[int],
     cone_r: wp.array[int],
     cap: wp.array[float],
+    dt: float,
+    ea_low: float,
+    ea_ratio: float,
+    knee: float,
+    width: float,
     vectors: wp.array[wp.vec3],
     matrices: wp.array[wp.mat33],
 ):
     force, torque, h_ll, h_al, h_aa = evaluate_tendon_force_hessians(
         body,
-        0.001,
+        dt,
         body_q,
         body_q_prev,
         body_com,
@@ -164,10 +173,10 @@ def _evaluate_body(
         active,
         active_l,
         active_r,
-        0.0,
-        1.0,
-        0.0,
-        1.0,
+        ea_low,
+        ea_ratio,
+        knee,
+        width,
         alm_lambda,
         alm_k,
         alm_enabled,
@@ -183,12 +192,13 @@ def _evaluate_body(
     matrices[2] = h_aa
 
 
-def _body_force(model, solver, body, tension, *, direct=True, previous_poses=None):
+def _body_force(model, solver, body, tension, *, direct=True, previous_poses=None, dt=0.001):
     """Set a specified elastic load, then evaluate only the body force element."""
     # The normal VBD iteration updates these rows before its body solve.
     solver._update_tendon_cone_rows(model, model.body_q, False)
     length = np.linalg.norm(solver.tendon_seg_attachment_r.numpy() - solver.tendon_seg_attachment_l.numpy(), axis=1)
-    solver.tendon_seg_rest_length.assign(length - np.asarray(tension) * model.tendon_seg_compliance.numpy())
+    if tension is not None:
+        solver.tendon_seg_rest_length.assign(length - np.asarray(tension) * model.tendon_seg_compliance.numpy())
     vectors = wp.empty(2, dtype=wp.vec3, device=model.device)
     matrices = wp.empty(3, dtype=wp.mat33, device=model.device)
     previous = model.body_q
@@ -220,11 +230,16 @@ def _body_force(model, solver, body, tension, *, direct=True, previous_poses=Non
             solver.tendon_seg_active_link_r,
             solver.tendon_seg_alm_lambda,
             solver.tendon_seg_alm_k,
-            int(solver.tendon_alm),
+            (2 if solver.tendon_alm_per_segment else 1) if solver.tendon_alm else 0,
             direct,
             solver.tendon_link_cone_seg_l,
             solver.tendon_link_cone_seg_r,
             solver.tendon_link_cap_ratio,
+            dt,
+            solver.tendon_sigmoid_ea_low,
+            solver.tendon_sigmoid_ea_ratio,
+            solver.tendon_sigmoid_transition_strain,
+            solver.tendon_sigmoid_transition_width,
         ],
         outputs=[vectors, matrices],
         device=model.device,

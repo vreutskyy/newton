@@ -217,7 +217,7 @@ class TendonStateMixin:
         if failed.size:
             tendon = int(failed[0])
             code = int(failures[tendon])
-            names = {-102: "INVALID_ROUTE", -103: "COMPONENT_TOO_LARGE"}
+            names = {-102: "INVALID_ROUTE", -103: "COMPONENT_TOO_LARGE", -120: "ALM_FORCE_PROJECTION_FAILED"}
             try:
                 reason = (
                     TendonMaterialNonlinearStatus(code + 200).name if code < -200 else TendonMaterialStatus(code).name
@@ -368,6 +368,7 @@ class TendonStateMixin:
             # per frictionless cable) and broadcast into per-segment copies read by the force kernel, plus the
             # route each segment's multiplier belongs to and the per-tendon row choice
             # (-1 undecided, 0 legacy penalty row for soft cables, 1 ALM row; decided once, no chatter).
+            # The per-segment ALM experiment retains independent multipliers in these same arrays.
             if getattr(self, "tendon_alm", False):
                 self.tendon_seg_alm_lambda = wp.zeros(model.tendon_segment_count, dtype=float)
                 self.tendon_seg_alm_k = wp.zeros(model.tendon_segment_count, dtype=float)

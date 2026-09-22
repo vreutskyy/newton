@@ -21,7 +21,8 @@ from ...sim import (
 )
 from ..flags import SolverNotifyFlags
 from ..solver import SolverBase
-from ..tendon_kernels import update_tendon_attachments
+from ..tendon_alm_material import TendonALMMaterialState
+from ..tendon_kernels import solve_tendon_material_direct, update_tendon_attachments
 from ..tendon_state import TendonStateMixin
 from ..xpbd.kernels import apply_joint_forces
 from .particle_vbd_kernels import (
@@ -82,6 +83,7 @@ from .rigid_vbd_kernels import (
 )
 from .tendon_kernels import (
     TendonForceElementAdjacencyInfo,
+    deactivate_negative_tendon_wraps,
     snapshot_tendon_segment_length_reference,
     step_tendon_alm_state,
     update_duals_tendon,
@@ -262,6 +264,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
         tendon_sigmoid_transition_strain: float = 0.0,
         tendon_sigmoid_transition_width: float = 1.0,
         tendon_alm: bool = False,
+        tendon_alm_per_segment: bool = False,
         tendon_alm_penalty_scale: float = 5.0,
         tendon_alm_min_stiffness_ratio: float = 50.0,
         tendon_material_direct: bool = False,
@@ -399,6 +402,13 @@ class SolverVBD(TendonStateMixin, SolverBase):
             tendon_alm_penalty_scale: Penalty metric of the ALM row as a multiple of the tendon's inertial
                 support ``1 / (dt^2 * w)``. Small values leave the multiplier too slow to follow a stiff cable;
                 large values fall back towards penalty behaviour.
+            tendon_alm_per_segment: Experimental. Retain a multiplier per segment and use the same ALM
+                tension in the direct material projection and roller reactions. Requires ``tendon_alm``
+                and ``tendon_material_direct``. Nonlinear/damped rows use an experimental scalar
+                projection certified against the actual ALM forces. Positive damping is limited to
+                the taut extension created during the step, giving continuous slack engagement.
+                Check projection failures with :meth:`check_tendon_material`. Route changes reset
+                the affected tendon's multipliers.
             tendon_alm_min_stiffness_ratio: A tendon whose material stiffness is below this multiple of its
                 inertial support keeps the legacy penalty row. The ratio is the penalty row's conditioning number
                 (how much heavier the cable's stretch term is than the body's inertia term in the local solve);
@@ -477,6 +487,10 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 f"tendon_alm_min_stiffness_ratio must be non-negative, got {tendon_alm_min_stiffness_ratio}"
             )
         self.tendon_alm = bool(tendon_alm)
+        self.tendon_alm_per_segment = bool(tendon_alm_per_segment)
+        if self.tendon_alm_per_segment:
+            if not tendon_alm or not tendon_material_direct:
+                raise ValueError("tendon_alm_per_segment requires tendon_alm and tendon_material_direct")
         self.tendon_alm_penalty_scale = float(tendon_alm_penalty_scale)
         self.tendon_alm_min_stiffness_ratio = float(tendon_alm_min_stiffness_ratio)
         self.tendon_material_direct = tendon_material_direct
@@ -512,6 +526,25 @@ class SolverVBD(TendonStateMixin, SolverBase):
         # Routed tendon geometry and material state are shared with XPBD; VBD
         # evaluates their force and Hessian contributions natively.
         self._init_tendon_state(model, allocate_xpbd_lambdas=True)
+        if self.tendon_alm_per_segment:
+            self._tendon_material_state.segment_alm = True
+            self._tendon_material_state.changed_routes = wp.zeros(model.tendon_count, dtype=int, device=self.device)
+            self._tendon_material_state.alm = TendonALMMaterialState()
+            alm = self._tendon_material_state.alm
+            for name in ("reference", "extension", "offset", "force"):
+                setattr(alm, name, wp.zeros(model.tendon_segment_count, dtype=float, device=model.device))
+            alm.iterations = wp.zeros(model.tendon_segment_count, dtype=int, device=model.device)
+            alm.length = self.tendon_seg_length
+            alm.physical_compliance = self.tendon_seg_active_compliance
+            alm.damping = self.tendon_seg_active_damping
+            alm.damping_force = self.tendon_seg_damping_tension
+            alm.multiplier = self.tendon_seg_alm_lambda
+            alm.penalty = self.tendon_seg_alm_k
+            # Reference implementation: the nonlinear outer iteration uses the scalar
+            # global projection on both CPU and CUDA, without falling back to sweeps.
+            self._tendon_material_kernel = solve_tendon_material_direct
+            self._tendon_material_lanes = 1
+            self._tendon_material_block_dim = 256
 
         # Initialize rigid body system and rigid-particle (body-particle) interaction state
         self._init_rigid_system(
@@ -1798,7 +1831,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
             # This accepted state is also where the unsupported-wrap
             # diagnostic is meaningful (mid-iteration predictor overshoot is
             # not), so report it here.
-            self._update_tendon_routing(state_in, dt, True)
+            self._finalize_tendon_routing(state_in, dt)
             self._snapshot_tendon_segment_length_reference(state_in.body_q, dt)
 
         # Snapshot solved rigid contact state for next-frame warm-start.
@@ -2524,7 +2557,12 @@ class SolverVBD(TendonStateMixin, SolverBase):
         return min(self.tendon_material_direct_settle_iterations, max(self.iterations - 1, 0))
 
     def _update_tendon_routing(
-        self, state_in: State, dt: float, report_unsupported_wrap: bool, skip_material: bool = False
+        self,
+        state_in: State,
+        dt: float,
+        report_unsupported_wrap: bool,
+        skip_material: bool = False,
+        latch_failure: bool | None = None,
     ) -> None:
         """Update VBD routed-tendon geometry and rolling rest transfer for this iteration.
 
@@ -2583,6 +2621,10 @@ class SolverVBD(TendonStateMixin, SolverBase):
         # (or 1 um split span) carried a phantom stretch of half a span for the whole hold.
         # The accepted pose at the end of the step always solves the material.
         apply_transfer = int(not skip_material)
+        if latch_failure is None:
+            latch_failure = report_unsupported_wrap
+        if self.tendon_alm_per_segment:
+            self._tendon_material_state.alm.dt = dt
 
         wp.launch(
             kernel=self._tendon_material_kernel,
@@ -2638,10 +2680,49 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self._tendon_material_state,
                 # Latch a direct-material rejection only on the accepted pose. In-iteration poses
                 # (iteration 0 is the raw inertial predictor) are discarded by the solver itself.
-                int(report_unsupported_wrap),
+                int(latch_failure),
             ],
             device=self.device,
         )
+
+    def _finalize_tendon_routing(self, state_in: State, dt: float) -> None:
+        """Accept material, then merge dynamic rollers crossed during this step."""
+        if not self.tendon_alm_per_segment or not self._has_dynamic_tendon_links:
+            self._update_tendon_routing(state_in, dt, True)
+            return
+        model = self.model
+        self._update_tendon_routing(state_in, dt, False, latch_failure=True)
+        # Rebase on the just-accepted geometry/material before changing topology.
+        # Reusing the step-start ledger would apply its rolling transfer twice.
+        self._snapshot_tendon_step_state()
+        wp.launch(
+            deactivate_negative_tendon_wraps,
+            dim=model.tendon_count,
+            inputs=[
+                state_in.body_q,
+                model.tendon_start,
+                model.tendon_link_body,
+                model.tendon_link_type,
+                model.tendon_link_flags,
+                model.tendon_link_radius,
+                model.tendon_link_orientation,
+                model.tendon_link_offset,
+                model.tendon_link_axis,
+                self.tendon_link_cone_seg_l,
+                self.tendon_link_cone_seg_r,
+                self.tendon_seg_attachment_l,
+                self.tendon_seg_attachment_r,
+                self.tendon_link_active,
+                self.tendon_seg_alm_lambda,
+                self.tendon_seg_alm_k,
+                self._tendon_material_state.changed_routes,
+            ],
+            device=self.device,
+        )
+        self._prepare_tendon_route(model, state_in.body_q, 1.0e-8)
+        self._tendon_material_state.process_changed_routes = True
+        self._update_tendon_routing(state_in, dt, True)
+        self._tendon_material_state.process_changed_routes = False
 
     def _step_tendon_alm_state(self, dt: float) -> None:
         """Per-step compliant-ALM tendon maintenance from the step-start pose (``body_q_prev``)."""
@@ -2686,6 +2767,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_seg_alm_k,  # input/output
                 self.tendon_seg_alm_link_l,  # input/output
                 self.tendon_seg_alm_link_r,  # input/output
+                int(self.tendon_alm_per_segment),
             ],
             device=self.device,
         )
@@ -2742,7 +2824,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_sigmoid_transition_width,
                 self.tendon_seg_alm_lambda,
                 self.tendon_seg_alm_k,
-                int(self.tendon_alm),
+                (2 if self.tendon_alm_per_segment else 1) if self.tendon_alm else 0,
             ],
             outputs=[
                 self.tendon_seg_attachment_l,
@@ -2971,7 +3053,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
                     self.tendon_sigmoid_transition_width,
                     self.tendon_seg_alm_lambda,
                     self.tendon_seg_alm_k,
-                    int(self.tendon_alm),
+                    (2 if self.tendon_alm_per_segment else 1) if self.tendon_alm else 0,
                     self.tendon_material_direct,
                     self.tendon_link_cone_seg_l,
                     self.tendon_link_cone_seg_r,
@@ -3109,6 +3191,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
                     self.tendon_alm_k,  # input
                     self.tendon_seg_alm_lambda,  # input/output
                     self.tendon_seg_alm_k,  # input
+                    int(self.tendon_alm_per_segment),
                 ],
                 device=self.device,
             )

@@ -3,8 +3,10 @@
 
 import warp as wp
 
-from ...sim.tendon import TendonLinkType
+from ...sim.tendon import TendonLinkFlags, TendonLinkType
+from ..tendon_alm_material import alm_damping_rate
 from ..tendon_kernels import (
+    oriented_wrap_arc_length,
     tendon_material_tangent,
     tendon_material_tension,
     tendon_segment_length_rate_from_poses,
@@ -13,6 +15,68 @@ from ..tendon_kernels import (
 wp.set_module_options({"enable_backward": False})
 
 _MIN_TENDON_COMPLIANCE = wp.constant(1.0e-8)
+
+
+@wp.kernel
+def deactivate_negative_tendon_wraps(
+    body_q: wp.array[wp.transform],
+    tendon_start: wp.array[int],
+    link_body: wp.array[int],
+    link_type: wp.array[int],
+    link_flags: wp.array[int],
+    link_radius: wp.array[float],
+    link_orientation: wp.array[int],
+    link_offset: wp.array[wp.vec3],
+    link_axis: wp.array[wp.vec3],
+    cone_seg_l: wp.array[int],
+    cone_seg_r: wp.array[int],
+    attachment_l: wp.array[wp.vec3],
+    attachment_r: wp.array[wp.vec3],
+    link_active: wp.array[bool],
+    seg_alm_lambda: wp.array[float],
+    seg_alm_k: wp.array[float],
+    changed_routes: wp.array[int],
+):
+    """Release dynamic rollers crossed during the accepted body update.
+
+    Only deactivate here; activation still uses the step-start hysteresis test.
+    The caller snapshots the accepted material before this launch and then
+    rebuilds the route, including the signed arc in each deactivation merge.
+    """
+    tendon = wp.tid()
+    start = tendon_start[tendon]
+    end = tendon_start[tendon + 1]
+    changed = bool(False)
+    for link in range(start + 1, end - 1):
+        if (
+            link_type[link] != int(TendonLinkType.ROLLING)
+            or (link_flags[link] & int(TendonLinkFlags.DYNAMIC)) == 0
+            or not link_active[link]
+        ):
+            continue
+        left = cone_seg_l[link]
+        right = cone_seg_r[link]
+        if left < 0 or right < 0:
+            continue
+        pose = body_q[link_body[link]]
+        arc = oriented_wrap_arc_length(
+            attachment_r[left],
+            attachment_l[right],
+            wp.transform_point(pose, link_offset[link]),
+            link_radius[link],
+            wp.transform_vector(pose, link_axis[link]),
+            link_orientation[link],
+        )
+        if arc < 0.0:
+            link_active[link] = False
+            changed = True
+    if changed:
+        # The old dual rows no longer describe this route. Use the physical
+        # material law for the accepted merge; next step builds its new metrics.
+        for seg in range(start - tendon, end - tendon - 1):
+            seg_alm_lambda[seg] = 0.0
+            seg_alm_k[seg] = 0.0
+    changed_routes[tendon] = int(changed)
 
 
 @wp.struct
@@ -145,15 +209,18 @@ def update_tendon_segment_diagnostics(
     alm_rho = float(0.0)
     if alm_enabled != 0:
         alm_rho = seg_alm_k[seg]
-    if alm_rho > 0.0:
+    if alm_rho > 0.0 or alm_enabled == 2:
         # Report the ALM row's tension at the accepted pose (its own length rate and the multiplier after the last
-        # ascent), split so that ``material + damping`` is that tension: on a taut span material = T - damping,
-        # on a slack span the row applies no damping, so damping is reported as 0 and material = T >= 0.
+        # ascent), split so that ``max(material + damping, 0)`` is that tension.
+        # Shared ALM gates all slack damping; per-segment ALM clips positive damping
+        # continuously at engagement and retains negative damping to release a dual.
         stretch = length - seg_rest_length[seg]
         lam = seg_alm_lambda[seg]
         seg_lambda[seg] = lam
         seg_material_tension[seg] = 0.0
-        if stretch <= 0.0:
+        if alm_enabled == 2:
+            seg_damping_tension[seg] = seg_active_damping[seg] * alm_damping_rate(stretch, length_rate, dt)
+        elif stretch <= 0.0:
             seg_damping_tension[seg] = 0.0
         if stretch > 0.0 or lam > 0.0:
             k_sec = _tendon_secant_stiffness(
@@ -166,7 +233,7 @@ def update_tendon_segment_diagnostics(
                 sigmoid_transition_width,
             )
             alm_tension, _alm_k_eff = _tendon_alm_row(
-                k_sec, seg_active_damping[seg], dt, stretch, length_rate, seg_alm_k[seg], lam
+                k_sec, seg_active_damping[seg], dt, stretch, length_rate, seg_alm_k[seg], lam, alm_enabled
             )
             seg_material_tension[seg] = wp.max(alm_tension, 0.0) - seg_damping_tension[seg]
 
@@ -270,6 +337,15 @@ def _rolling_spin_axis_component(
 # 52-70 N on the slider span, against 0.01 deg / 0.01 N with the shared row). The shared row is stable because the
 # bodies only see the tendon's total stretch, which the material transfer conserves. A route change (dynamic routing)
 # resets the tendon's multiplier, so a roller that activates every step keeps the row soft until the ascent rebuilds it.
+#
+# The opt-in per-segment experiment replaces that shared ascent. In the linear undamped case:
+#     T_s = max((e_s + lambda_s/rho_s) / (C_s + 1/rho_s), 0), lambda_s <- T_s.
+# The direct material projection uses these SAME forces (shifted extensions and compliances),
+# not the ordinary constitutive tension. It conserves physical rest length after undoing the shift.
+# At a fixed point lambda_s = max(e_s/C_s, 0), without requiring equality across frictional rollers.
+# With damping/sigmoid material, the material projection re-evaluates the same secant row and
+# certifies the resulting forces. Mode 2 uses timestep-limited positive damping at engagement;
+# mode 1 retains the original shared-ALM force law.
 
 _TENDON_ALM_STRETCH_EPS = wp.constant(1.0e-9)
 
@@ -317,10 +393,13 @@ def _tendon_alm_row(
     stretch_rate: float,
     rho: float,
     lam: float,
+    mode: int,
 ):
     """Compliant-ALM stretch row: returns ``(tension, effective_stiffness)`` for the body solve."""
     row_k = k_sec + damping / dt
-    if stretch <= 0.0:
+    if mode == 2:
+        stretch_rate = alm_damping_rate(stretch, stretch_rate, dt)
+    elif stretch <= 0.0:
         # Slack span: damping must not make it transmit tension; only a stored multiplier can still pull.
         stretch_rate = 0.0
     e_row = (k_sec * stretch + damping * stretch_rate) / row_k
@@ -332,6 +411,26 @@ def _tendon_alm_row(
     s = row_k / (row_k + rho)
     k_eff = row_k * rho / (row_k + rho)
     return k_eff * e_row + s * lam, k_eff
+
+
+@wp.func
+def _tendon_alm_body_stiffness(
+    k_sec: float, k_tangent: float, damping: float, dt: float, stretch: float, rho: float, lam: float, tension: float
+) -> float:
+    """Local body-force derivative, holding rest lengths and multipliers fixed."""
+    row_k = k_sec + damping / dt
+    physical_tangent = k_tangent + damping / dt
+    if rho <= 0.0:
+        return physical_tangent
+    secant_derivative = float(0.0)
+    if stretch > 0.0:
+        secant_derivative = (k_tangent - k_sec) / stretch
+    # T = (rho * F + row_k * lambda) / (rho + row_k).
+    # row_k changes with extension for nonlinear material; differentiating
+    # only F misses the derivative of both the numerator and denominator.
+    tangent = (rho * physical_tangent + secant_derivative * (lam - tension)) / (rho + row_k)
+    # VBD needs a positive local metric even away from a stationary dual.
+    return wp.max(tangent, row_k * rho / (row_k + rho))
 
 
 @wp.func
@@ -413,8 +512,14 @@ def step_tendon_alm_state(
     seg_alm_k: wp.array[float],
     seg_alm_link_l: wp.array[wp.int32],
     seg_alm_link_r: wp.array[wp.int32],
+    per_segment: int,
 ):
     """Per-step compliant-ALM tendon maintenance (mirror of ``step_joint_C0_lambda``), one thread per tendon.
+
+    With ``per_segment`` enabled, retain the individual segment multipliers instead of broadcasting
+    the shared multiplier, and use each row's own inertial support for its penalty. Immobile rows
+    keep the physical constitutive law: they do not have a body-motion constraint to regularize.
+    The per-tendon soft-cable guard is unchanged.
 
     The multiplier and the penalty metric are shared along the tendon: a frictionless routed cable carries one
     tension, and the rest-length transfer in the material solve equalizes the segments' stretch, so a uniform row
@@ -440,6 +545,8 @@ def step_tendon_alm_state(
     route_changed = int(0)
     for s in range(num_segs):
         seg = seg_offset + s
+        if per_segment != 0:
+            seg_alm_k[seg] = 0.0
         if seg_active[seg] == 0:
             if seg_alm_link_l[seg] != -1 or seg_alm_link_r[seg] != -1:
                 route_changed = 1
@@ -554,6 +661,8 @@ def step_tendon_alm_state(
                 sigmoid_transition_width,
             )
             support = 1.0 / (dt * dt * w)
+            if per_segment != 0:
+                seg_alm_k[seg] = wp.min(penalty_scale * support, k_sec)
             rho_cap = wp.min(rho_cap, k_sec)
             k_sec_min = wp.min(k_sec_min, k_sec)
             support_min = wp.min(support_min, support)
@@ -588,8 +697,24 @@ def step_tendon_alm_state(
             seg_alm_lambda[seg] = 0.0
             seg_alm_k[seg] = 0.0
         else:
-            seg_alm_lambda[seg] = lam
-            seg_alm_k[seg] = rho
+            row_rho = rho
+            if per_segment != 0:
+                # A zero-mobility row needs no inertial regularization. Broadcasting
+                # a finite rho to it creates an artificial maximum force at its
+                # minimum rest length, making short rigidly routed spans infeasible.
+                row_rho = seg_alm_k[seg]
+                if mode == 0:
+                    row_rho = 0.0
+                retained = wp.max(lambda_decay * seg_alm_lambda[seg], 0.0)
+                if route_changed != 0 or row_rho <= 0.0:
+                    retained = 0.0
+                seg_alm_lambda[seg] = retained
+            else:
+                seg_alm_lambda[seg] = lam
+            seg_alm_k[seg] = row_rho
+    if per_segment != 0:
+        # There is no shared tension when rollers can sustain friction.
+        tendon_alm_lambda[tendon_id] = 0.0
 
 
 @wp.kernel
@@ -619,8 +744,11 @@ def update_duals_tendon(
     tendon_alm_k: wp.array[float],
     seg_alm_lambda: wp.array[float],
     seg_alm_k: wp.array[float],
+    per_segment: int,
 ):
     """Per-iteration dual ascent of the shared stretch multiplier of each tendon (after all colour sweeps).
+
+    The ``per_segment`` experiment instead updates each segment's force row independently.
 
     Series-cable row: total effective stretch and series stiffness over the tendon's loaded segments (see the module
     comment), evaluated on the pose the colour sweeps just produced with the rest lengths this iteration's material
@@ -630,6 +758,66 @@ def update_duals_tendon(
     link_start = tendon_start[tendon_id]
     num_segs = tendon_start[tendon_id + 1] - link_start - 1
     seg_offset = link_start - tendon_id
+
+    if per_segment != 0:
+        for s in range(num_segs):
+            seg = seg_offset + s
+            rho_seg = seg_alm_k[seg]
+            if seg_active[seg] == 0 or rho_seg <= 0.0:
+                seg_alm_lambda[seg] = 0.0
+                continue
+            link_l = seg_active_link_l[seg]
+            link_r = seg_active_link_r[seg]
+            attachment_l = wp.transform_point(body_q[tendon_link_body[link_l]], seg_attachment_l_local[seg])
+            attachment_r = wp.transform_point(body_q[tendon_link_body[link_r]], seg_attachment_r_local[seg])
+            length = wp.length(attachment_r - attachment_l)
+            stretch = length - seg_rest_length[seg]
+            compliance = wp.max(seg_active_compliance[seg], _MIN_TENDON_COMPLIANCE)
+            stiffness = _tendon_secant_stiffness(
+                length,
+                seg_rest_length[seg],
+                compliance,
+                sigmoid_ea_low,
+                sigmoid_ea_ratio,
+                sigmoid_transition_strain,
+                sigmoid_transition_width,
+            )
+            rate = tendon_segment_length_rate_from_poses(
+                dt,
+                body_q,
+                body_q_prev,
+                body_com,
+                tendon_link_body,
+                tendon_link_type,
+                tendon_link_offset,
+                tendon_link_axis,
+                link_l,
+                link_r,
+                seg_attachment_l_local[seg],
+                seg_attachment_r_local[seg],
+                attachment_l,
+                attachment_r,
+            )
+            tension, _ = _tendon_alm_row(
+                stiffness,
+                seg_active_damping[seg],
+                dt,
+                stretch,
+                rate,
+                rho_seg,
+                seg_alm_lambda[seg],
+                2,
+            )
+            tension = wp.max(tension, 0.0)
+            if stretch <= 0.0 and tension < seg_alm_lambda[seg] and length - tension / stiffness == length:
+                # At zero stretch a releasing dual otherwise decays forever:
+                # its elastic extension is lost when the next iteration forms
+                # length - rest in float. Release it when that extension is
+                # unrepresentable, not at an arbitrary force threshold.
+                tension = 0.0
+            seg_alm_lambda[seg] = tension
+        tendon_alm_lambda[tendon_id] = 0.0
+        return
 
     lam = tendon_alm_lambda[tendon_id]
     rho = tendon_alm_k[tendon_id]
@@ -733,6 +921,9 @@ def _direct_tendon_span_tension(
     sigmoid_ea_ratio: float,
     sigmoid_transition_strain: float,
     sigmoid_transition_width: float,
+    seg_alm_lambda: wp.array[float],
+    seg_alm_k: wp.array[float],
+    alm_enabled: int,
 ) -> float:
     """Evaluate the selected VBD material law at the current trial poses."""
     link_l = seg_active_link_l[seg]
@@ -742,7 +933,49 @@ def _direct_tendon_span_tension(
     length = wp.length(attachment_r - attachment_l)
     rest_length = seg_rest_length[seg]
     # Preserve the VBD slack/damping gate used by the body force assembly.
-    if length <= 1.0e-8 or length <= rest_length:
+    if length <= 1.0e-8:
+        return 0.0
+    if alm_enabled != 0:
+        rho = seg_alm_k[seg]
+        if rho > 0.0 or alm_enabled == 2:
+            compliance = wp.max(seg_active_compliance[seg], _MIN_TENDON_COMPLIANCE)
+            rate = tendon_segment_length_rate_from_poses(
+                dt,
+                body_q,
+                body_q_prev,
+                body_com,
+                tendon_link_body,
+                tendon_link_type,
+                tendon_link_offset,
+                tendon_link_axis,
+                link_l,
+                link_r,
+                seg_attachment_l_local[seg],
+                seg_attachment_r_local[seg],
+                attachment_l,
+                attachment_r,
+            )
+            stiffness = _tendon_secant_stiffness(
+                length,
+                rest_length,
+                compliance,
+                sigmoid_ea_low,
+                sigmoid_ea_ratio,
+                sigmoid_transition_strain,
+                sigmoid_transition_width,
+            )
+            tension, _ = _tendon_alm_row(
+                stiffness,
+                seg_active_damping[seg],
+                dt,
+                length - rest_length,
+                rate,
+                rho,
+                seg_alm_lambda[seg],
+                alm_enabled,
+            )
+            return wp.max(tension, 0.0)
+    if length <= rest_length:
         return 0.0
     compliance = wp.max(seg_active_compliance[seg], _MIN_TENDON_COMPLIANCE)
     length_rate = tendon_segment_length_rate_from_poses(
@@ -804,6 +1037,9 @@ def _direct_rolling_spin_axis_component(
     sigmoid_ea_ratio: float,
     sigmoid_transition_strain: float,
     sigmoid_transition_width: float,
+    seg_alm_lambda: wp.array[float],
+    seg_alm_k: wp.array[float],
+    alm_enabled: int,
 ) -> wp.vec3:
     """Remove only the rim moment forbidden by the direct material cone.
 
@@ -848,6 +1084,9 @@ def _direct_rolling_spin_axis_component(
             sigmoid_ea_ratio,
             sigmoid_transition_strain,
             sigmoid_transition_width,
+            seg_alm_lambda,
+            seg_alm_k,
+            alm_enabled,
         )
         tension_r = _direct_tendon_span_tension(
             seg_right,
@@ -870,6 +1109,9 @@ def _direct_rolling_spin_axis_component(
             sigmoid_ea_ratio,
             sigmoid_transition_strain,
             sigmoid_transition_width,
+            seg_alm_lambda,
+            seg_alm_k,
+            alm_enabled,
         )
         beta = (cap_ratio - 1.0) / (cap_ratio + 1.0)
         allowed_difference = beta * (tension_l + tension_r)
@@ -960,7 +1202,7 @@ def evaluate_tendon_force_hessians(
         alm_rho = float(0.0)
         if alm_enabled != 0:
             alm_rho = seg_alm_k[seg]
-        if alm_enabled == 0 or alm_rho <= 0.0:
+        if alm_enabled == 0 or (alm_rho <= 0.0 and alm_enabled != 2):
             if length <= rest_length:
                 continue
 
@@ -1042,10 +1284,23 @@ def evaluate_tendon_force_hessians(
                 sigmoid_transition_width,
             )
             alm_tension, alm_k_eff = _tendon_alm_row(
-                k_sec, seg_active_damping[seg], dt, stretch, length_rate, seg_alm_k[seg], lam
+                k_sec, seg_active_damping[seg], dt, stretch, length_rate, seg_alm_k[seg], lam, alm_enabled
             )
             tension = wp.max(alm_tension, 0.0)
             effective_stiffness = alm_k_eff
+            if alm_enabled == 2 and sigmoid_ea_low > 0.0:
+                k_tangent = tendon_material_tangent(
+                    length,
+                    rest_length,
+                    compliance,
+                    sigmoid_ea_low,
+                    sigmoid_ea_ratio,
+                    sigmoid_transition_strain,
+                    sigmoid_transition_width,
+                )
+                effective_stiffness = _tendon_alm_body_stiffness(
+                    k_sec, k_tangent, seg_active_damping[seg], dt, stretch, seg_alm_k[seg], lam, alm_tension
+                )
 
         if tension <= 0.0:
             continue
@@ -1086,6 +1341,9 @@ def evaluate_tendon_force_hessians(
                     sigmoid_ea_ratio,
                     sigmoid_transition_strain,
                     sigmoid_transition_width,
+                    seg_alm_lambda,
+                    seg_alm_k,
+                    alm_enabled,
                 )
                 fix_r = _direct_rolling_spin_axis_component(
                     dt,
@@ -1114,6 +1372,9 @@ def evaluate_tendon_force_hessians(
                     sigmoid_ea_ratio,
                     sigmoid_transition_strain,
                     sigmoid_transition_width,
+                    seg_alm_lambda,
+                    seg_alm_k,
+                    alm_enabled,
                 )
             else:
                 fix_l = _rolling_spin_axis_component(
@@ -1195,6 +1456,9 @@ def evaluate_tendon_force_hessians(
                 sigmoid_ea_ratio,
                 sigmoid_transition_strain,
                 sigmoid_transition_width,
+                seg_alm_lambda,
+                seg_alm_k,
+                alm_enabled,
             )
             moment_axis = moment_axis - spin_fix
             endpoint_sign = 1.0 if body == body_l else -1.0

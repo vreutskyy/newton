@@ -64,6 +64,9 @@ def _trial_tension(
         10.0,
         0.01,
         0.003,
+        damping,  # Unused ALM arrays: this test exercises the constitutive path.
+        damping,
+        0,
     )
 
 

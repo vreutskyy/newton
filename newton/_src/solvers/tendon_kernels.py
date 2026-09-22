@@ -1173,6 +1173,8 @@ def _make_solve_tendon_material(direct_enabled: bool):
         """
         tendon_id = wp.tid()
         if wp.static(direct_enabled):
+            if direct.process_changed_routes and direct.changed_routes[tendon_id] == 0:
+                return
             if direct.failure[tendon_id] != 0:
                 return
         link_start = tendon_start[tendon_id]
