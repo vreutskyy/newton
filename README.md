@@ -301,6 +301,14 @@ If you installed from source with uv, substitute `uv run` for `python` in the co
     </td>
   </tr>
   <tr>
+    <td align="center" width="33%">
+      <a href="newton/examples/cable/example_roller_profiles.py">
+        <img width="320" src="docs/images/examples/example_roller_profiles.jpg" alt="Loaded circular, elliptical, and sector rollers">
+      </a>
+      <br><code>python -m newton.examples roller_profiles</code>
+    </td>
+  </tr>
+  <tr>
     <td colspan="3"><h3>Cloth Examples</h3></td>
   </tr>
   <tr>

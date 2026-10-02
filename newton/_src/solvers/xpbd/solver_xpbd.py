@@ -140,6 +140,8 @@ class SolverXPBD(TendonStateMixin, SolverBase):
         self.tendon_sigmoid_ea_ratio = tendon_sigmoid_ea_ratio
         self.tendon_sigmoid_transition_strain = tendon_sigmoid_transition_strain
         self.tendon_sigmoid_transition_width = tendon_sigmoid_transition_width
+        if model.tendon_profile_routing:
+            raise NotImplementedError("Explicit roller profiles are currently VBD-only")
 
         self.soft_body_relaxation = soft_body_relaxation
         self.soft_contact_relaxation = soft_contact_relaxation
@@ -813,6 +815,7 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                                 self.tendon_sigmoid_ea_ratio,
                                 self.tendon_sigmoid_transition_strain,
                                 self.tendon_sigmoid_transition_width,
+                                model.tendon_profile_routing,
                             ],
                             device=model.device,
                         )

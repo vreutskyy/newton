@@ -21,6 +21,7 @@ class TendonForceElementAdjacencyInfo:
 
     body_adj_segments: wp.array[wp.int32]
     body_adj_segments_offsets: wp.array[wp.int32]
+    profile_routing: bool
 
     def to(self, device):
         """Copy the adjacency to a device."""
@@ -30,6 +31,7 @@ class TendonForceElementAdjacencyInfo:
         adjacency = TendonForceElementAdjacencyInfo()
         adjacency.body_adj_segments = self.body_adj_segments.to(device)
         adjacency.body_adj_segments_offsets = self.body_adj_segments_offsets.to(device)
+        adjacency.profile_routing = self.profile_routing
         return adjacency
 
 
@@ -48,6 +50,7 @@ def snapshot_tendon_segment_length_reference(
     seg_active: wp.array[int],
     seg_active_link_l: wp.array[int],
     seg_active_link_r: wp.array[int],
+    profile_routing: bool,
     seg_length_prev: wp.array[float],
 ):
     """Snapshot previous-pose segment lengths for final VBD diagnostics."""
@@ -77,6 +80,7 @@ def snapshot_tendon_segment_length_reference(
         seg_attachment_r_local[seg],
         attachment_l,
         attachment_r,
+        not profile_routing,
     )
     seg_length_prev[seg] = wp.length(attachment_r - attachment_l) - dt * length_rate
 
@@ -281,6 +285,7 @@ def evaluate_tendon_force_hessians(
             seg_attachment_r_local[seg],
             attachment_l,
             attachment_r,
+            not adjacency.profile_routing,
         )
 
         stiffness = 1.0 / compliance
@@ -314,6 +319,9 @@ def evaluate_tendon_force_hessians(
             continue
 
         if body_l == body_r:
+            if adjacency.profile_routing:
+                # Internal span endpoint loads cancel on the same rigid body.
+                continue
             # Both endpoints ride this body: the endpoint forces and their base
             # torques cancel exactly, but the rolling spin corrections are
             # asymmetric, leaving a net roller-axis torque — the same net row
@@ -372,7 +380,7 @@ def evaluate_tendon_force_hessians(
         moment_axis = wp.cross(moment_arm, direction)
         body_torque = wp.cross(moment_arm, body_force)
 
-        if tendon_link_type[link] == int(TendonLinkType.ROLLING):
+        if tendon_link_type[link] == int(TendonLinkType.ROLLING) and not adjacency.profile_routing:
             # Free-span tension still loads the body, but only capstan friction
             # transmits the rolling-axis part of its moment.
             seg_left = tendon_link_seg_left[link]

@@ -364,6 +364,12 @@ class Model:
         """Total number of tendon links (waypoints) across all tendons."""
         self.tendon_segment_count: int = 0
         """Total number of tendon segments (= tendon_link_count - tendon_count)."""
+        self.tendon_profile_routing: bool = False
+        """Whether prescribed VBD roller-profile routing is enabled (experimental)."""
+        self.tendon_link_profile = None
+        """Private packed roller profiles; anchors and pinholes are points."""
+        self.tendon_link_profile_axis: wp.array[wp.vec3] | None = None
+        """Body-local profile +X axes [dimensionless], shape [tendon_link_count]."""
         self.tendon_start: wp.array[wp.int32] | None = None
         """Start index into link arrays for each tendon, shape [tendon_count + 1], int."""
         self.tendon_link_body: wp.array[wp.int32] | None = None

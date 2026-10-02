@@ -1474,6 +1474,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
     def _compute_tendon_force_element_adjacency(self, model: Model) -> TendonForceElementAdjacencyInfo:
         """Build CSR adjacency for authored and possible dynamic bypass segments."""
         adjacency = TendonForceElementAdjacencyInfo()
+        adjacency.profile_routing = model.tendon_profile_routing
         body_segments = [set() for _ in range(model.body_count)]
         body_colors = np.full(model.body_count, -1, dtype=np.int32)
         for color, group in enumerate(model.body_color_groups):
@@ -2439,38 +2440,41 @@ class SolverVBD(TendonStateMixin, SolverBase):
         if model.tendon_segment_count == 0 or state_in.body_q is None:
             return
 
-        wp.launch(
-            kernel=update_tendon_attachments,
-            dim=model.tendon_segment_count,
-            inputs=[
-                state_in.body_q,
-                model.tendon_link_body,
-                model.tendon_link_type,
-                model.tendon_link_flags,
-                model.tendon_link_radius,
-                model.tendon_link_orientation,
-                model.tendon_link_offset,
-                model.tendon_link_axis,
-                self.tendon_seg_active,
-                self.tendon_seg_active_link_l,
-                self.tendon_seg_active_link_r,
-                self.tendon_link_active,
-                self.tendon_link_active_step,
-                self.tendon_seg_attachment_l_local_step,
-                self.tendon_seg_attachment_r_local_step,
-                1,
-            ],
-            outputs=[
-                self.tendon_seg_attachment_l,
-                self.tendon_seg_attachment_r,
-                self.tendon_seg_attachment_l_local,
-                self.tendon_seg_attachment_r_local,
-                self.tendon_seg_rolling_delta_l,
-                self.tendon_seg_rolling_delta_r,
-                self.tendon_seg_length,
-            ],
-            device=self.device,
-        )
+        if model.tendon_profile_routing:
+            self._update_profile_attachments(state_in.body_q, rolling=True)
+        else:
+            wp.launch(
+                kernel=update_tendon_attachments,
+                dim=model.tendon_segment_count,
+                inputs=[
+                    state_in.body_q,
+                    model.tendon_link_body,
+                    model.tendon_link_type,
+                    model.tendon_link_flags,
+                    model.tendon_link_radius,
+                    model.tendon_link_orientation,
+                    model.tendon_link_offset,
+                    model.tendon_link_axis,
+                    self.tendon_seg_active,
+                    self.tendon_seg_active_link_l,
+                    self.tendon_seg_active_link_r,
+                    self.tendon_link_active,
+                    self.tendon_link_active_step,
+                    self.tendon_seg_attachment_l_local_step,
+                    self.tendon_seg_attachment_r_local_step,
+                    1,
+                ],
+                outputs=[
+                    self.tendon_seg_attachment_l,
+                    self.tendon_seg_attachment_r,
+                    self.tendon_seg_attachment_l_local,
+                    self.tendon_seg_attachment_r_local,
+                    self.tendon_seg_rolling_delta_l,
+                    self.tendon_seg_rolling_delta_r,
+                    self.tendon_seg_length,
+                ],
+                device=self.device,
+            )
 
         self._update_tendon_cone_rows(model, state_in.body_q, report_unsupported_wrap)
 
@@ -2523,6 +2527,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_sigmoid_ea_ratio,
                 self.tendon_sigmoid_transition_strain,
                 self.tendon_sigmoid_transition_width,
+                model.tendon_profile_routing,
             ],
             device=self.device,
         )
@@ -2549,6 +2554,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_seg_active,
                 self.tendon_seg_active_link_l,
                 self.tendon_seg_active_link_r,
+                model.tendon_profile_routing,
             ],
             outputs=[self.tendon_seg_delta_lambda],
             device=self.device,
@@ -2640,13 +2646,21 @@ class SolverVBD(TendonStateMixin, SolverBase):
         self.body_hessian_al.zero_()
         self.body_hessian_ll.zero_()
 
-        self._update_tendon_routing(state_in, dt, report_unsupported_wrap)
+        if not model.tendon_profile_routing:
+            self._update_tendon_routing(state_in, dt, report_unsupported_wrap)
 
         body_color_groups = model.body_color_groups
 
         # Gauss-Seidel-style per-color updates
         for color in range(len(body_color_groups)):
             color_group = body_color_groups[color]
+
+            if model.tendon_profile_routing:
+                # Profiles use the actual endpoint moments. A preceding body
+                # color can change the tension balance, so reproject material
+                # before evaluating these moments at the new pose. Otherwise
+                # even a frictionless circle receives a spurious spin torque.
+                self._update_tendon_routing(state_in, dt, report_unsupported_wrap and color == 0)
 
             # Accumulate body-particle contact forces/hessians for bodies in this color
             if model.particle_count > 0 and contacts is not None:

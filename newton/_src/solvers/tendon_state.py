@@ -10,6 +10,8 @@ mapping before applying their own numerical solve.
 
 from __future__ import annotations
 
+from itertools import pairwise
+
 import numpy as np
 import warp as wp
 
@@ -106,6 +108,14 @@ class TendonStateMixin:
 
     def _init_tendon_state(self, model: Model, allocate_xpbd_lambdas: bool = True) -> None:
         """Allocate mutable tendon state arrays and build segment/link mappings."""
+        if model.tendon_profile_routing:
+            self.tendon_profile_tangent_status = wp.zeros(model.tendon_segment_count, dtype=int, device=model.device)
+            self.tendon_profile_wrap_status = wp.zeros(model.tendon_link_count, dtype=int, device=model.device)
+            self.tendon_profile_wrap_length = wp.zeros(model.tendon_link_count, dtype=float, device=model.device)
+            self.tendon_profile_parameter_l = wp.zeros(model.tendon_segment_count, dtype=float, device=model.device)
+            self.tendon_profile_parameter_r = wp.zeros_like(self.tendon_profile_parameter_l)
+            self.tendon_profile_parameter_l_step = wp.zeros_like(self.tendon_profile_parameter_l)
+            self.tendon_profile_parameter_r_step = wp.zeros_like(self.tendon_profile_parameter_l)
         self._has_dynamic_tendon_links = False
         # Solver-level cable cone parameters (a solver may override before calling this).
         if not hasattr(self, "tendon_max_sweeps"):
@@ -278,6 +288,9 @@ class TendonStateMixin:
         wp.copy(self.tendon_seg_rest_length_step, self.tendon_seg_rest_length)
         wp.copy(self.tendon_seg_attachment_l_local_step, self.tendon_seg_attachment_l_local)
         wp.copy(self.tendon_seg_attachment_r_local_step, self.tendon_seg_attachment_r_local)
+        if self.model.tendon_profile_routing:
+            wp.copy(self.tendon_profile_parameter_l_step, self.tendon_profile_parameter_l)
+            wp.copy(self.tendon_profile_parameter_r_step, self.tendon_profile_parameter_r)
         if self._has_dynamic_tendon_links:
             wp.launch(
                 kernel=snapshot_tendon_link_active,
@@ -360,6 +373,9 @@ class TendonStateMixin:
         report_unsupported_wrap: bool,
     ) -> None:
         """Cache geometry-dependent segment pairs and capstan ratios for material rows."""
+        if model.tendon_profile_routing:
+            self._update_profile_cones(body_q, report_unsupported_wrap)
+            return
         wp.launch(
             kernel=update_tendon_cone_rows,
             dim=model.tendon_link_count,
@@ -450,6 +466,77 @@ class TendonStateMixin:
 
         return route_rest, route_seg_mask
 
+    def _update_profile_attachments(self, body_q: wp.array[wp.transform], *, rolling: bool) -> None:
+        """Update the experimental prescribed-profile route on the simulation device."""
+        from .roller_profile_kernels import update_profile_attachments  # noqa: PLC0415
+
+        m = self.model
+        wp.launch(
+            update_profile_attachments,
+            dim=m.tendon_segment_count,
+            inputs=[
+                body_q,
+                m.tendon_link_body,
+                m.tendon_link_orientation,
+                m.tendon_link_offset,
+                m.tendon_link_axis,
+                m.tendon_link_profile_axis,
+                m.tendon_link_profile,
+                self.tendon_seg_active_link_l,
+                self.tendon_seg_active_link_r,
+                self.tendon_profile_parameter_l_step,
+                self.tendon_profile_parameter_r_step,
+                rolling,
+            ],
+            outputs=[
+                self.tendon_seg_attachment_l,
+                self.tendon_seg_attachment_r,
+                self.tendon_seg_attachment_l_local,
+                self.tendon_seg_attachment_r_local,
+                self.tendon_seg_rolling_delta_l,
+                self.tendon_seg_rolling_delta_r,
+                self.tendon_seg_length,
+                self.tendon_profile_tangent_status,
+                self.tendon_profile_parameter_l,
+                self.tendon_profile_parameter_r,
+            ],
+            device=m.device,
+        )
+
+    def _update_profile_cones(self, body_q: wp.array[wp.transform], report: bool) -> None:
+        """Refresh wrapped lengths and capstan bounds for the prescribed profile route."""
+        from .roller_profile_kernels import update_profile_cones  # noqa: PLC0415
+
+        m = self.model
+        wp.launch(
+            update_profile_cones,
+            dim=m.tendon_link_count,
+            inputs=[
+                body_q,
+                m.tendon_start,
+                self.tendon_link_tendon,
+                m.tendon_link_body,
+                m.tendon_link_type,
+                m.tendon_link_orientation,
+                m.tendon_link_mu,
+                m.tendon_link_axis,
+                m.tendon_link_profile,
+                self.tendon_seg_attachment_l,
+                self.tendon_seg_attachment_r,
+                self.tendon_profile_parameter_l,
+                self.tendon_profile_parameter_r,
+                report,
+            ],
+            outputs=[
+                self.tendon_link_cone_seg_l,
+                self.tendon_link_cone_seg_r,
+                self.tendon_link_cap_ratio,
+                self.tendon_profile_wrap_length,
+                self.tendon_profile_wrap_status,
+            ],
+            device=m.device,
+        )
+
     def _init_tendon_attachment_points(self, model: Model, auto_mask: np.ndarray, route_seg_mask: np.ndarray) -> None:
         """Compute initial tendon tangent attachments and rest lengths."""
         body_q = model.body_q
@@ -489,38 +576,41 @@ class TendonStateMixin:
 
         self._prepare_tendon_route(model, body_q)
 
-        wp.launch(
-            kernel=update_tendon_attachments,
-            dim=model.tendon_segment_count,
-            inputs=[
-                body_q,
-                model.tendon_link_body,
-                model.tendon_link_type,
-                model.tendon_link_flags,
-                model.tendon_link_radius,
-                model.tendon_link_orientation,
-                model.tendon_link_offset,
-                model.tendon_link_axis,
-                self.tendon_seg_active,
-                self.tendon_seg_active_link_l,
-                self.tendon_seg_active_link_r,
-                self.tendon_link_active,
-                self.tendon_link_active_step,
-                self.tendon_seg_attachment_l_local_step,
-                self.tendon_seg_attachment_r_local_step,
-                0,
-            ],
-            outputs=[
-                self.tendon_seg_attachment_l,
-                self.tendon_seg_attachment_r,
-                self.tendon_seg_attachment_l_local,
-                self.tendon_seg_attachment_r_local,
-                self.tendon_seg_rolling_delta_l,
-                self.tendon_seg_rolling_delta_r,
-                self.tendon_seg_length,
-            ],
-            device=model.device,
-        )
+        if model.tendon_profile_routing:
+            self._update_profile_attachments(body_q, rolling=False)
+        else:
+            wp.launch(
+                kernel=update_tendon_attachments,
+                dim=model.tendon_segment_count,
+                inputs=[
+                    body_q,
+                    model.tendon_link_body,
+                    model.tendon_link_type,
+                    model.tendon_link_flags,
+                    model.tendon_link_radius,
+                    model.tendon_link_orientation,
+                    model.tendon_link_offset,
+                    model.tendon_link_axis,
+                    self.tendon_seg_active,
+                    self.tendon_seg_active_link_l,
+                    self.tendon_seg_active_link_r,
+                    self.tendon_link_active,
+                    self.tendon_link_active_step,
+                    self.tendon_seg_attachment_l_local_step,
+                    self.tendon_seg_attachment_r_local_step,
+                    0,
+                ],
+                outputs=[
+                    self.tendon_seg_attachment_l,
+                    self.tendon_seg_attachment_r,
+                    self.tendon_seg_attachment_l_local,
+                    self.tendon_seg_attachment_r_local,
+                    self.tendon_seg_rolling_delta_l,
+                    self.tendon_seg_rolling_delta_r,
+                    self.tendon_seg_length,
+                ],
+                device=model.device,
+            )
 
         wp.launch(
             kernel=solve_tendon_material,
@@ -571,6 +661,7 @@ class TendonStateMixin:
                 self.tendon_sigmoid_ea_ratio,
                 self.tendon_sigmoid_transition_strain,
                 self.tendon_sigmoid_transition_width,
+                model.tendon_profile_routing,
             ],
             device=model.device,
         )
@@ -583,6 +674,18 @@ class TendonStateMixin:
                 rest_np[i] = np.linalg.norm(att_r_np[i] - att_l_np[i])
         self.tendon_seg_rest_length = wp.array(rest_np, dtype=float, device=model.device)
         self._snapshot_tendon_step_state()
+
+        if model.tendon_profile_routing:
+            self._update_profile_cones(body_q, True)
+            if np.any(self.tendon_profile_tangent_status.numpy()) or np.any(self.tendon_profile_wrap_status.numpy()):
+                raise ValueError("Initial tendon profile route is not a supported coplanar tangent path")
+            wraps = self.tendon_profile_wrap_length.numpy()
+            total = [
+                np.sum(rest_np[start - t : end - t - 1], dtype=np.float64) + np.sum(wraps[start:end], dtype=np.float64)
+                for t, (start, end) in enumerate(pairwise(tendon_start_np))
+            ]
+            self.tendon_total_cable = wp.array(total, dtype=float, device=model.device)
+            return
 
         link_type_np = model.tendon_link_type.numpy()
         link_radius_np = model.tendon_link_radius.numpy()

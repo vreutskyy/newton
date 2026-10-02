@@ -27,6 +27,7 @@ from ._src.geometry import (
 from ._src.geometry.inertia import compute_inertia_shape, transform_inertia
 from ._src.geometry.kernels import sdf_box, sdf_capsule, sdf_cone, sdf_cylinder, sdf_mesh, sdf_plane, sdf_sphere
 from ._src.geometry.narrow_phase import NarrowPhase
+from ._src.geometry.roller_profile import RollerProfile, RollerProfileCircle, RollerProfileEllipse, RollerProfileSector
 from ._src.geometry.sdf_hydroelastic import HydroelasticSDF
 from ._src.geometry.sdf_utils import compute_offset_mesh, create_empty_sdf_data
 
@@ -38,6 +39,10 @@ __all__ = [
     "BroadPhaseSAP",
     "HydroelasticSDF",
     "NarrowPhase",
+    "RollerProfile",
+    "RollerProfileCircle",
+    "RollerProfileEllipse",
+    "RollerProfileSector",
     "build_bvh_particle",
     "build_bvh_shape",
     "collide_box_box",

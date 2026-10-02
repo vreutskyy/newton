@@ -13,6 +13,7 @@ import warnings
 from collections import Counter, deque
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
+from itertools import pairwise
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import numpy as np
@@ -47,6 +48,7 @@ from ..geometry import (
     transform_inertia,
 )
 from ..geometry.inertia import validate_and_correct_inertia_kernel, verify_and_correct_inertia
+from ..geometry.roller_profile import RollerProfile, RollerProfileCircle, pack_profiles
 from ..geometry.types import Heightfield
 from ..geometry.utils import RemeshingMethod, compute_inertia_obb, remesh_mesh
 from ..math import quat_between_vectors_robust
@@ -993,6 +995,10 @@ class ModelBuilder:
         """Link type (TendonLinkType enum) for each tendon link."""
         self.tendon_link_radius: list[float] = []
         """Contact radius [m] for each tendon link."""
+        self.tendon_link_profile: list[RollerProfile | None] = []
+        """Experimental explicit roller shapes; None retains radius-only routing."""
+        self.tendon_link_profile_axis: list[tuple[float, float, float]] = []
+        """Body-local profile +X directions [dimensionless]."""
         self.tendon_link_orientation: list[int] = []
         """Winding direction (+1/-1) for each tendon link."""
         self.tendon_link_mu: list[float] = []
@@ -3018,6 +3024,8 @@ class ModelBuilder:
 
         if builder.up_axis != self.up_axis:
             raise ValueError("Cannot add a builder with a different up axis.")
+        if any(p is not None for p in builder.tendon_link_profile):
+            raise NotImplementedError("Merging or replicating explicit roller profiles is not implemented")
 
         # Copy gravity from source builder
         if self.current_world >= 0 and self.current_world < len(self.world_gravity):
@@ -4499,6 +4507,9 @@ class ModelBuilder:
         compliance: float = 0.0,
         damping: float = 0.0,
         rest_length: float = -1.0,
+        *,
+        profile: RollerProfile | None = None,
+        profile_axis: tuple[float, float, float] = (1.0, 0.0, 0.0),
     ) -> int:
         """Add a link (waypoint) to the most recently created tendon.
 
@@ -4525,12 +4536,37 @@ class ModelBuilder:
             rest_length: Rest length [m] for the segment ending at this link.
                 If negative, will be computed from initial body positions during
                 finalization.
+            profile: Experimental roller cross-section. Omit to retain the
+                existing circular radius API. Explicit profiles are VBD-only.
+            profile_axis: Body-local profile +X direction, perpendicular to axis.
 
         Returns:
             The link index.
         """
         link_idx = len(self.tendon_link_body)
         tendon_link_start = self.tendon_start[-1]
+        if profile is not None:
+            if not isinstance(profile, RollerProfile):
+                raise TypeError("profile must be a RollerProfile")
+            if link_type != int(TendonLinkType.ROLLING) or dynamic:
+                raise ValueError("Explicit profiles require a prescribed ROLLING link")
+            if radius != 0.0:
+                raise ValueError("Specify either radius or profile, not both")
+            if isinstance(profile, RollerProfileCircle):
+                radius = profile.radius
+        normal = np.asarray(axis, dtype=float)
+        x_axis = np.asarray(profile_axis, dtype=float)
+        if profile is not None:
+            if normal.shape != (3,) or x_axis.shape != (3,) or not np.isfinite([normal, x_axis]).all():
+                raise ValueError("Profile axes must be finite 3D vectors")
+            if np.linalg.norm(normal) == 0 or np.linalg.norm(x_axis) == 0:
+                raise ValueError("Profile axes must be nonzero")
+            normal = normal / np.linalg.norm(normal)
+            x_axis = x_axis / np.linalg.norm(x_axis)
+            if abs(np.dot(normal, x_axis)) > 1e-5:
+                raise ValueError("Profile axes must be perpendicular")
+            axis = tuple(normal)
+            profile_axis = tuple(x_axis)
         if dynamic and link_type != int(TendonLinkType.ROLLING):
             raise ValueError("dynamic routing is only supported for ROLLING tendon links")
         if (
@@ -4545,6 +4581,8 @@ class ModelBuilder:
         self.tendon_link_body.append(body)
         self.tendon_link_type.append(link_type)
         self.tendon_link_radius.append(radius)
+        self.tendon_link_profile.append(profile)
+        self.tendon_link_profile_axis.append(profile_axis)
         self.tendon_link_orientation.append(orientation)
         self.tendon_link_mu.append(mu)
         flags = TendonLinkFlags.DYNAMIC if dynamic else 0
@@ -4953,6 +4991,8 @@ class ModelBuilder:
         """
 
         body_data = {}
+        if any(p is not None for p in self.tendon_link_profile):
+            raise NotImplementedError("Fixed-joint collapse of explicit roller profiles is not implemented")
         body_children = {-1: []}
         visited = {}
         merged_body_data = {}
@@ -10565,6 +10605,40 @@ class ModelBuilder:
             m.tendon_count = tendon_count
             m.tendon_link_count = link_count
             m.tendon_segment_count = seg_count
+            m.tendon_profile_routing = any(p is not None for p in self.tendon_link_profile)
+            if m.tendon_profile_routing:
+                if requires_grad:
+                    raise NotImplementedError("Explicit roller-profile routing does not support autodiff")
+                if any(f & int(TendonLinkFlags.DYNAMIC) for f in self.tendon_link_flags):
+                    raise ValueError("Profile routing currently requires all tendon links to be prescribed")
+                if any(b < 0 for b in self.tendon_link_body):
+                    raise ValueError("Profile routing requires body-backed tendon links")
+                for start, end in pairwise(tendon_start):
+                    if any(self.tendon_link_type[i] == int(TendonLinkType.ROLLING) for i in (start, end - 1)):
+                        raise ValueError("Profile routing does not support terminal rollers")
+                profiles = [
+                    p if p is not None else RollerProfileCircle(r) if t == int(TendonLinkType.ROLLING) else None
+                    for p, r, t in zip(
+                        self.tendon_link_profile, self.tendon_link_radius, self.tendon_link_type, strict=True
+                    )
+                ]
+                m.tendon_link_profile = pack_profiles(profiles, device=m.device)
+                normals = np.array(self.tendon_link_axis, dtype=float)
+                profile_axes = np.array(self.tendon_link_profile_axis, dtype=float)
+                for i, profile in enumerate(profiles):
+                    if profile is None or self.tendon_link_profile[i] is not None:
+                        continue
+                    # A radius-only circle has no authored in-plane direction.
+                    # Build a stable orthonormal frame for its contact history.
+                    length = np.linalg.norm(normals[i])
+                    if not np.isfinite(length) or length == 0:
+                        raise ValueError("Profile routing requires finite, nonzero roller axes")
+                    normals[i] /= length
+                    seed = np.eye(3)[np.argmin(np.abs(normals[i]))]
+                    x_axis = seed - np.dot(seed, normals[i]) * normals[i]
+                    profile_axes[i] = x_axis / np.linalg.norm(x_axis)
+                m.tendon_link_axis = wp.array(normals, dtype=wp.vec3, device=m.device)
+                m.tendon_link_profile_axis = wp.array(profile_axes, dtype=wp.vec3, device=m.device)
 
             # ---------------------
             # triangles

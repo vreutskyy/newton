@@ -18,6 +18,10 @@ newton.geometry
    BroadPhaseSAP
    HydroelasticSDF
    NarrowPhase
+   RollerProfile
+   RollerProfileCircle
+   RollerProfileEllipse
+   RollerProfileSector
 
 .. rubric:: Functions
 
