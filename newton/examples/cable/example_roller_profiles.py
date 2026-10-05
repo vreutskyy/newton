@@ -18,7 +18,7 @@ import warp as wp
 import newton
 import newton.examples
 from newton.geometry import RollerProfileCircle, RollerProfileEllipse, RollerProfileSector
-from newton.solvers import SolverVBD
+from newton.solvers import SolverVBD, SolverXPBD
 
 
 @wp.kernel
@@ -77,7 +77,12 @@ class Example:
         self.viewer = viewer
         self.frame_dt = 1.0 / 60
         self.sim_substeps = getattr(args, "substeps", 10)
-        iterations = getattr(args, "iterations", 32)
+        solver_name = getattr(args, "solver", "vbd")
+        if solver_name not in ("vbd", "xpbd"):
+            raise ValueError("solver must be 'vbd' or 'xpbd'")
+        iterations = getattr(args, "iterations", None)
+        if iterations is None:
+            iterations = 32
         friction = getattr(args, "friction", 0.3)
         if self.sim_substeps < 1 or iterations < 1:
             raise ValueError("substeps and iterations must be positive")
@@ -123,7 +128,12 @@ class Example:
             rollers.append(roller)
         builder.color()
         self.model = builder.finalize()
-        self.solver = SolverVBD(self.model, iterations=iterations, tendon_settle_tol=1e-5)
+        solver_type = SolverVBD if solver_name == "vbd" else SolverXPBD
+        self.solver = solver_type(self.model, iterations=iterations, tendon_settle_tol=1e-5)
+        if solver_name == "xpbd":
+            # Coupled cable impulses interact with the separately solved hinges.
+            # The default 0.7 chatters at the sector's stick/slip transition here.
+            self.solver.joint_linear_relaxation = 0.5
         self.state_0, self.state_1 = self.model.state(), self.model.state()
         self.control = self.model.control()
         self.anchors = wp.array(anchors, dtype=int, device=self.model.device)
@@ -213,6 +223,7 @@ class Example:
         poses = self.state_0.body_q.numpy()
         parameter_l = self.solver.tendon_profile_parameter_l.numpy()
         parameter_r = self.solver.tendon_profile_parameter_r.numpy()
+        wrap_length = self.solver.tendon_profile_wrap_length.numpy()
         attachment_l = self.solver.tendon_seg_attachment_l.numpy()
         attachment_r = self.solver.tendon_seg_attachment_r.numpy()
         starts, ends, colors = [], [], []
@@ -251,7 +262,10 @@ class Example:
             curve(0, period, (0.25, 0.55, 1.0))
             entry = float(parameter_r[2 * i])
             exit = float(parameter_l[2 * i + 1])
-            curve(entry, entry + (exit - entry) % period, (1.0, 0.75, 0.2))
+            # Use the solver's zero-wrap classification: modulo of independently
+            # rounded coincident parameters can otherwise draw a full circuit.
+            if wrap_length[3 * i + 1] > 0.0:
+                curve(entry, entry + (exit - entry) % period, (1.0, 0.75, 0.2))
             starts.append(world((0, 0)))
             ends.append(world(_boundary(profile, 0)))
             colors.append((0.5, 0.8, 1.0))
@@ -273,8 +287,9 @@ class Example:
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
     parser.add_argument("--substeps", type=int, default=10)
-    parser.add_argument("--iterations", type=int, default=32)
+    parser.add_argument("--iterations", type=int, default=None, help="Default: 32 for either solver")
     parser.add_argument("--friction", type=float, default=0.3)
+    parser.add_argument("--solver", choices=("vbd", "xpbd"), default="vbd")
     parser.add_argument("--disable-cuda-graph", action="store_true")
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

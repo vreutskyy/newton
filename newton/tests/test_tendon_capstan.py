@@ -18,13 +18,18 @@ import warp as wp
 import newton
 from newton._src.sim.builder import Axis
 from newton._src.sim.tendon import TendonLinkFlags, TendonLinkType
-from newton._src.solvers.tendon_kernels import tendon_material_transfer_delta, tendon_segment_length_rate
-from newton._src.solvers.xpbd.tendon_kernels import solve_tendon_slip, solve_tendon_stretch
+from newton._src.solvers.tendon_kernels import (
+    _is_supported_rolling_wrap,
+    tendon_material_transfer_delta,
+    tendon_segment_length_rate,
+)
 from newton.examples.cable.cable import get_tendon_cable_lines
 from newton.examples.cable.example_tendon_capstan_friction import Example as DynamicCapstanExample
 from newton.examples.cable.example_tendon_mujoco_switch import Example as MujocoSwitchExample
 from newton.examples.cable.example_tendon_mujoco_switch_matrix import Example as MujocoSwitchMatrixExample
 from newton.examples.cable.example_tendon_mujoco_wrap import Example as MujocoWrapExample
+from newton.geometry import RollerProfileCircle
+from newton.tests.test_roller_profile_vbd import _build, _load
 from newton.tests.unittest_utils import sanitize_identifier
 
 SIGMOID_TENDON_MATERIAL = {
@@ -70,6 +75,33 @@ def add_test(cls, name, devices, test_fn):
     for device in devices:
         test_name = f"test_{sanitize_identifier(name)}_{sanitize_identifier(device)}"
         setattr(cls, test_name, lambda self, d=device, fn=test_fn: fn(self, d))
+
+
+@wp.kernel
+def _classify_rolling_wraps(angles: wp.array[float], supported: wp.array[bool]):
+    index = wp.tid()
+    supported[index] = _is_supported_rolling_wrap(angles[index])
+
+
+def test_wrap_warning_endpoints(test, device):
+    """atan2's negative-pi representation is a valid half wrap, not a negative wrap."""
+    with wp.ScopedDevice(device):
+        cases = [
+            (0.0, True),
+            (math.pi, True),
+            (-math.pi, True),
+            (-1.0e-7, True),
+            (-math.pi + 5.0e-7, True),
+            (-0.01, False),
+            (-math.pi + 0.01, False),
+        ]
+        angles = wp.array([angle for angle, _ in cases], dtype=float)
+        supported = wp.empty(len(cases), dtype=bool)
+        wp.launch(_classify_rolling_wraps, dim=len(cases), inputs=[angles], outputs=[supported])
+        actual = supported.numpy()
+        for index, (angle, expected) in enumerate(cases):
+            with test.subTest(angle=angle):
+                test.assertEqual(bool(actual[index]), expected)
 
 
 def _box_on_planar_joint(builder, pos, mass, half_extent):
@@ -775,7 +807,7 @@ def build_motorized_pulley_drive(mu=0.0):
     return builder.finalize(), slider, pulley, j_pulley
 
 
-def build_kinematic_rolling_transport(mu=10.0):
+def build_kinematic_rolling_transport(mu=10.0, profile=None):
     """Build a fixed anchor - rolling pulley - fixed anchor route for prescribed spin tests."""
     builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=0.0)
 
@@ -795,7 +827,7 @@ def build_kinematic_rolling_transport(mu=10.0):
     builder.add_tendon_link(
         body=pulley,
         link_type=int(TendonLinkType.ROLLING),
-        radius=0.1,
+        **({"radius": 0.1} if profile is None else {"profile": profile}),
         orientation=1,
         mu=mu,
         offset=(0.0, 0.0, 0.0),
@@ -814,6 +846,7 @@ def build_kinematic_rolling_transport(mu=10.0):
         rest_length=-1.0,
     )
 
+    builder.color()
     return builder.finalize(), pulley
 
 
@@ -1768,7 +1801,10 @@ def test_mujoco_switch_preserves_active_route_segments(test, device):
 
         test.assertTrue(example._saw_middle_segment_disabled, "Inactive middle link should be skipped")
         test.assertTrue(example._saw_middle_segment_enabled, "Active middle link should restore its second segment")
-        test.assertLess(example._max_inactive_middle_penetration, 1.0e-5)
+        test.assertLess(
+            example._max_inactive_middle_penetration,
+            example.middle_radius * example.solver.tendon_activation_tol + 1.0e-5,
+        )
         test.assertGreater(example._min_active_tangent_radius, example.middle_radius * 0.80)
         test.assertLess(example._max_active_tangent_radius, example.middle_radius * 1.20)
 
@@ -1858,9 +1894,11 @@ def _pinhole_friction_metrics(mu, num_frames=80):
 def test_frictional_pinhole_mu_controls_slip_and_locking(test, device):
     """Pinhole friction should interpolate between free slip and locked cable transfer."""
     with wp.ScopedDevice(device):
-        low = _pinhole_friction_metrics(mu=0.0)
-        mid = _pinhole_friction_metrics(mu=0.1)
-        high = _pinhole_friction_metrics(mu=10.0)
+        # Compare before the rising weight reaches the guide; subsequent
+        # contact and reversal are not a friction-order test.
+        low = _pinhole_friction_metrics(mu=0.0, num_frames=40)
+        mid = _pinhole_friction_metrics(mu=0.1, num_frames=40)
+        high = _pinhole_friction_metrics(mu=10.0, num_frames=40)
 
         for label, metrics in [("low", low), ("mid", mid), ("high", high)]:
             body_q, _left_travel, right_travel = metrics
@@ -2390,70 +2428,29 @@ def test_tendon_damping_does_not_generate_compression(test, device):
 
 
 def test_tendon_slip_uses_true_segment_compliance(test, device):
-    """The rolling-slip cone should use the same physical tension as material transfer."""
-    with wp.ScopedDevice(device):
-        compliance_l = 1.0e-9
-        compliance_r = 1.0e-7
-        rest_l = 1.0 - 1.0e-6
-        rest_r = 1.0 - 1.0e-4
-        mu = 0.1
-
-        body_q = wp.array([wp.transform_identity()], dtype=wp.transform)
-        tendon_link_seg_left = wp.array([-1, 0, -1], dtype=int)
-        tendon_link_body = wp.array([0, 0, 0], dtype=int)
-        tendon_link_type = wp.array(
-            [int(TendonLinkType.ATTACHMENT), int(TendonLinkType.ROLLING), int(TendonLinkType.ATTACHMENT)],
-            dtype=int,
+    """Retain true per-span compliance in finite-friction coupled impulses."""
+    for radius_only in (False, True):
+        _, model, solver, _ = _build(
+            newton.geometry.RollerProfileCircle(0.05),
+            device,
+            mu=0.1,
+            solver_type=newton.solvers.SolverXPBD,
+            radius_only=radius_only,
         )
-        tendon_link_radius = wp.array([0.0, 1.0, 0.0], dtype=float)
-        tendon_link_mu = wp.array([0.0, mu, 0.0], dtype=float)
-        tendon_link_active = wp.ones(3, dtype=bool)
-        tendon_link_offset = wp.zeros(3, dtype=wp.vec3)
-        tendon_link_axis = wp.array([wp.vec3(0.0, 1.0, 0.0)] * 3, dtype=wp.vec3)
-        seg_rest_length = wp.array([rest_l, rest_r], dtype=float)
-        seg_attachment_l = wp.array([wp.vec3(-1.0, 0.0, -1.0), wp.vec3(1.0, 0.0, 0.0)], dtype=wp.vec3)
-        seg_attachment_r = wp.array([wp.vec3(-1.0, 0.0, 0.0), wp.vec3(1.0, 0.0, -1.0)], dtype=wp.vec3)
-        seg_compliance = wp.array([compliance_l, compliance_r], dtype=float)
-        seg_material_tension = wp.array([(1.0 - rest_l) / compliance_l, (1.0 - rest_r) / compliance_r], dtype=float)
-        seg_damping_tension = wp.zeros(2, dtype=float)
-        seg_delta_lambda = wp.array([-1.0, 0.0], dtype=float)
-        body_deltas = wp.zeros(1, dtype=wp.spatial_vector)
-
-        wp.launch(
-            solve_tendon_slip,
-            dim=3,
-            inputs=[
-                body_q,
-                tendon_link_seg_left,
-                tendon_link_body,
-                tendon_link_type,
-                tendon_link_radius,
-                tendon_link_mu,
-                tendon_link_active,
-                tendon_link_offset,
-                tendon_link_axis,
-                seg_attachment_l,
-                seg_attachment_r,
-                seg_compliance,
-                seg_material_tension,
-                seg_damping_tension,
-                seg_delta_lambda,
-                1.0,
-                0.0,
-            ],
-            outputs=[body_deltas],
-        )
-
-        rest = seg_rest_length.numpy()
-        compliance = seg_compliance.numpy()
-        force_l = (1.0 - float(rest[0])) / float(compliance[0])
-        force_r = (1.0 - float(rest[1])) / float(compliance[1])
-        cap_ratio = math.exp(mu * math.pi)
-        beta = (cap_ratio - 1.0) / (cap_ratio + 1.0)
-        scale = min(1.0, beta * (force_l + force_r) / max(abs(force_l - force_r), 1.0e-8))
-        expected_spin_y = -scale * beta
-
-        test.assertAlmostEqual(float(body_deltas.numpy()[0, 4]), expected_spin_y, delta=1.0e-6)
+        model.tendon_seg_compliance.assign(np.array([1.0e-7, 1.0e-5], dtype=np.float32))
+        state = model.state()
+        # Request a load outside the cone so both compliance values enter the
+        # material transfer and its condensed impulse mode.
+        _load(model, solver, state, tensions=(100.0, 1.0))
+        dt = 1.0e-3
+        solver.joint_linear_relaxation = 1.0
+        deltas = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=device)
+        solver._solve_tendon_stretch(state.body_q, state.body_qd, deltas, dt)
+        expected = np.maximum(solver.tendon_seg_stretch.numpy(), 0.0)
+        expected /= solver.tendon_seg_active_compliance.numpy()
+        np.testing.assert_allclose(-solver.tendon_seg_lambda.numpy() / dt, expected, rtol=3.0e-4, atol=1.0e-3)
+        ratio = float(solver.tendon_link_cap_ratio.numpy()[1])
+        test.assertAlmostEqual(float(expected[0] / expected[1]), ratio, delta=3.0e-4)
 
 
 def test_same_body_tendon_segment_reports_constitutive_tension(test, device):
@@ -2608,42 +2605,14 @@ def test_same_body_rolling_route_matches_length_gradient(test, device):
         zero_inv_inertia = wp.zeros(model.body_count, dtype=wp.mat33, device=model.device)
         dt = 1.0 / 120.0
 
-        wp.launch(
-            kernel=solve_tendon_stretch,
-            dim=model.tendon_segment_count,
-            inputs=[
-                state.body_q,
-                state.body_qd,
-                model.body_com,
-                zero_inv_mass,
-                zero_inv_inertia,
-                model.tendon_link_body,
-                model.tendon_link_type,
-                model.tendon_link_offset,
-                model.tendon_link_axis,
-                solver.tendon_seg_rest_length,
-                solver.tendon_seg_attachment_l,
-                solver.tendon_seg_attachment_r,
-                solver.tendon_seg_attachment_l_local,
-                solver.tendon_seg_attachment_r_local,
-                solver.tendon_seg_active_compliance,
-                solver.tendon_seg_active_damping,
-                solver.tendon_seg_lambda,
-                solver.tendon_seg_delta_lambda,
-                solver.tendon_seg_active,
-                solver.tendon_seg_active_link_l,
-                solver.tendon_seg_active_link_r,
-                1.0 / dt,
-                1.0,
-                dt,
-                0.0,
-                1.0,
-                0.0,
-                1.0,
-            ],
-            outputs=[solver.tendon_seg_material_tension, body_deltas],
-            device=model.device,
-        )
+        solver.body_inv_mass_effective = zero_inv_mass
+        solver.body_inv_inertia_effective = zero_inv_inertia
+        solver._snapshot_tendon_step_state()
+        solver._prepare_tendon_route(model, state.body_q)
+        solver._update_tendon_attachments(state.body_q)
+        solver._update_tendon_cone_rows(model, state.body_q, True)
+        solver._solve_tendon_material(state.body_q, state.body_qd, state.body_q, dt)
+        solver._solve_tendon_stretch(state.body_q, state.body_qd, body_deltas, dt)
 
         delta_lambda = solver.tendon_seg_delta_lambda.numpy()
         solved_lengths = np.linalg.norm(
@@ -2756,8 +2725,69 @@ def test_rolling_link_body_preserves_center_motion_jacobian(test, device):
         test.assertLess(float(model.joint_q.numpy()[joint_q]), -1.0e-3)
 
 
-def test_motorized_pulley_drives_slider(test, device):
-    """A rolling drive pulley must convert rotation into cable sliding."""
+def _check_loaded_motorized_pulley_drive(test, solver_factory):
+    """Equal hanging masses provide a taut return; travel must match rim motion."""
+    builder = newton.ModelBuilder(gravity=-9.81)
+    radius, compliance, initial_z = 0.1, 1e-4, 0.5
+    masses = []
+    for x in (-radius, radius):
+        pose = wp.transform(p=(x, 0, initial_z))
+        body = builder.add_link(xform=pose, mass=1.0, inertia=wp.mat33(np.eye(3)))
+        joint = builder.add_joint_prismatic(-1, body, parent_xform=pose, axis=Axis.Z)
+        builder.add_articulation([joint])
+        masses.append(body)
+    pose = wp.transform(p=(0, 0, 1))
+    pulley = builder.add_link(xform=pose, mass=0.1, inertia=wp.mat33(np.eye(3) * 0.001))
+    joint = builder.add_joint_revolute(-1, pulley, parent_xform=pose, axis=Axis.Y, target_ke=10.0, target_kd=1.0)
+    builder.add_articulation([joint])
+    builder.add_tendon()
+    builder.add_tendon_link(masses[0], TendonLinkType.ATTACHMENT)
+    builder.add_tendon_link(
+        pulley,
+        TendonLinkType.ROLLING,
+        axis=(0, 1, 0),
+        radius=radius,
+        mu=2.0,
+        compliance=compliance,
+        rest_length=0.5 - 9.81 * compliance,
+    )
+    builder.add_tendon_link(
+        masses[1], TendonLinkType.ATTACHMENT, compliance=compliance, rest_length=0.5 - 9.81 * compliance
+    )
+    builder.color()
+    model = builder.finalize()
+    solver = solver_factory(model)
+    a, b = model.state(), model.state()
+    control = model.control()
+    dof = int(model.joint_qd_start.numpy()[joint])
+    initial_rest = solver.tendon_seg_rest_length.numpy().copy()
+    # Smooth startup keeps acceleration below gravity, hence both tails loaded.
+    for step in range(300):
+        target = 0.5 * (1.0 - math.cos(math.pi * (step + 1) / 300))
+        control.joint_target_pos[dof : dof + 1].fill_(target)
+        a.clear_forces()
+        solver.step(a, b, control, None, 1.0 / 600)
+        a, b = b, a
+        q = a.body_q.numpy()
+        theta = 2.0 * math.atan2(float(q[pulley, 4]), float(q[pulley, 6]))
+        rest_delta = solver.tendon_seg_rest_length.numpy() - initial_rest
+        # Geometry stays vertical, so this reference does not use solver tensions.
+        np.testing.assert_allclose(rest_delta, [-radius * theta, radius * theta], atol=2e-5, rtol=0)
+        np.testing.assert_allclose(q[masses, 2] - initial_z, [radius * theta, -radius * theta], atol=3e-3, rtol=0)
+    test.assertGreater(theta, 0.7)
+    test.assertGreater(float(q[masses[0], 2] - initial_z), 0.07)
+
+
+def test_loaded_motorized_pulley_drive(test, device):
+    """A loaded motorized pulley drives both cable ends with the correct sign and travel."""
+    with wp.ScopedDevice(device):
+        _check_loaded_motorized_pulley_drive(
+            test, lambda model: newton.solvers.SolverXPBD(model, iterations=12, joint_linear_relaxation=0.8)
+        )
+
+
+def test_unloaded_motorized_pulley_cannot_drive_slider(test, device):
+    """An unloaded cable cannot transmit motor traction against a slack tail."""
     with wp.ScopedDevice(device):
         model, slider_idx, pulley_idx, drive_joint = build_motorized_pulley_drive(mu=10.0)
         state = run_motorized_model(model, drive_joint)
@@ -2769,7 +2799,7 @@ def test_motorized_pulley_drives_slider(test, device):
         theta = abs(2.0 * np.arctan2(float(q[5]), float(q[6])))
 
         test.assertGreater(theta, 0.5, f"Drive pulley should rotate under its target: theta={theta:.4f}")
-        test.assertGreater(slider_x, -0.2, f"No-slip drive should pull the slider through the cable: x={slider_x:.4f}")
+        test.assertAlmostEqual(slider_x, -0.4, delta=1e-4)
 
 
 def test_frictionless_motorized_pulley_does_not_drive_slider(test, device):
@@ -2792,8 +2822,8 @@ def test_frictionless_motorized_pulley_does_not_drive_slider(test, device):
         )
 
 
-def test_motorized_pulley_couples_without_delay(test, device):
-    """A driven pulley should move the cable during the initial rotation, not later."""
+def test_unloaded_motorized_pulley_has_no_startup_traction(test, device):
+    """Motor startup must not create transient traction against an unloaded tail."""
     with wp.ScopedDevice(device):
         model, slider_idx, pulley_idx, drive_joint = build_motorized_pulley_drive(mu=10.0)
         solver = newton.solvers.SolverXPBD(model, iterations=12, joint_linear_relaxation=0.8)
@@ -2818,11 +2848,11 @@ def test_motorized_pulley_couples_without_delay(test, device):
         theta = abs(2.0 * np.arctan2(float(body_q[pulley_idx][5]), float(body_q[pulley_idx][6])))
 
         test.assertGreater(theta, 0.1, f"Pulley should have started rotating: theta={theta:.4f}")
-        test.assertGreater(slider_dx, 0.02, f"Pulley rotation should immediately pull cable: dx={slider_dx:.4f}")
+        test.assertAlmostEqual(slider_dx, 0.0, delta=1e-4)
 
 
-def test_motorized_pulley_updates_rest_in_first_step(test, device):
-    """Rolling surface transfer should happen in the same XPBD step as pulley rotation."""
+def test_unloaded_motorized_pulley_projects_first_step(test, device):
+    """Material projection must undo inadmissible unloaded rolling on the first step."""
     with wp.ScopedDevice(device):
         model, _, pulley_idx, drive_joint = build_motorized_pulley_drive(mu=10.0)
         solver = newton.solvers.SolverXPBD(model, iterations=12, joint_linear_relaxation=0.8)
@@ -2845,11 +2875,7 @@ def test_motorized_pulley_updates_rest_in_first_step(test, device):
         rest_delta = solver.tendon_seg_rest_length.numpy() - initial_rest
 
         test.assertGreater(theta, 1.0e-3, f"Drive pulley should rotate in the first step: theta={theta:.6f}")
-        test.assertGreater(
-            float(np.max(np.abs(rest_delta))),
-            1.0e-4,
-            f"Pulley rotation should transfer rolling rest length in the first step: delta={rest_delta}",
-        )
+        np.testing.assert_allclose(rest_delta, 0.0, atol=1e-6, rtol=0)
 
 
 def _moving_rolling_route_material_error(solver_factory, mu, short_segment=None):
@@ -2863,9 +2889,11 @@ def _moving_rolling_route_material_error(solver_factory, mu, short_segment=None)
     solver = solver_factory(model)
     if short_segment is not None:
         rest = solver.tendon_seg_rest_length.numpy()
-        total_rest = float(np.sum(rest))
+        # Both spans must remain taut. Putting all remaining material into
+        # the other span makes it slack; capstan projection then undoes the
+        # proposed transport before it can reach the depletion boundary.
         rest[short_segment] = 5.0e-3
-        rest[1 - short_segment] = total_rest - rest[short_segment]
+        rest[1 - short_segment] *= 0.5
         solver.tendon_seg_rest_length.assign(rest)
         solver._snapshot_tendon_step_state()
 
@@ -2926,7 +2954,7 @@ def test_moving_rolling_route_conserves_material(test, device):
 
 
 def test_kinematic_rolling_transfer_independent_of_iterations(test, device):
-    """Prescribed pulley spin should transfer the same material for any XPBD iteration count."""
+    """An admissible no-slip trial should transfer the same material for any XPBD iteration count."""
 
     def run_once(iterations):
         model, pulley_idx = build_kinematic_rolling_transport(mu=10.0)
@@ -2936,6 +2964,8 @@ def test_kinematic_rolling_transfer_independent_of_iterations(test, device):
         control = model.control()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
 
+        # Keep both spans taut throughout the 0.04 m prescribed rim travel.
+        solver.tendon_seg_rest_length.assign(solver.tendon_seg_rest_length.numpy() - 0.05)
         initial_rest = solver.tendon_seg_rest_length.numpy().copy()
         angle = 0.4
         body_q = state_0.body_q.numpy()
@@ -2969,9 +2999,10 @@ def test_kinematic_rolling_transfer_independent_of_iterations(test, device):
 def test_kinematic_rolling_transfer_independent_of_cone_sweeps(test, device):
     """Prescribed pulley spin should transfer the same material for any cone sweep count.
 
-    The rolling transport is a one-shot kinematic move set by the pulley geometry, not a
-    convergent relaxation; refining the capstan cone must not erode it. ``tendon_settle_tol=0``
-    forces the full ``tendon_max_sweeps`` budget so the executed count varies.
+    Keep both spans taut and the no-slip trial inside the capstan cone. Refining
+    the cone then must not erode that admissible transport. With a slack tail,
+    prescribed spin alone does not justify retaining an inadmissible trial.
+    ``tendon_settle_tol=0`` forces the full sweep budget.
     """
 
     def run_once(tendon_max_sweeps):
@@ -2988,6 +3019,9 @@ def test_kinematic_rolling_transfer_independent_of_cone_sweeps(test, device):
         control = model.control()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
 
+        # The imposed rim travel is 0.04 m. A 0.05 m initial extension on
+        # each fixed span leaves both taut, within this finite friction cone.
+        solver.tendon_seg_rest_length.assign(solver.tendon_seg_rest_length.numpy() - 0.05)
         initial_rest = solver.tendon_seg_rest_length.numpy().copy()
         angle = 0.4
         body_q = state_0.body_q.numpy()
@@ -3022,45 +3056,88 @@ def test_kinematic_rolling_transfer_independent_of_cone_sweeps(test, device):
             test.assertEqual(sweep_count, tendon_max_sweeps)
 
 
-def test_rolling_transfer_saturates_at_zero_span(test, device):
-    """Rolling transfer should clamp before a free span goes negative."""
+def test_rolling_slack_tail_cannot_support_tension(test, device):
+    """Remove a rolling trial's tension when its other span is slack, even at high finite friction."""
     with wp.ScopedDevice(device):
-        model, slider_idx, _, drive_joint = build_motorized_pulley_drive(mu=10.0)
-        solver = newton.solvers.SolverXPBD(model, iterations=12, joint_linear_relaxation=0.8)
-        state_0 = model.state()
-        state_1 = model.state()
-        control = model.control()
-        contacts = model.contacts()
-        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+        for mu in (0.2, 10.0):
+            with test.subTest(mu=mu):
+                model, pulley = build_kinematic_rolling_transport(mu=mu)
+                solver = newton.solvers.SolverXPBD(model, iterations=1, tendon_max_sweeps=1)
+                a, b = model.state(), model.state()
+                initial = solver.tendon_seg_rest_length.numpy().copy()
+                poses = a.body_q.numpy()
+                poses[pulley, 3:] = [0, 0, np.sin(0.2), np.cos(0.2)]
+                a.body_q.assign(poses)
+                solver.step(a, b, None, None, 1.0 / 60.0)
+                # No external displacement or pretension: spin cannot generate
+                # tension against a slack tail under any finite capstan ratio.
+                np.testing.assert_allclose(solver.tendon_seg_rest_length.numpy(), initial, atol=1e-7, rtol=0)
+                np.testing.assert_allclose(solver.tendon_seg_material_tension.numpy(), 0, atol=0.1, rtol=0)
 
-        dof_start = int(model.joint_qd_start.numpy()[drive_joint])
-        dt = 1.0 / 60.0 / 10.0
-        saturated_x = None
 
-        for _frame in range(60):
-            control.joint_target_pos[dof_start : dof_start + 1].fill_(8.0)
-            for _ in range(10):
-                state_0.clear_forces()
-                model.collide(state_0, contacts)
-                solver.step(state_0, state_1, control, contacts, dt)
-                state_0, state_1 = state_1, state_0
-
-            rest = solver.tendon_seg_rest_length.numpy()
-            if saturated_x is None and np.min(rest) <= 1.1e-6:
-                body_q = state_0.body_q.numpy()
-                saturated_x = float(body_q[slider_idx][0])
-
-        body_q = state_0.body_q.numpy()
-        final_x = float(body_q[slider_idx][0])
+def _check_rolling_transfer_clamp(test, solver_factory, profile=None):
+    """Exercise depletion with prescribed spin and two genuinely loaded spans."""
+    model, pulley = build_kinematic_rolling_transport(mu=10.0, profile=profile)
+    solver = solver_factory(model)
+    initial = np.array([0.005, 0.1], dtype=np.float32)
+    solver.tendon_seg_rest_length.assign(initial)
+    a, b = model.state(), model.state()
+    reached_clamp = False
+    for angle in np.linspace(0.0, 0.4, 21):
+        poses = a.body_q.numpy()
+        poses[pulley, 3:] = [0, 0, np.sin(angle / 2), np.cos(angle / 2)]
+        a.body_q.assign(poses)
+        solver.step(a, b, None, None, 1.0 / 60.0)
+        a, b = b, a
         rest = solver.tendon_seg_rest_length.numpy()
+        test.assertGreaterEqual(float(np.min(rest)), 0.99e-6)
+        test.assertAlmostEqual(float(np.sum(rest)), float(np.sum(initial)), delta=1e-6)
+        reached_clamp |= np.min(rest) <= 1.1e-6
+    test.assertTrue(reached_clamp, "Prescribed rolling must exercise the depletion clamp")
 
-        test.assertIsNotNone(saturated_x, "Driven pulley should exhaust one adjacent free span")
-        test.assertGreaterEqual(float(np.min(rest)), 0.99e-6, f"Rest lengths must stay non-negative: {rest}")
-        test.assertLess(
-            abs(final_x - saturated_x),
-            1.0e-2,
-            f"Slider should lock once a free span is exhausted: {final_x:.6f} vs {saturated_x:.6f}",
-        )
+
+def test_rolling_transfer_saturates_at_zero_span(test, device):
+    """Rolling transfer should clamp without losing material when a span is exhausted."""
+    with wp.ScopedDevice(device):
+        for profile in (None, RollerProfileCircle(0.1)):
+            with test.subTest(profile=profile):
+                _check_rolling_transfer_clamp(
+                    test, lambda model: newton.solvers.SolverXPBD(model, iterations=4), profile
+                )
+
+
+def test_depletion_does_not_cross_attachment(test, device):
+    """Rest-bound projection may not borrow cable across an internal attachment."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(gravity=0.0)
+        bodies = [builder.add_body(xform=wp.transform(p=(0.4 * i, 0, 0)), is_kinematic=True) for i in range(5)]
+        builder.add_tendon()
+        for i, body in enumerate(bodies):
+            builder.add_tendon_link(
+                body,
+                TendonLinkType.ROLLING if i % 2 else TendonLinkType.ATTACHMENT,
+                radius=0.1 if i % 2 else 0,
+                mu=10.0,
+                compliance=1e-3,
+            )
+        builder.color()
+        model = builder.finalize()
+        for solver_type in (newton.solvers.SolverXPBD, newton.solvers.SolverVBD):
+            solver = solver_type(model, iterations=4)
+            initial = np.array([0.005, 0.1, 0.1, 0.1], dtype=np.float32)
+            solver.tendon_seg_rest_length.assign(initial)
+            a, b = model.state(), model.state()
+            pose = a.body_q.numpy()
+            pose[bodies[1], 3:] = [0, 0, np.sin(0.2), np.cos(0.2)]
+            a.body_q.assign(pose)
+            solver.step(a, b, None, None, 1.0 / 60)
+            rest = solver.tendon_seg_rest_length.numpy()
+            test.assertLess(rest[0], 1.1e-6)
+            test.assertGreaterEqual(rest[0], 0.99e-6)
+            np.testing.assert_allclose(
+                rest.reshape(2, 2).sum(axis=1), initial.reshape(2, 2).sum(axis=1), atol=1e-6, rtol=0
+            )
+            np.testing.assert_allclose(rest[2:], initial[2:], atol=1e-6, rtol=0)
 
 
 def test_frictionless_zero_span_equalizes_global_tension(test, device):
@@ -3278,7 +3355,11 @@ def test_xpbd_sigmoid_stretch_uses_material_tangent(test, device):
         inv_mass = float(model.body_inv_mass.numpy()[body])
         expected_lambda = -dt * tension / (1.0 + dt * dt * tangent * inv_mass)
 
-        np.testing.assert_allclose(solver.tendon_seg_material_tension.numpy()[0], tension, rtol=2.0e-5)
+        accepted_length = np.linalg.norm(
+            solver.tendon_seg_attachment_r.numpy()[0] - solver.tendon_seg_attachment_l.numpy()[0]
+        )
+        accepted_tension = sigmoid_tendon_tension(float(accepted_length), rest_length, material)
+        np.testing.assert_allclose(solver.tendon_seg_material_tension.numpy()[0], accepted_tension, rtol=2.0e-5)
         test.assertAlmostEqual(float(solver.tendon_seg_lambda.numpy()[0]), expected_lambda, delta=1.0e-5)
 
 
@@ -3659,6 +3740,12 @@ devices = ["cpu"]
 if wp.is_cuda_available():
     devices.append("cuda:0")
 cuda_devices = [device for device in devices if device.startswith("cuda")]
+add_test(
+    TestTendonCapstan,
+    "rolling_slack_tail_cannot_support_tension",
+    devices,
+    test_rolling_slack_tail_cannot_support_tension,
+)
 
 add_test(
     TestTendonCapstan,
@@ -3861,7 +3948,13 @@ add_test(
     devices,
     test_tendon_slip_uses_true_segment_compliance,
 )
-add_test(TestTendonCapstan, "motorized_pulley_drives_slider", devices, test_motorized_pulley_drives_slider)
+add_test(TestTendonCapstan, "loaded_motorized_pulley_drive", devices, test_loaded_motorized_pulley_drive)
+add_test(
+    TestTendonCapstan,
+    "unloaded_motorized_pulley_cannot_drive_slider",
+    devices,
+    test_unloaded_motorized_pulley_cannot_drive_slider,
+)
 add_test(
     TestTendonCapstan,
     "frictionless_motorized_pulley_does_not_drive_slider",
@@ -3869,13 +3962,16 @@ add_test(
     test_frictionless_motorized_pulley_does_not_drive_slider,
 )
 add_test(
-    TestTendonCapstan, "motorized_pulley_couples_without_delay", devices, test_motorized_pulley_couples_without_delay
+    TestTendonCapstan,
+    "unloaded_motorized_pulley_has_no_startup_traction",
+    devices,
+    test_unloaded_motorized_pulley_has_no_startup_traction,
 )
 add_test(
     TestTendonCapstan,
-    "motorized_pulley_updates_rest_in_first_step",
+    "unloaded_motorized_pulley_projects_first_step",
     devices,
-    test_motorized_pulley_updates_rest_in_first_step,
+    test_unloaded_motorized_pulley_projects_first_step,
 )
 add_test(
     TestTendonCapstan,
@@ -3898,6 +3994,7 @@ add_test(
 add_test(
     TestTendonCapstan, "rolling_transfer_saturates_at_zero_span", devices, test_rolling_transfer_saturates_at_zero_span
 )
+add_test(TestTendonCapstan, "depletion_does_not_cross_attachment", devices, test_depletion_does_not_cross_attachment)
 add_test(
     TestTendonCapstan,
     "frictionless_zero_span_equalizes_global_tension",
@@ -3946,6 +4043,9 @@ add_test(
     devices,
     test_slack_tendon_settles_without_chasing_vanishing_tension,
 )
+
+
+add_test(TestTendonCapstan, "wrap_warning_endpoints", devices, test_wrap_warning_endpoints)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import warnings
+from itertools import pairwise
 from typing import Any
 
 import numpy as np
@@ -18,10 +19,10 @@ from ...sim import (
     ModelBuilder,
     State,
     TendonLinkFlags,
+    TendonLinkType,
 )
 from ..flags import SolverNotifyFlags
 from ..solver import SolverBase
-from ..tendon_kernels import solve_tendon_material, update_tendon_attachments
 from ..tendon_state import TendonStateMixin
 from ..xpbd.kernels import apply_joint_forces
 from .particle_vbd_kernels import (
@@ -82,6 +83,8 @@ from .rigid_vbd_kernels import (
 )
 from .tendon_kernels import (
     TendonForceElementAdjacencyInfo,
+    TendonMaterialMode,
+    prepare_tendon_material_modes,
     snapshot_tendon_segment_length_reference,
     update_tendon_segment_diagnostics,
 )
@@ -133,7 +136,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
         - Static routes and isolated dynamic ROLLING links are supported. Zero
           segment compliance is approximated as ``1.0e-8`` m/N.
         - Call :meth:`newton.ModelBuilder.color` after adding tendons so that
-          segment endpoints receive different rigid-body colors.
+          bodies coupled through tendon material receive different colors.
 
     Buffer sizing:
         SolverVBD pre-allocates contact state from capacities populated by
@@ -444,6 +447,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
         # Routed tendon geometry and material state are shared with XPBD; VBD
         # evaluates their force and Hessian contributions natively.
         self._init_tendon_state(model, allocate_xpbd_lambdas=True)
+        self.tendon_material_modes = wp.zeros(model.tendon_segment_count, dtype=TendonMaterialMode, device=model.device)
 
         # Initialize rigid body system and rigid-particle (body-particle) interaction state
         self._init_rigid_system(
@@ -1474,7 +1478,6 @@ class SolverVBD(TendonStateMixin, SolverBase):
     def _compute_tendon_force_element_adjacency(self, model: Model) -> TendonForceElementAdjacencyInfo:
         """Build CSR adjacency for authored and possible dynamic bypass segments."""
         adjacency = TendonForceElementAdjacencyInfo()
-        adjacency.profile_routing = model.tendon_profile_routing
         body_segments = [set() for _ in range(model.body_count)]
         body_colors = np.full(model.body_count, -1, dtype=np.int32)
         for color, group in enumerate(model.body_color_groups):
@@ -1512,6 +1515,24 @@ class SolverVBD(TendonStateMixin, SolverBase):
                             "call ModelBuilder.color() after adding tendons"
                         )
                     body_segments[bypass_body].add(segment)
+
+            # A material mode can span several geometrically non-adjacent
+            # bodies. Updating those bodies simultaneously would be Jacobi,
+            # not the per-color descent assumed by the condensed curvature.
+            link_types = model.tendon_link_type.numpy()
+            starts = model.tendon_start.numpy()
+            for start, end in pairwise(starts):
+                bodies = set()
+                for link in range(start, end):
+                    bodies.add(int(link_bodies[link]))
+                    if link == end - 1 or (link > start and link_types[link] == int(TendonLinkType.ATTACHMENT)):
+                        colors = [body_colors[body] for body in bodies]
+                        if len(set(colors)) != len(colors):
+                            raise ValueError(
+                                "model.body_color_groups does not separate material-coupled tendon bodies; "
+                                "call ModelBuilder.color() after adding tendons"
+                            )
+                        bodies = {int(link_bodies[link])}
 
         offsets = np.zeros(model.body_count + 1, dtype=np.int32)
         for body, segments in enumerate(body_segments):
@@ -2440,95 +2461,35 @@ class SolverVBD(TendonStateMixin, SolverBase):
         if model.tendon_segment_count == 0 or state_in.body_q is None:
             return
 
-        if model.tendon_profile_routing:
-            self._update_profile_attachments(state_in.body_q, rolling=True)
-        else:
-            wp.launch(
-                kernel=update_tendon_attachments,
-                dim=model.tendon_segment_count,
-                inputs=[
-                    state_in.body_q,
-                    model.tendon_link_body,
-                    model.tendon_link_type,
-                    model.tendon_link_flags,
-                    model.tendon_link_radius,
-                    model.tendon_link_orientation,
-                    model.tendon_link_offset,
-                    model.tendon_link_axis,
-                    self.tendon_seg_active,
-                    self.tendon_seg_active_link_l,
-                    self.tendon_seg_active_link_r,
-                    self.tendon_link_active,
-                    self.tendon_link_active_step,
-                    self.tendon_seg_attachment_l_local_step,
-                    self.tendon_seg_attachment_r_local_step,
-                    1,
-                ],
-                outputs=[
-                    self.tendon_seg_attachment_l,
-                    self.tendon_seg_attachment_r,
-                    self.tendon_seg_attachment_l_local,
-                    self.tendon_seg_attachment_r_local,
-                    self.tendon_seg_rolling_delta_l,
-                    self.tendon_seg_rolling_delta_r,
-                    self.tendon_seg_length,
-                ],
-                device=self.device,
-            )
+        self._update_tendon_attachments(state_in.body_q)
 
         self._update_tendon_cone_rows(model, state_in.body_q, report_unsupported_wrap)
 
+        self._solve_tendon_material(
+            state_in.body_q, state_in.body_qd, self.body_q_prev, dt, damping_from_pose_delta=True
+        )
         wp.launch(
-            kernel=solve_tendon_material,
+            prepare_tendon_material_modes,
             dim=model.tendon_count,
             inputs=[
-                state_in.body_q,
-                state_in.body_qd,
-                self.body_q_prev,
-                model.body_com,
                 model.tendon_start,
-                model.tendon_link_body,
-                model.tendon_link_type,
-                model.tendon_link_radius,
-                model.tendon_link_offset,
-                model.tendon_link_axis,
-                self.tendon_seg_rest_length,
-                self.tendon_seg_rest_length_step,
-                self.tendon_seg_route_rest_length,
-                self.tendon_seg_stretch,
-                self.tendon_seg_damping_tension,
-                self.tendon_seg_active,
-                self.tendon_seg_active_link_l,
-                self.tendon_seg_active_link_r,
-                self.tendon_seg_active_compliance,
-                self.tendon_seg_active_damping,
-                self.tendon_link_active,
-                self.tendon_link_active_step,
-                self.tendon_link_route_rest_length,
-                self.tendon_seg_attachment_l,
-                self.tendon_seg_attachment_r,
-                self.tendon_seg_length,
-                self.tendon_seg_attachment_l_local,
-                self.tendon_seg_attachment_r_local,
-                self.tendon_seg_rolling_delta_l,
-                self.tendon_seg_rolling_delta_r,
                 self.tendon_link_cone_seg_l,
                 self.tendon_link_cone_seg_r,
                 self.tendon_link_cap_ratio,
-                self.tendon_cone_sweep_count,
-                1,
+                self.tendon_seg_rest_length,
+                self.tendon_seg_length,
+                self.tendon_seg_stretch,
+                self.tendon_seg_active_compliance,
+                self.tendon_seg_active_damping,
+                self.tendon_seg_damping_tension,
+                self.tendon_seg_active,
                 dt,
-                1,
-                1,
-                1,
-                self.tendon_max_sweeps,
-                self.tendon_settle_tol,
                 self.tendon_sigmoid_ea_low,
                 self.tendon_sigmoid_ea_ratio,
                 self.tendon_sigmoid_transition_strain,
                 self.tendon_sigmoid_transition_width,
-                model.tendon_profile_routing,
             ],
+            outputs=[self.tendon_material_modes],
             device=self.device,
         )
 
@@ -2554,7 +2515,6 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 self.tendon_seg_active,
                 self.tendon_seg_active_link_l,
                 self.tendon_seg_active_link_r,
-                model.tendon_profile_routing,
             ],
             outputs=[self.tendon_seg_delta_lambda],
             device=self.device,
@@ -2646,21 +2606,15 @@ class SolverVBD(TendonStateMixin, SolverBase):
         self.body_hessian_al.zero_()
         self.body_hessian_ll.zero_()
 
-        if not model.tendon_profile_routing:
-            self._update_tendon_routing(state_in, dt, report_unsupported_wrap)
-
         body_color_groups = model.body_color_groups
 
         # Gauss-Seidel-style per-color updates
         for color in range(len(body_color_groups)):
             color_group = body_color_groups[color]
 
-            if model.tendon_profile_routing:
-                # Profiles use the actual endpoint moments. A preceding body
-                # color can change the tension balance, so reproject material
-                # before evaluating these moments at the new pose. Otherwise
-                # even a frictionless circle receives a spurious spin torque.
-                self._update_tendon_routing(state_in, dt, report_unsupported_wrap and color == 0)
+            # Reproject material after every body color so physical contact
+            # moments use the current capstan balance, for every roller shape.
+            self._update_tendon_routing(state_in, dt, report_unsupported_wrap and color == 0)
 
             # Accumulate body-particle contact forces/hessians for bodies in this color
             if model.particle_count > 0 and contacts is not None:
@@ -2792,25 +2746,13 @@ class SolverVBD(TendonStateMixin, SolverBase):
                     self.body_hessian_al,
                     self.body_hessian_aa,
                     self.tendon_adjacency,
+                    self.tendon_material_modes,
                     model.tendon_link_body,
-                    model.tendon_link_type,
-                    model.tendon_link_radius,
-                    model.tendon_link_mu,
-                    model.tendon_link_offset,
-                    model.tendon_link_axis,
-                    self.tendon_link_seg_left,
-                    self.tendon_seg_rest_length,
-                    self.tendon_seg_attachment_l_local,
-                    self.tendon_seg_attachment_r_local,
-                    self.tendon_seg_active_compliance,
-                    self.tendon_seg_active_damping,
+                    self.tendon_seg_attachment_l,
+                    self.tendon_seg_attachment_r,
                     self.tendon_seg_active,
                     self.tendon_seg_active_link_l,
                     self.tendon_seg_active_link_r,
-                    self.tendon_sigmoid_ea_low,
-                    self.tendon_sigmoid_ea_ratio,
-                    self.tendon_sigmoid_transition_strain,
-                    self.tendon_sigmoid_transition_width,
                 ],
                 outputs=[
                     state_in.body_q,

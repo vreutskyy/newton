@@ -24,7 +24,7 @@ from newton._src.math import quat_velocity
 from newton._src.sim import JointType
 from newton._src.solvers.solver import integrate_rigid_body
 
-from .tendon_kernels import TendonForceElementAdjacencyInfo, evaluate_tendon_force_hessians
+from .tendon_kernels import TendonForceElementAdjacencyInfo, TendonMaterialMode, evaluate_tendon_force_hessians
 
 wp.set_module_options({"enable_backward": False})
 
@@ -2948,25 +2948,13 @@ def solve_rigid_body(
     external_hessian_aa: wp.array[wp.mat33],  # Angular-angular block from rigid contacts
     # Tendon data
     tendon_adjacency: TendonForceElementAdjacencyInfo,
+    tendon_material_modes: wp.array[TendonMaterialMode],
     tendon_link_body: wp.array[int],
-    tendon_link_type: wp.array[int],
-    tendon_link_radius: wp.array[float],
-    tendon_link_mu: wp.array[float],
-    tendon_link_offset: wp.array[wp.vec3],
-    tendon_link_axis: wp.array[wp.vec3],
-    tendon_link_seg_left: wp.array[int],
-    tendon_seg_rest_length: wp.array[float],
-    tendon_seg_attachment_l_local: wp.array[wp.vec3],
-    tendon_seg_attachment_r_local: wp.array[wp.vec3],
-    tendon_seg_active_compliance: wp.array[float],
-    tendon_seg_active_damping: wp.array[float],
+    tendon_seg_attachment_l: wp.array[wp.vec3],
+    tendon_seg_attachment_r: wp.array[wp.vec3],
     tendon_seg_active: wp.array[int],
     tendon_seg_active_link_l: wp.array[int],
     tendon_seg_active_link_r: wp.array[int],
-    tendon_sigmoid_ea_low: float,
-    tendon_sigmoid_ea_ratio: float,
-    tendon_sigmoid_transition_strain: float,
-    tendon_sigmoid_transition_width: float,
     # Output
     body_q_new: wp.array[wp.transform],
 ):
@@ -3090,30 +3078,16 @@ def solve_rigid_body(
 
     tendon_force, tendon_torque, tendon_h_ll, tendon_h_al, tendon_h_aa = evaluate_tendon_force_hessians(
         body_index,
-        dt,
         body_q,
-        body_q_prev,
         body_com,
         tendon_adjacency,
+        tendon_material_modes,
         tendon_link_body,
-        tendon_link_type,
-        tendon_link_radius,
-        tendon_link_mu,
-        tendon_link_offset,
-        tendon_link_axis,
-        tendon_link_seg_left,
-        tendon_seg_rest_length,
-        tendon_seg_attachment_l_local,
-        tendon_seg_attachment_r_local,
-        tendon_seg_active_compliance,
-        tendon_seg_active_damping,
+        tendon_seg_attachment_l,
+        tendon_seg_attachment_r,
         tendon_seg_active,
         tendon_seg_active_link_l,
         tendon_seg_active_link_r,
-        tendon_sigmoid_ea_low,
-        tendon_sigmoid_ea_ratio,
-        tendon_sigmoid_transition_strain,
-        tendon_sigmoid_transition_width,
     )
     f_force = f_force + tendon_force
     f_torque = f_torque + tendon_torque

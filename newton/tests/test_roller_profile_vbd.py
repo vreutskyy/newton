@@ -11,7 +11,12 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.vbd.tendon_kernels import TendonForceElementAdjacencyInfo, evaluate_tendon_force_hessians
+from newton._src.solvers.vbd.tendon_kernels import (
+    TendonForceElementAdjacencyInfo,
+    TendonMaterialMode,
+    evaluate_tendon_force_hessians,
+    prepare_tendon_material_modes,
+)
 from newton.geometry import RollerProfileCircle, RollerProfileEllipse, RollerProfileSector
 from newton.solvers import SolverVBD
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -20,23 +25,13 @@ from newton.tests.unittest_utils import add_function_test, get_test_devices
 @wp.kernel
 def _forces(
     body: int,
-    dt: float,
     q: wp.array[wp.transform],
-    prev: wp.array[wp.transform],
     com: wp.array[wp.vec3],
     adjacency: TendonForceElementAdjacencyInfo,
+    modes: wp.array[TendonMaterialMode],
     bodies: wp.array[int],
-    types: wp.array[int],
-    radii: wp.array[float],
-    mu: wp.array[float],
-    offsets: wp.array[wp.vec3],
-    axes: wp.array[wp.vec3],
-    cone_l: wp.array[int],
-    rest: wp.array[float],
-    local_l: wp.array[wp.vec3],
-    local_r: wp.array[wp.vec3],
-    compliance: wp.array[float],
-    damping: wp.array[float],
+    attachment_l: wp.array[wp.vec3],
+    attachment_r: wp.array[wp.vec3],
     active: wp.array[int],
     link_l: wp.array[int],
     link_r: wp.array[int],
@@ -45,30 +40,16 @@ def _forces(
 ):
     force, torque, h_ll, h_al, h_aa = evaluate_tendon_force_hessians(
         body,
-        dt,
         q,
-        prev,
         com,
         adjacency,
+        modes,
         bodies,
-        types,
-        radii,
-        mu,
-        offsets,
-        axes,
-        cone_l,
-        rest,
-        local_l,
-        local_r,
-        compliance,
-        damping,
+        attachment_l,
+        attachment_r,
         active,
         link_l,
         link_r,
-        0.0,
-        1.0,
-        0.0,
-        1.0,
     )
     result[0] = force
     result[1] = torque
@@ -77,7 +58,9 @@ def _forces(
     hessian[2] = h_aa
 
 
-def _build(profile, device, *, mu=0.0, damping=0.0, movable=False, orientation=1):
+def _build(
+    profile, device, *, mu=0.0, damping=0.0, movable=False, orientation=1, solver_type=SolverVBD, radius_only=False
+):
     builder = newton.ModelBuilder(gravity=0.0)
     anchor_l = builder.add_body(xform=wp.transform(p=(-0.3, 0.1 * orientation, 0.0)), is_kinematic=True)
     anchor_r = builder.add_body(xform=wp.transform(p=(0.25, 0.16 * orientation, 0.0)), is_kinematic=True)
@@ -94,7 +77,7 @@ def _build(profile, device, *, mu=0.0, damping=0.0, movable=False, orientation=1
     builder.add_tendon_link(
         roller,
         newton.TendonLinkType.ROLLING,
-        profile=profile,
+        **({"radius": profile.radius} if radius_only else {"profile": profile}),
         compliance=1e-3,
         damping=damping,
         mu=mu,
@@ -103,7 +86,7 @@ def _build(profile, device, *, mu=0.0, damping=0.0, movable=False, orientation=1
     builder.add_tendon_link(anchor_r, newton.TendonLinkType.ATTACHMENT, compliance=1e-3, damping=damping)
     builder.color()
     model = builder.finalize(device=device)
-    solver = SolverVBD(model, iterations=16, tendon_settle_tol=1e-6)
+    solver = solver_type(model, iterations=16, tendon_settle_tol=1e-6)
     return builder, model, solver, roller
 
 
@@ -113,8 +96,13 @@ def _load(model, solver, state, tensions=(4.0, 4.0), dt=0.001):
     solver.tendon_seg_rest_length.assign(rest)
     solver._snapshot_tendon_step_state()
     solver._prepare_tendon_route(model, state.body_q, 1e-8)
-    wp.copy(solver.body_q_prev, state.body_q)
-    solver._update_tendon_routing(state, dt, True)
+    if isinstance(solver, SolverVBD):
+        wp.copy(solver.body_q_prev, state.body_q)
+        solver._update_tendon_routing(state, dt, True)
+    else:
+        solver._update_tendon_attachments(state.body_q)
+        solver._update_tendon_cone_rows(model, state.body_q, True)
+        solver._solve_tendon_material(state.body_q, state.body_qd, state.body_q, dt)
 
 
 def _measure(model, solver, state, body, dt=0.001):
@@ -125,23 +113,13 @@ def _measure(model, solver, state, body, dt=0.001):
         dim=1,
         inputs=[
             body,
-            dt,
             state.body_q,
-            solver.body_q_prev,
             model.body_com,
             solver.tendon_adjacency,
+            solver.tendon_material_modes,
             model.tendon_link_body,
-            model.tendon_link_type,
-            model.tendon_link_radius,
-            model.tendon_link_mu,
-            model.tendon_link_offset,
-            model.tendon_link_axis,
-            solver.tendon_link_seg_left,
-            solver.tendon_seg_rest_length,
-            solver.tendon_seg_attachment_l_local,
-            solver.tendon_seg_attachment_r_local,
-            solver.tendon_seg_active_compliance,
-            solver.tendon_seg_active_damping,
+            solver.tendon_seg_attachment_l,
+            solver.tendon_seg_attachment_r,
             solver.tendon_seg_active,
             solver.tendon_seg_active_link_l,
             solver.tendon_seg_active_link_r,
@@ -203,6 +181,266 @@ def test_profile_friction(test, device):
         test.assertAlmostEqual(float(solver.tendon_link_cap_ratio.numpy()[1]), ratio, delta=1e-6)
         test.assertAlmostEqual(float(tension[0] / tension[1]), ratio, delta=6e-4)
         test.assertAlmostEqual(float(np.sum(tension)), 11.0, delta=0.002)
+
+
+def test_stiff_circle_preserves_projected_balance(test, device):
+    """Keep equal projected tensions equal when float32 rest lengths cannot encode their stretch."""
+    for compliance in (1e-4, 1e-6, 1e-8):
+        with test.subTest(compliance=compliance):
+            _, model, solver, roller = _build(RollerProfileCircle(0.05), device)
+            model.tendon_seg_compliance.fill_(compliance)
+            state = model.state()
+            poses = state.body_q.numpy()
+            poses[0, 0] = -1.2
+            state.body_q.assign(poses)
+            solver._update_tendon_attachments(state.body_q)
+            _load(model, solver, state)
+            loads, _ = _measure(model, solver, state, roller)
+            test.assertLess(abs(float(loads[1, 2])), 5e-7)
+
+
+def test_circle_sliding_curvature(test, device):
+    """Do not assign spin stiffness to a centered frictionless circular route."""
+    _, model, solver, roller = _build(RollerProfileCircle(0.05), device)
+    state = model.state()
+    _load(model, solver, state)
+    _, hessian = _measure(model, solver, state, roller)
+    # After free material transfer, rotating the centered circle changes
+    # neither path length nor tension. Its spin row and column must vanish.
+    np.testing.assert_allclose(hessian[1][2], 0.0, atol=1e-5, rtol=0)
+    np.testing.assert_allclose(hessian[2][2], 0.0, atol=1e-5, rtol=0)
+
+
+def test_damped_material_modes_use_total_tension(test, device):
+    """Retain damping-supported tension and its free material mode at nonpositive elastic stretch."""
+    stretch = np.array([0.0006, -0.001, -0.0001, 0.0, -0.001, 0.0006, 0.0006])
+    damping_force = np.array([0.0, 80.0, 80.0, 80.0, 20.0, -40.0, -20.0])
+    count = len(stretch)
+    compliance = np.full(count, 2.0e-5)
+    expected = np.maximum(stretch / compliance + damping_force, 0.0)
+    cone_l = np.full(count + 1, -1)
+    cone_r = np.full(count + 1, -1)
+    cone_l[1], cone_r[1] = 0, 1
+
+    def array(values, dtype=float):
+        return wp.array(values, dtype=dtype, device=device)
+
+    modes = wp.empty(count, dtype=TendonMaterialMode, device=device)
+    wp.launch(
+        prepare_tendon_material_modes,
+        dim=1,
+        inputs=[
+            array([0, count + 1], int),
+            array(cone_l, int),
+            array(cone_r, int),
+            array(np.ones(count + 1)),
+            array(1.0 - stretch),
+            array(np.ones(count)),
+            array(stretch),
+            array(compliance),
+            array(np.full(count, 80.0)),
+            array(damping_force),
+            array(np.ones(count), int),
+            0.001,
+            0.0,
+            20.0,
+            0.001,
+            0.001,
+        ],
+        outputs=[modes],
+        device=device,
+    )
+    result = modes.numpy()
+    np.testing.assert_allclose(result["tension"], expected, atol=1.0e-5)
+    np.testing.assert_allclose(result["stiffness"], np.where(expected > 0.0, 130000.0, 0.0), rtol=1.0e-6)
+    np.testing.assert_array_equal(result["first"][:2], [0, 0])
+    np.testing.assert_array_equal(result["last"][:2], [1, 1])
+
+
+def test_material_curvature_reference(test, device):
+    """Match independent dense elimination, including repeated bodies and cone boundaries."""
+    rng = np.random.default_rng(2976)
+    for count in (1, 2, 8, 32):
+        for damping_scale in (0.0, 2.0):
+            with test.subTest(count=count, damping=damping_scale):
+                dt = 0.003
+                comp = rng.uniform(1e-4, 1e-3, count)
+                damping = rng.uniform(0, damping_scale, count)
+                left = rng.uniform(-1, 1, (count, 3))
+                right = rng.uniform(-1, 1, (count, 3))
+                length = np.linalg.norm(right - left, axis=1)
+                force = np.full(count, 4.0)
+                stretch = comp * force
+                rest = length - stretch
+                ratio = np.ones(count + 1)
+                active = np.ones(count, dtype=np.int32)
+                bodies = np.arange(count + 1, dtype=np.int32) % 3
+                if count > 2:
+                    # A finite-friction boundary remains on the sticking tangent
+                    # even when the projected force is exactly on its slip bound.
+                    ratio[2] = 1.7
+                    force[2] *= ratio[2]
+                    stretch[2] = comp[2] * force[2]
+                    bodies[-1] = bodies[-2]  # one same-body span
+                    rest[-2] = 1e-6  # hard depletion breaks the free mode
+                cone_l = np.arange(-1, count, dtype=np.int32)
+                cone_r = np.arange(count + 1, dtype=np.int32)
+                cone_r[[0, -1]] = -1
+                cone_l[-1] = -1
+                link_l = np.arange(count, dtype=np.int32)
+                link_r = np.arange(1, count + 1, dtype=np.int32)
+                if count > 2:
+                    # A deactivated guide leaves an inactive slot inside a
+                    # material block, while the preceding span bypasses it.
+                    gap = count // 2
+                    active[gap] = 0
+                    force[gap] = 0
+                    link_r[gap - 1] = gap + 1
+                    cone_l[gap] = cone_r[gap] = -1
+                    cone_l[gap + 1] = gap - 1
+                modes = wp.empty(count, dtype=TendonMaterialMode, device=device)
+
+                def array(value, dtype=float):
+                    return wp.array(value, dtype=dtype, device=device)
+
+                wp.launch(
+                    prepare_tendon_material_modes,
+                    dim=1,
+                    inputs=[
+                        array([0, count + 1], int),
+                        array(cone_l, int),
+                        array(cone_r, int),
+                        array(ratio),
+                        array(rest),
+                        array(length),
+                        array(stretch),
+                        array(comp),
+                        array(damping),
+                        array(np.zeros(count)),
+                        array(active, int),
+                        dt,
+                        0.0,
+                        20.0,
+                        0.001,
+                        0.001,
+                    ],
+                    outputs=[modes],
+                    device=device,
+                )
+                # Eliminate one independent material-transfer variable for
+                # each freely sliding interface from the full diagonal energy.
+                transfer = []
+                for link in range(1, count):
+                    a, b = cone_l[link], cone_r[link]
+                    if (
+                        a >= 0
+                        and b >= 0
+                        and active[a]
+                        and active[b]
+                        and ratio[link] == 1
+                        and min(rest[a], rest[b]) > 1.001e-6
+                    ):
+                        column = np.zeros(count)
+                        column[a], column[b] = 1, -1
+                        transfer.append(column)
+                stiffness = np.diag(active * (1 / comp + damping / dt))
+                condensed = stiffness.copy()
+                if transfer:
+                    transfer = np.asarray(transfer).T
+                    condensed -= (
+                        stiffness
+                        @ transfer
+                        @ np.linalg.solve(transfer.T @ stiffness @ transfer, transfer.T @ stiffness)
+                    )
+                adjacency = TendonForceElementAdjacencyInfo()
+                adjacency.body_adj_segments = array(np.tile(np.arange(count), 3), int)
+                adjacency.body_adj_segments_offsets = array(np.arange(4) * count, int)
+                directions = (right - left) / length[:, None]
+                for body in range(3):
+                    jacobian = np.zeros((count, 6))
+                    for seg in range(count):
+                        if bodies[link_l[seg]] == body:
+                            jacobian[seg] += np.r_[directions[seg], np.cross(left[seg], directions[seg])]
+                        if bodies[link_r[seg]] == body:
+                            jacobian[seg] -= np.r_[directions[seg], np.cross(right[seg], directions[seg])]
+                    result = wp.zeros(2, dtype=wp.vec3, device=device)
+                    hessian = wp.zeros(3, dtype=wp.mat33, device=device)
+                    wp.launch(
+                        _forces,
+                        dim=1,
+                        inputs=[
+                            body,
+                            array([wp.transform_identity()] * 3, wp.transform),
+                            array(np.zeros((3, 3)), wp.vec3),
+                            adjacency,
+                            modes,
+                            array(bodies, int),
+                            array(left, wp.vec3),
+                            array(right, wp.vec3),
+                            array(active, int),
+                            array(link_l, int),
+                            array(link_r, int),
+                        ],
+                        outputs=[result, hessian],
+                        device=device,
+                    )
+                    blocks = hessian.numpy()
+                    actual = np.block([[blocks[0], blocks[1].T], [blocks[1], blocks[2]]])
+                    np.testing.assert_allclose(actual, jacobian.T @ condensed @ jacobian, rtol=3e-5, atol=0.005)
+                    np.testing.assert_allclose(result.numpy().ravel(), jacobian.T @ force, rtol=1e-5, atol=5e-6)
+
+
+def _tangent_route(profile, normal, point, device, *, orientation=1):
+    """Construct a straight cable touching a prescribed profile."""
+    tangent = orientation * np.array([-normal[1], normal[0]])
+    builder = newton.ModelBuilder(gravity=0.0)
+    left = builder.add_body(xform=wp.transform(p=(*(point - 0.3 * tangent), 0.0)), is_kinematic=True)
+    right = builder.add_body(xform=wp.transform(p=(*(point + 0.4 * tangent), 0.0)), is_kinematic=True)
+    roller = builder.add_body(is_kinematic=True)
+    builder.add_tendon()
+    builder.add_tendon_link(left, newton.TendonLinkType.ATTACHMENT)
+    builder.add_tendon_link(
+        roller, newton.TendonLinkType.ROLLING, profile=profile, compliance=1e-3, mu=0.3, orientation=orientation
+    )
+    builder.add_tendon_link(right, newton.TendonLinkType.ATTACHMENT, compliance=1e-3)
+    builder.color()
+    model = builder.finalize(device=device)
+    return SolverVBD(model, iterations=1)
+
+
+def test_profile_zero_wrap(test, device):
+    """Keep tangent routes at zero wrap instead of inventing a full perimeter."""
+    for profile in (RollerProfileCircle(0.05), RollerProfileEllipse(0.08, 0.02), RollerProfileSector(0.08, 2.2)):
+        for angle in np.linspace(-math.pi, math.pi, 25):
+            normal = np.array([math.cos(angle), math.sin(angle)])
+            if isinstance(profile, RollerProfileCircle):
+                point = profile.radius * normal
+            elif isinstance(profile, RollerProfileEllipse):
+                radii = np.array([profile.a, profile.b])
+                point = radii**2 * normal / np.linalg.norm(radii * normal)
+            else:
+                theta = np.clip(angle, -profile.angle / 2, profile.angle / 2)
+                point = profile.radius * np.array([math.cos(theta), math.sin(theta)])
+                if point @ normal <= 0:
+                    point = np.zeros(2)
+            for orientation in (-1, 1):
+                solver = _tangent_route(profile, normal, point, device, orientation=orientation)
+                with test.subTest(profile=profile, angle=angle, orientation=orientation):
+                    test.assertLess(float(solver.tendon_profile_wrap_length.numpy()[1]), 2e-6)
+                    test.assertAlmostEqual(float(solver.tendon_total_cable.numpy()[0]), 0.7, delta=2e-6)
+
+
+def test_sector_flat_edge(test, device):
+    """Preserve cable along a straight sector edge despite zero tangent turning."""
+    for angle in (0.5, 2.2, math.pi):
+        profile = RollerProfileSector(0.08, angle)
+        for side in (-1, 1):
+            edge = np.array([math.cos(angle / 2), side * math.sin(angle / 2)])
+            normal = np.array([-math.sin(angle / 2), side * math.cos(angle / 2)])
+            for orientation in (-1, 1):
+                solver = _tangent_route(profile, normal, 0.04 * edge, device, orientation=orientation)
+                test.assertAlmostEqual(float(solver.tendon_total_cable.numpy()[0]), 0.7, delta=2e-6)
+                test.assertAlmostEqual(float(solver.tendon_link_cap_ratio.numpy()[1]), 1.0, delta=2e-6)
 
 
 def test_profile_transport(test, device):
@@ -356,7 +594,7 @@ def test_profile_force_reference(test, device):
             )
 
 
-def test_profile_example_graph(test, device):
+def test_profile_example_graph(test, device, solver_name="vbd"):
     """Match graph and uncaptured trajectories, clocks, and odd/even buffers."""
     if not device.is_cuda:
         test.skipTest("CUDA graph capture requires a CUDA device")
@@ -364,8 +602,10 @@ def test_profile_example_graph(test, device):
 
     with wp.ScopedDevice(device):
         for substeps in (3, 4):
-            graph = Example(None, SimpleNamespace(substeps=substeps, iterations=4))
-            plain = Example(None, SimpleNamespace(substeps=substeps, iterations=4, disable_cuda_graph=True))
+            graph = Example(None, SimpleNamespace(substeps=substeps, iterations=4, solver=solver_name))
+            plain = Example(
+                None, SimpleNamespace(substeps=substeps, iterations=4, solver=solver_name, disable_cuda_graph=True)
+            )
             test.assertEqual(int(graph.frame.numpy()[0]), 0)
             np.testing.assert_array_equal(graph.state_0.body_q.numpy(), graph.model.body_q.numpy())
             for frame in range(8):
@@ -389,6 +629,32 @@ def test_profile_example_graph(test, device):
 
 
 class TestRollerProfileVBD(unittest.TestCase):
+    def test_coloring_separates_material_coupling(self):
+        """Bodies coupled through free material must not share a VBD update color."""
+        builder = newton.ModelBuilder(gravity=0.0)
+        bodies = [
+            builder.add_body(xform=wp.transform(p=(i, i % 2, 0)), mass=1.0, inertia=wp.mat33(np.eye(3)))
+            for i in range(4)
+        ]
+        builder.add_tendon()
+        for i, body in enumerate(bodies):
+            builder.add_tendon_link(
+                body,
+                newton.TendonLinkType.ATTACHMENT if i in (0, 3) else newton.TendonLinkType.PINHOLE,
+                compliance=1e-3,
+            )
+        builder.color()
+        model = builder.finalize(device="cpu")
+        colors = np.full(model.body_count, -1)
+        for color, group in enumerate(model.body_color_groups):
+            colors[group.numpy()] = color
+        self.assertEqual(len(set(colors)), 4)
+        SolverVBD(model, iterations=1)
+        # Adjacent endpoints are separate, but material connects the two pairs.
+        model.body_color_groups = [wp.array([0, 2], dtype=int), wp.array([1, 3], dtype=int)]
+        with self.assertRaisesRegex(ValueError, "material-coupled tendon bodies"):
+            SolverVBD(model, iterations=1)
+
     def test_mixed_radius_circle_axis(self):
         """Radius-only circles need no authored in-plane axis in a mixed model."""
         builder = newton.ModelBuilder(gravity=0.0)
@@ -435,6 +701,12 @@ class TestRollerProfileVBD(unittest.TestCase):
 for fn in (
     test_profile_loads,
     test_profile_friction,
+    test_stiff_circle_preserves_projected_balance,
+    test_circle_sliding_curvature,
+    test_material_curvature_reference,
+    test_damped_material_modes_use_total_tension,
+    test_profile_zero_wrap,
+    test_sector_flat_edge,
     test_profile_transport,
     test_profile_step,
     test_profile_frictionless_motion,

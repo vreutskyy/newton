@@ -8,6 +8,8 @@
 # dynamic pulley constrained by a hinge joint.  The heavier weight
 # descends, pulling the lighter weight up; the pulley rotates freely
 # under cable tension — no kinematic rotation tracking needed.
+# Vertical guides and travel stops keep the weights below the pulley so
+# the fixed rolling link stays within its supported zero-to-half-turn wrap.
 #
 # The pulley has finite mass and inertia, so the XPBD constraint
 # solve correctly transmits force between the two sides of the cable
@@ -22,9 +24,14 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton._src.sim.builder import Axis
-from newton._src.sim.tendon import TendonLinkType
-from newton.examples.cable.cable import assert_tendon_total_length, get_tendon_attachment_worlds, get_tendon_cable_lines
+from newton import Axis, TendonLinkType
+from newton.examples.cable.cable import (
+    assert_circular_tendon_wraps,
+    assert_tendon_material_length,
+    assert_tendon_total_length,
+    get_tendon_attachment_worlds,
+    get_tendon_cable_lines,
+)
 
 
 class Example:
@@ -94,34 +101,36 @@ class Example:
             child_xform=wp.transform(),
         )
 
-        planar_lin = [Dof(axis=Axis.X), Dof(axis=Axis.Z)]
-        planar_ang = [Dof(axis=Axis.Y)]
+        # Keep the light anchor near the rim without letting it cross the
+        # pulley crown or swing through the cable route.
+        guide_lin = [Dof(axis=Axis.Z, limit_lower=-1.8, limit_upper=0.24, limit_ke=1.0e5, limit_kd=100.0)]
+        weight_x = 0.30
 
         self.left_idx = left = builder.add_link(
-            xform=wp.transform(p=wp.vec3(-0.5, 0.0, 2.16), q=wp.quat_identity()),
+            xform=wp.transform(p=wp.vec3(-weight_x, 0.0, 2.16), q=wp.quat_identity()),
             mass=1.0,
         )
         builder.add_shape_box(left, hx=0.08, hy=0.08, hz=0.08, cfg=contact_cfg)
         j1 = builder.add_joint_d6(
             parent=-1,
             child=left,
-            linear_axes=planar_lin,
-            angular_axes=planar_ang,
-            parent_xform=wp.transform(p=wp.vec3(-0.5, 0.0, 2.16), q=wp.quat_identity()),
+            linear_axes=guide_lin,
+            angular_axes=[],
+            parent_xform=wp.transform(p=wp.vec3(-weight_x, 0.0, 2.16), q=wp.quat_identity()),
             child_xform=wp.transform(),
         )
 
         self.right_idx = right = builder.add_link(
-            xform=wp.transform(p=wp.vec3(0.5, 0.0, 2.16), q=wp.quat_identity()),
+            xform=wp.transform(p=wp.vec3(weight_x, 0.0, 2.16), q=wp.quat_identity()),
             mass=2.0,
         )
         builder.add_shape_box(right, hx=0.10, hy=0.10, hz=0.10, cfg=contact_cfg)
         j2 = builder.add_joint_d6(
             parent=-1,
             child=right,
-            linear_axes=planar_lin,
-            angular_axes=planar_ang,
-            parent_xform=wp.transform(p=wp.vec3(0.5, 0.0, 2.16), q=wp.quat_identity()),
+            linear_axes=guide_lin,
+            angular_axes=[],
+            parent_xform=wp.transform(p=wp.vec3(weight_x, 0.0, 2.16), q=wp.quat_identity()),
             child_xform=wp.transform(),
         )
 
@@ -251,6 +260,8 @@ class Example:
         )
 
     def test_post_step(self):
+        assert_tendon_material_length(self)
+        assert_circular_tendon_wraps(self)
         body_q = self.state_0.body_q.numpy()
         assert np.isfinite(body_q).all(), "Rolling pulley produced non-finite body state"
         assert float(np.max(np.abs(body_q[:, :3]))) < 20.0, "Rolling pulley body state became unbounded"

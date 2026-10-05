@@ -3,7 +3,6 @@
 
 import warp as wp
 
-from ...sim.tendon import TendonLinkType
 from ..tendon_kernels import (
     tendon_material_tangent,
     tendon_material_tension,
@@ -16,12 +15,96 @@ _MIN_TENDON_COMPLIANCE = wp.constant(1.0e-8)
 
 
 @wp.struct
+class TendonMaterialMode:
+    """A freely sliding material block and its current unilateral force."""
+
+    first: int
+    last: int
+    next: int
+    tension: float
+    stiffness: float
+
+
+@wp.kernel
+def prepare_tendon_material_modes(
+    tendon_start: wp.array[int],
+    cone_l: wp.array[int],
+    cone_r: wp.array[int],
+    cap_ratio: wp.array[float],
+    rest: wp.array[float],
+    length: wp.array[float],
+    stretch: wp.array[float],
+    compliance: wp.array[float],
+    damping: wp.array[float],
+    damping_tension: wp.array[float],
+    active: wp.array[int],
+    dt: float,
+    ea_low: float,
+    ea_ratio: float,
+    transition: float,
+    width: float,
+    modes: wp.array[TendonMaterialMode],
+):
+    """Condense free material modes, retaining the sticking tangent at friction bounds."""
+    tendon = wp.tid()
+    first = tendon_start[tendon] - tendon
+    end = tendon_start[tendon + 1] - tendon - 1
+    for seg in range(first, end):
+        mode = TendonMaterialMode()
+        mode.first = seg
+        mode.last = seg
+        mode.next = -1
+        if active[seg] != 0:
+            comp = wp.max(compliance[seg], _MIN_TENDON_COMPLIANCE)
+            material = stretch[seg] / comp
+            tangent = 1.0 / comp
+            if ea_low > 0.0:
+                material = tendon_material_tension(length[seg], rest[seg], comp, ea_low, ea_ratio, transition, width)
+                tangent = tendon_material_tangent(length[seg], rest[seg], comp, ea_low, ea_ratio, transition, width)
+            # Match the material projection's unilateral Kelvin-Voigt force.
+            # Damping can support positive tension at nonpositive elastic
+            # stretch; testing stretch alone would discard that force.
+            mode.tension = wp.max(material + damping_tension[seg], 0.0)
+            if mode.tension > 0.0:
+                mode.stiffness = tangent + damping[seg] / dt
+        modes[seg] = mode
+
+    for link in range(tendon_start[tendon] + 1, tendon_start[tendon + 1] - 1):
+        left = cone_l[link]
+        right = cone_r[link]
+        if left < first or right >= end or left < 0 or right <= left:
+            continue
+        if active[left] == 0 or active[right] == 0 or rest[left] <= 1.001e-6 or rest[right] <= 1.001e-6:
+            continue
+        if modes[left].stiffness <= 0.0 or modes[right].stiffness <= 0.0:
+            continue
+        # A finite-friction cone boundary is nonsmooth: reverse motion can
+        # stick. Keep that conservative tangent instead of extending a sliding
+        # branch in both directions. A unit ratio has no sticking interval.
+        if cap_ratio[link] == 1.0:
+            l = modes[left]
+            l.next = right
+            modes[left] = l
+
+    head = first
+    while head < end:
+        last = head
+        while modes[last].next >= 0:
+            last = modes[last].next
+        for seg in range(head, last + 1):
+            mode = modes[seg]
+            mode.first = head
+            mode.last = last
+            modes[seg] = mode
+        head = last + 1
+
+
+@wp.struct
 class TendonForceElementAdjacencyInfo:
     """CSR adjacency between VBD rigid bodies and tendon segments."""
 
     body_adj_segments: wp.array[wp.int32]
     body_adj_segments_offsets: wp.array[wp.int32]
-    profile_routing: bool
 
     def to(self, device):
         """Copy the adjacency to a device."""
@@ -31,7 +114,6 @@ class TendonForceElementAdjacencyInfo:
         adjacency = TendonForceElementAdjacencyInfo()
         adjacency.body_adj_segments = self.body_adj_segments.to(device)
         adjacency.body_adj_segments_offsets = self.body_adj_segments_offsets.to(device)
-        adjacency.profile_routing = self.profile_routing
         return adjacency
 
 
@@ -50,7 +132,6 @@ def snapshot_tendon_segment_length_reference(
     seg_active: wp.array[int],
     seg_active_link_l: wp.array[int],
     seg_active_link_r: wp.array[int],
-    profile_routing: bool,
     seg_length_prev: wp.array[float],
 ):
     """Snapshot previous-pose segment lengths for final VBD diagnostics."""
@@ -80,7 +161,6 @@ def snapshot_tendon_segment_length_reference(
         seg_attachment_r_local[seg],
         attachment_l,
         attachment_r,
-        not profile_routing,
     )
     seg_length_prev[seg] = wp.length(attachment_r - attachment_l) - dt * length_rate
 
@@ -145,97 +225,20 @@ def update_tendon_segment_diagnostics(
 
 
 @wp.func
-def _rolling_spin_axis_component(
-    body_q: wp.array[wp.transform],
-    tendon_link_body: wp.array[int],
-    tendon_link_type: wp.array[int],
-    tendon_link_radius: wp.array[float],
-    tendon_link_mu: wp.array[float],
-    tendon_link_offset: wp.array[wp.vec3],
-    tendon_link_axis: wp.array[wp.vec3],
-    tendon_link_seg_left: wp.array[int],
-    seg_attachment_l_local: wp.array[wp.vec3],
-    seg_attachment_r_local: wp.array[wp.vec3],
-    seg_active: wp.array[int],
-    link: int,
-    attachment: wp.vec3,
-    direction: wp.vec3,
-) -> wp.vec3:
-    """Roller-axis moment row of a unit-tension span at a ROLLING link.
-
-    Returns ``(1 - spin_scale) * dot(cross(radial, direction), normal) * normal``
-    — the roller-axis part of the span's moment that an ideal (or partially
-    slipping) pulley cannot transmit through its rim. Zero for non-ROLLING
-    links or when the wrap geometry is unavailable.
-    """
-    if tendon_link_type[link] != int(TendonLinkType.ROLLING):
-        return wp.vec3(0.0)
-    seg_left = tendon_link_seg_left[link]
-    if seg_left < 0:
-        return wp.vec3(0.0)
-    seg_right = seg_left + 1
-    if seg_right >= seg_active.shape[0] or seg_active[seg_left] == 0 or seg_active[seg_right] == 0:
-        return wp.vec3(0.0)
-
-    body = tendon_link_body[link]
-    pose = body_q[body]
-    center = wp.transform_point(pose, tendon_link_offset[link])
-    normal = wp.normalize(wp.transform_vector(pose, tendon_link_axis[link]))
-    point_left = wp.transform_point(pose, seg_attachment_r_local[seg_left])
-    point_right = wp.transform_point(pose, seg_attachment_l_local[seg_right])
-    radial_left = point_left - center
-    radial_right = point_right - center
-    radial_left = radial_left - wp.dot(radial_left, normal) * normal
-    radial_right = radial_right - wp.dot(radial_right, normal) * normal
-    radial_left_length = wp.length(radial_left)
-    radial_right_length = wp.length(radial_right)
-
-    theta = float(0.0)
-    if tendon_link_radius[link] > 0.0 and radial_left_length > 1.0e-8 and radial_right_length > 1.0e-8:
-        unit_left = radial_left / radial_left_length
-        unit_right = radial_right / radial_right_length
-        theta = wp.abs(
-            wp.atan2(
-                wp.dot(wp.cross(unit_left, unit_right), normal),
-                wp.dot(unit_left, unit_right),
-            )
-        )
-
-    cap_ratio = wp.exp(wp.min(wp.max(tendon_link_mu[link], 0.0) * theta, 20.0))
-    spin_scale = (cap_ratio - 1.0) / (cap_ratio + 1.0)
-    radial = attachment - center
-    return (1.0 - spin_scale) * wp.dot(wp.cross(radial, direction), normal) * normal
-
-
-@wp.func
 def evaluate_tendon_force_hessians(
     body: int,
-    dt: float,
     body_q: wp.array[wp.transform],
-    body_q_prev: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
     adjacency: TendonForceElementAdjacencyInfo,
+    modes: wp.array[TendonMaterialMode],
     tendon_link_body: wp.array[int],
-    tendon_link_type: wp.array[int],
-    tendon_link_radius: wp.array[float],
-    tendon_link_mu: wp.array[float],
-    tendon_link_offset: wp.array[wp.vec3],
-    tendon_link_axis: wp.array[wp.vec3],
-    tendon_link_seg_left: wp.array[int],
-    seg_rest_length: wp.array[float],
-    seg_attachment_l_local: wp.array[wp.vec3],
-    seg_attachment_r_local: wp.array[wp.vec3],
-    seg_active_compliance: wp.array[float],
-    seg_active_damping: wp.array[float],
+    seg_attachment_l: wp.array[wp.vec3],
+    seg_attachment_r: wp.array[wp.vec3],
     seg_active: wp.array[int],
     seg_active_link_l: wp.array[int],
     seg_active_link_r: wp.array[int],
-    sigmoid_ea_low: float,
-    sigmoid_ea_ratio: float,
-    sigmoid_transition_strain: float,
-    sigmoid_transition_width: float,
 ):
-    """Evaluate unilateral tendon spring-damper forces for one VBD body."""
+    """Evaluate body loads from material and geometry projected before this body color."""
     force = wp.vec3(0.0)
     torque = wp.vec3(0.0)
     h_ll = wp.mat33(0.0)
@@ -256,176 +259,76 @@ def evaluate_tendon_force_hessians(
         if body != body_l and body != body_r:
             continue
 
-        attachment_l = wp.transform_point(body_q[body_l], seg_attachment_l_local[seg])
-        attachment_r = wp.transform_point(body_q[body_r], seg_attachment_r_local[seg])
+        attachment_l = seg_attachment_l[seg]
+        attachment_r = seg_attachment_r[seg]
         direction = attachment_r - attachment_l
         length = wp.length(direction)
         if length <= 1.0e-8:
             continue
         direction = direction / length
 
-        compliance = wp.max(seg_active_compliance[seg], _MIN_TENDON_COMPLIANCE)
-
-        rest_length = seg_rest_length[seg]
-        if length <= rest_length:
-            continue
-
-        length_rate = tendon_segment_length_rate_from_poses(
-            dt,
-            body_q,
-            body_q_prev,
-            body_com,
-            tendon_link_body,
-            tendon_link_type,
-            tendon_link_offset,
-            tendon_link_axis,
-            link_l,
-            link_r,
-            seg_attachment_l_local[seg],
-            seg_attachment_r_local[seg],
-            attachment_l,
-            attachment_r,
-            not adjacency.profile_routing,
-        )
-
-        stiffness = 1.0 / compliance
-        damping = seg_active_damping[seg]
-        tension = stiffness * (length - rest_length) + damping * length_rate
-        if sigmoid_ea_low > 0.0:
-            stiffness = tendon_material_tangent(
-                length,
-                rest_length,
-                compliance,
-                sigmoid_ea_low,
-                sigmoid_ea_ratio,
-                sigmoid_transition_strain,
-                sigmoid_transition_width,
-            )
-            tension = (
-                tendon_material_tension(
-                    length,
-                    rest_length,
-                    compliance,
-                    sigmoid_ea_low,
-                    sigmoid_ea_ratio,
-                    sigmoid_transition_strain,
-                    sigmoid_transition_width,
-                )
-                + damping * length_rate
-            )
-        tension = wp.max(tension, 0.0)
+        tension = modes[seg].tension
 
         if tension <= 0.0:
             continue
 
         if body_l == body_r:
-            if adjacency.profile_routing:
-                # Internal span endpoint loads cancel on the same rigid body.
-                continue
-            # Both endpoints ride this body: the endpoint forces and their base
-            # torques cancel exactly, but the rolling spin corrections are
-            # asymmetric, leaving a net roller-axis torque — the same net row
-            # XPBD's combined same-body Jacobian applies. Without it, a cable
-            # that wraps a roller and terminates on the same body transmits no
-            # torque at all (toy3 cable B: R3 -> tip on link1).
-            fix_l = _rolling_spin_axis_component(
-                body_q,
-                tendon_link_body,
-                tendon_link_type,
-                tendon_link_radius,
-                tendon_link_mu,
-                tendon_link_offset,
-                tendon_link_axis,
-                tendon_link_seg_left,
-                seg_attachment_l_local,
-                seg_attachment_r_local,
-                seg_active,
-                link_l,
-                attachment_l,
-                direction,
-            )
-            fix_r = _rolling_spin_axis_component(
-                body_q,
-                tendon_link_body,
-                tendon_link_type,
-                tendon_link_radius,
-                tendon_link_mu,
-                tendon_link_offset,
-                tendon_link_axis,
-                tendon_link_seg_left,
-                seg_attachment_l_local,
-                seg_attachment_r_local,
-                seg_active,
-                link_r,
-                attachment_r,
-                direction,
-            )
-            net_moment_axis = fix_l - fix_r
-            torque = torque - tension * net_moment_axis
-            same_body_stiffness = stiffness + damping / dt
-            h_aa = h_aa + same_body_stiffness * wp.outer(net_moment_axis, net_moment_axis)
+            # Internal straight-span forces and moments cancel on one body.
             continue
 
         world_com = wp.transform_point(body_q[body], body_com[body])
         if body == body_l:
             attachment = attachment_l
-            link = link_l
             body_force = tension * direction
         else:
             attachment = attachment_r
-            link = link_r
             body_force = -tension * direction
 
         moment_arm = attachment - world_com
-        moment_axis = wp.cross(moment_arm, direction)
         body_torque = wp.cross(moment_arm, body_force)
-
-        if tendon_link_type[link] == int(TendonLinkType.ROLLING) and not adjacency.profile_routing:
-            # Free-span tension still loads the body, but only capstan friction
-            # transmits the rolling-axis part of its moment.
-            seg_left = tendon_link_seg_left[link]
-            if seg_left >= 0:
-                seg_right = seg_left + 1
-
-                if seg_right < seg_active.shape[0] and seg_active[seg_left] != 0 and seg_active[seg_right] != 0:
-                    pose = body_q[body]
-                    center = wp.transform_point(pose, tendon_link_offset[link])
-                    normal = wp.normalize(wp.transform_vector(pose, tendon_link_axis[link]))
-                    point_left = wp.transform_point(pose, seg_attachment_r_local[seg_left])
-                    point_right = wp.transform_point(pose, seg_attachment_l_local[seg_right])
-                    radial_left = point_left - center
-                    radial_right = point_right - center
-                    radial_left = radial_left - wp.dot(radial_left, normal) * normal
-                    radial_right = radial_right - wp.dot(radial_right, normal) * normal
-                    radial_left_length = wp.length(radial_left)
-                    radial_right_length = wp.length(radial_right)
-
-                    theta = float(0.0)
-                    if tendon_link_radius[link] > 0.0 and radial_left_length > 1.0e-8 and radial_right_length > 1.0e-8:
-                        unit_left = radial_left / radial_left_length
-                        unit_right = radial_right / radial_right_length
-                        theta = wp.abs(
-                            wp.atan2(
-                                wp.dot(wp.cross(unit_left, unit_right), normal),
-                                wp.dot(unit_left, unit_right),
-                            )
-                        )
-
-                    cap_ratio = wp.exp(wp.min(wp.max(tendon_link_mu[link], 0.0) * theta, 20.0))
-                    spin_scale = (cap_ratio - 1.0) / (cap_ratio + 1.0)
-                    radial = attachment - center
-                    spin_moment_axis = wp.cross(radial, direction)
-                    spin_torque = wp.cross(radial, body_force)
-                    moment_axis = moment_axis - (1.0 - spin_scale) * wp.dot(spin_moment_axis, normal) * normal
-                    body_torque = body_torque - (1.0 - spin_scale) * wp.dot(spin_torque, normal) * normal
-
-        effective_stiffness = stiffness + damping / dt
 
         force = force + body_force
         torque = torque + body_torque
-        # The axial Gauss-Newton approximation remains positive semidefinite.
-        h_ll = h_ll + effective_stiffness * wp.outer(direction, direction)
-        h_al = h_al + effective_stiffness * wp.outer(moment_axis, direction)
-        h_aa = h_aa + effective_stiffness * wp.outer(moment_axis, moment_axis)
+
+    # Eliminate freely sliding material coordinates before assembling the
+    # Gauss-Newton curvature: series compliance is sum(1/k_i), and the path
+    # gradient is sum(J_i). This preserves cancellation between adjacent
+    # spans (including a circle's spin nullspace) without inspecting profiles.
+    # Finite-friction interfaces retain their sticking-side tangent; the
+    # capstan projection still determines all forces above.
+    previous = int(-1)
+    world_com = wp.transform_point(body_q[body], body_com[body])
+    for adjacent_index in range(adjacent_start, adjacent_end):
+        adjacent_seg = adjacency.body_adj_segments[adjacent_index]
+        if seg_active[adjacent_seg] == 0:
+            continue
+        mode = modes[adjacent_seg]
+        if mode.first == previous:
+            continue
+        previous = mode.first
+        linear = wp.vec3(0.0)
+        angular = wp.vec3(0.0)
+        mode_compliance = float(0.0)
+        for seg in range(mode.first, mode.last + 1):
+            if seg_active[seg] == 0 or modes[seg].stiffness <= 0.0:
+                continue
+            left = seg_attachment_l[seg]
+            right = seg_attachment_r[seg]
+            length = wp.length(right - left)
+            if length <= 1.0e-8:
+                continue
+            stiffness = modes[seg].stiffness
+            mode_compliance += 1.0 / stiffness
+            direction = (right - left) / length
+            if tendon_link_body[seg_active_link_l[seg]] == body:
+                linear += direction
+                angular += wp.cross(left - world_com, direction)
+            if tendon_link_body[seg_active_link_r[seg]] == body:
+                linear -= direction
+                angular -= wp.cross(right - world_com, direction)
+        if mode_compliance > 0.0:
+            h_ll += wp.outer(linear, linear) / mode_compliance
+            h_al += wp.outer(angular, linear) / mode_compliance
+            h_aa += wp.outer(angular, angular) / mode_compliance
 
     return force, torque, h_ll, h_al, h_aa

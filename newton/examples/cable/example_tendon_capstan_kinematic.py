@@ -5,16 +5,18 @@
 # Example Tendon Capstan Kinematic
 #
 # Three side-by-side asymmetric Atwood machines with
-# kinematic (fixed) pulleys and different placeholder capstan friction
+# kinematic (fixed) pulleys and different capstan friction
 # coefficients:
 #
 #   Left:   mu = 0.0
-#   Center: mu = 0.05
+#   Center: mu = 0.08
 #   Right:  mu = 10.0
 #
 # The unified capstan projection uses the same path for all three cases:
 # zero friction slips freely, finite friction reduces slip, and high friction
 # locks against the fixed pulley.
+# Vertical guides and travel stops preserve supported wraps throughout the
+# run. Compare slip before the weights reach their stops.
 #
 # Command: python -m newton.examples tendon_capstan_kinematic
 #
@@ -26,7 +28,12 @@ import warp as wp
 import newton
 import newton.examples
 from newton import Axis, TendonLinkType
-from newton.examples.cable.cable import assert_tendon_total_length, get_tendon_cable_lines
+from newton.examples.cable.cable import (
+    assert_circular_tendon_wraps,
+    assert_tendon_material_length,
+    assert_tendon_total_length,
+    get_tendon_cable_lines,
+)
 
 
 class Example:
@@ -54,8 +61,7 @@ class Example:
         q_cyl = wp.quat(np.sin(np.pi / 4.0), 0.0, 0.0, np.cos(np.pi / 4.0))
 
         Dof = newton.ModelBuilder.JointDofConfig
-        planar_lin = [Dof(axis=Axis.X), Dof(axis=Axis.Z)]
-        planar_ang = []
+        guide_lin = [Dof(axis=Axis.Z, limit_lower=-1.65, limit_upper=1.25, limit_ke=1.0e5, limit_kd=100.0)]
 
         self.pulley_indices = []
         self.left_indices = []
@@ -87,8 +93,8 @@ class Example:
             j1 = builder.add_joint_d6(
                 parent=-1,
                 child=left,
-                linear_axes=planar_lin,
-                angular_axes=planar_ang,
+                linear_axes=guide_lin,
+                angular_axes=[],
                 parent_xform=wp.transform(p=left_pos),
                 child_xform=wp.transform(),
             )
@@ -104,8 +110,8 @@ class Example:
             j2 = builder.add_joint_d6(
                 parent=-1,
                 child=right,
-                linear_axes=planar_lin,
-                angular_axes=planar_ang,
+                linear_axes=guide_lin,
+                angular_axes=[],
                 parent_xform=wp.transform(p=right_pos),
                 child_xform=wp.transform(),
             )
@@ -185,7 +191,11 @@ class Example:
         self._right_z_history.append(np.array([body_q[i][2] for i in self.right_indices], dtype=np.float64))
 
     def test_post_step(self):
-        assert_tendon_total_length(self, rel_tol=0.06)
+        assert_circular_tendon_wraps(self)
+        assert_tendon_material_length(self)
+        # A stop can unload the cable. Its taut geometric path may then be
+        # shorter, but the free plus wrapped material must still be conserved.
+        assert_tendon_total_length(self, rel_tol=0.06, allow_slack=True)
         if self.sim_time < self.frame_dt * 1.5:
             att_r = self.solver.tendon_seg_attachment_r.numpy()
             att_l = self.solver.tendon_seg_attachment_l.numpy()
@@ -201,7 +211,8 @@ class Example:
                 )
 
     def test_final(self):
-        assert_tendon_total_length(self, rel_tol=0.06)
+        assert_tendon_material_length(self)
+        assert_tendon_total_length(self, rel_tol=0.06, allow_slack=True)
         body_q = self.state_0.body_q.numpy()
         assert np.isfinite(body_q).all(), "Non-finite values in body positions"
         if not self._right_z_history:
@@ -211,8 +222,13 @@ class Example:
         right_z = np.array(self._right_z_history)
         assert np.isfinite(left_z).all() and np.isfinite(right_z).all(), "Non-finite capstan trajectory"
 
-        left_disp = left_z[-1] - self._initial_left_z
-        right_disp = self._initial_right_z - right_z[-1]
+        # Once a weight reaches its stop, travel is no longer a measure of
+        # friction. Compare the same pre-stop interval in all three cases.
+        # In the first half-second even free fall travels less than 1.25 m,
+        # leaving room before the upper stop in this setup.
+        slip_sample = min(int(0.5 / self.frame_dt) - 1, len(right_z) - 1)
+        left_disp = left_z[slip_sample] - self._initial_left_z
+        right_disp = self._initial_right_z - right_z[slip_sample]
 
         assert np.max(left_z[:, :2]) < self.pulley_z - self.pulley_radius - 0.05, (
             f"Low/mid kinematic capstan weights should stay below the pulley: max_z={np.max(left_z[:, :2], axis=0)}"
@@ -229,11 +245,14 @@ class Example:
             f"High-friction kinematic capstan should lock more than mid friction: dz={right_disp}"
         )
         assert right_disp[2] < 0.08, f"High-friction kinematic capstan should lock cable motion: dz={right_disp}"
-        if len(left_z) > 2:
-            left_step = np.max(np.abs(np.diff(left_z[:, :2], axis=0)), axis=0)
-            right_step = np.max(np.abs(np.diff(right_z[:, :2], axis=0)), axis=0)
-            left_acc_step = np.max(np.abs(np.diff(left_z[:, :2], n=2, axis=0)), axis=0)
-            right_acc_step = np.max(np.abs(np.diff(right_z[:, :2], n=2, axis=0)), axis=0)
+        if slip_sample > 1:
+            # These smooth-slip checks exclude deliberate stop impacts.
+            left_slip = left_z[: slip_sample + 1, :2]
+            right_slip = right_z[: slip_sample + 1, :2]
+            left_step = np.max(np.abs(np.diff(left_slip, axis=0)), axis=0)
+            right_step = np.max(np.abs(np.diff(right_slip, axis=0)), axis=0)
+            left_acc_step = np.max(np.abs(np.diff(left_slip, n=2, axis=0)), axis=0)
+            right_acc_step = np.max(np.abs(np.diff(right_slip, n=2, axis=0)), axis=0)
             assert np.max(left_step) < 0.045 and np.max(right_step) < 0.045, (
                 f"Low/mid kinematic capstan slip should move smoothly per frame: "
                 f"left_step={left_step}, right_step={right_step}"

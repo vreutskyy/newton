@@ -147,7 +147,10 @@ def _support_point(
         candidate = wp.vec2(profile.corner[0], wp.sign(direction[1]) * profile.corner[1])
         if radius * unit[0] >= profile.corner[0]:
             candidate = radius * unit
-        if wp.dot(candidate, direction) > 0.0:
+        # A radial face has many supporting points. Resolve a float32 tie to
+        # the apex consistently, so entry/exit queries cannot spuriously wrap
+        # the other way around the profile while the cable follows that face.
+        if wp.dot(candidate, direction) > 2.0e-7 * radius * wp.length(direction):
             point = candidate
     return point
 

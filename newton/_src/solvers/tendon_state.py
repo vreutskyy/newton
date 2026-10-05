@@ -407,6 +407,109 @@ class TendonStateMixin:
             device=model.device,
         )
 
+    def _update_tendon_attachments(self, body_q: wp.array[wp.transform], *, rolling: bool = True) -> None:
+        """Query route geometry independently of the mechanical formulation."""
+        model = self.model
+        if model.tendon_profile_routing:
+            self._update_profile_attachments(body_q, rolling=rolling)
+        else:
+            wp.launch(
+                kernel=update_tendon_attachments,
+                dim=model.tendon_segment_count,
+                inputs=[
+                    body_q,
+                    model.tendon_link_body,
+                    model.tendon_link_type,
+                    model.tendon_link_flags,
+                    model.tendon_link_radius,
+                    model.tendon_link_orientation,
+                    model.tendon_link_offset,
+                    model.tendon_link_axis,
+                    self.tendon_seg_active,
+                    self.tendon_seg_active_link_l,
+                    self.tendon_seg_active_link_r,
+                    self.tendon_link_active,
+                    self.tendon_link_active_step,
+                    self.tendon_seg_attachment_l_local_step,
+                    self.tendon_seg_attachment_r_local_step,
+                    int(rolling),
+                ],
+                outputs=[
+                    self.tendon_seg_attachment_l,
+                    self.tendon_seg_attachment_r,
+                    self.tendon_seg_attachment_l_local,
+                    self.tendon_seg_attachment_r_local,
+                    self.tendon_seg_rolling_delta_l,
+                    self.tendon_seg_rolling_delta_r,
+                    self.tendon_seg_length,
+                ],
+                device=model.device,
+            )
+
+    def _solve_tendon_material(
+        self,
+        body_q: wp.array[wp.transform],
+        body_qd: wp.array[wp.spatial_vector],
+        body_q_prev: wp.array[wp.transform],
+        dt: float,
+        *,
+        damping_from_pose_delta: bool = False,
+    ) -> None:
+        """Project material on the current route with the solver's damping convention."""
+        model = self.model
+        wp.launch(
+            kernel=solve_tendon_material,
+            dim=model.tendon_count,
+            inputs=[
+                body_q,
+                body_qd,
+                body_q_prev,
+                model.body_com,
+                model.tendon_start,
+                model.tendon_link_body,
+                model.tendon_link_type,
+                model.tendon_link_radius,
+                model.tendon_link_offset,
+                model.tendon_link_axis,
+                self.tendon_seg_rest_length,
+                self.tendon_seg_rest_length_step,
+                self.tendon_seg_route_rest_length,
+                self.tendon_seg_stretch,
+                self.tendon_seg_damping_tension,
+                self.tendon_seg_active,
+                self.tendon_seg_active_link_l,
+                self.tendon_seg_active_link_r,
+                self.tendon_seg_active_compliance,
+                self.tendon_seg_active_damping,
+                self.tendon_link_active,
+                self.tendon_link_active_step,
+                self.tendon_link_route_rest_length,
+                self.tendon_seg_attachment_l,
+                self.tendon_seg_attachment_r,
+                self.tendon_seg_length,
+                self.tendon_seg_attachment_l_local,
+                self.tendon_seg_attachment_r_local,
+                self.tendon_seg_rolling_delta_l,
+                self.tendon_seg_rolling_delta_r,
+                self.tendon_link_cone_seg_l,
+                self.tendon_link_cone_seg_r,
+                self.tendon_link_cap_ratio,
+                self.tendon_cone_sweep_count,
+                int(damping_from_pose_delta),
+                dt,
+                1,
+                1,
+                1,
+                self.tendon_max_sweeps,
+                self.tendon_settle_tol,
+                self.tendon_sigmoid_ea_low,
+                self.tendon_sigmoid_ea_ratio,
+                self.tendon_sigmoid_transition_strain,
+                self.tendon_sigmoid_transition_width,
+            ],
+            device=model.device,
+        )
+
     def _compute_active_route_rest_lengths(self, model: Model) -> tuple[np.ndarray, np.ndarray]:
         """Compute bypass material lengths for dynamically routed rolling links."""
         route_rest = np.zeros(model.tendon_link_count, dtype=np.float32)
@@ -661,7 +764,6 @@ class TendonStateMixin:
                 self.tendon_sigmoid_ea_ratio,
                 self.tendon_sigmoid_transition_strain,
                 self.tendon_sigmoid_transition_width,
-                model.tendon_profile_routing,
             ],
             device=model.device,
         )

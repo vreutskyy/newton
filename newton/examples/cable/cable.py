@@ -213,6 +213,59 @@ def get_tendon_total_lengths(solver, model, state):
     return lengths
 
 
+def assert_circular_tendon_wraps(example):
+    """Check that circular rolling links stay within zero to half a turn."""
+    model, solver = example.model, example.solver
+    att_l, att_r = get_tendon_attachment_worlds(solver, model, example.state_0)
+    body_q = example.state_0.body_q.numpy()
+    bodies = model.tendon_link_body.numpy()
+    offsets = model.tendon_link_offset.numpy()
+    axes = model.tendon_link_axis.numpy()
+    orientations = model.tendon_link_orientation.numpy()
+    types = model.tendon_link_type.numpy()
+    seg_l = solver.tendon_link_cone_seg_l.numpy()
+    seg_r = solver.tendon_link_cone_seg_r.numpy()
+    for link in range(model.tendon_link_count):
+        if types[link] != int(newton.TendonLinkType.ROLLING) or seg_l[link] < 0 or seg_r[link] < 0:
+            continue
+        if bodies[link] < 0:
+            center, normal = offsets[link], axes[link]
+        else:
+            pose = body_q[bodies[link]]
+            center = _transform_point_np(pose, offsets[link])
+            normal = _transform_vector_np(pose, axes[link])
+        incoming = att_r[seg_l[link]] - center
+        outgoing = att_l[seg_r[link]] - center
+        angle = orientations[link] * np.arctan2(
+            np.dot(np.cross(incoming, outgoing), normal), np.dot(incoming, outgoing)
+        )
+        # atan2 may represent an exact half turn as -pi.
+        assert angle >= -1.0e-6 or angle <= -np.pi + 1.0e-6, (
+            f"Rolling link {link} left the supported wrap range [0, pi]: {np.degrees(angle):.5f} degrees"
+        )
+
+
+def assert_tendon_material_length(example, abs_tol=1.0e-3):
+    """Check free-span rest length plus circular wraps, including slack spans."""
+    model, solver = example.model, example.solver
+    current = get_tendon_total_lengths(solver, model, example.state_0).astype(np.float64)
+    att_l, att_r = get_tendon_attachment_worlds(solver, model, example.state_0)
+    length = np.linalg.norm(att_r - att_l, axis=1)
+    rest = solver.tendon_seg_rest_length.numpy()
+    active = solver.tendon_seg_active.numpy().astype(bool)
+    starts = model.tendon_start.numpy()
+    for tendon in range(model.tendon_count):
+        a, b = starts[tendon] - tendon, starts[tendon + 1] - tendon - 1
+        current[tendon] += np.sum((rest[a:b] - length[a:b])[active[a:b]], dtype=np.float64)
+    np.testing.assert_allclose(
+        current,
+        solver.tendon_total_cable.numpy(),
+        rtol=0.0,
+        atol=abs_tol,
+        err_msg="Free plus wrapped tendon material was not conserved",
+    )
+
+
 def assert_tendon_total_length(example, rel_tol=0.05, abs_tol=1.0e-3, allow_slack=False):
     """Assert that an example's geometric cable lengths stay near target.
 

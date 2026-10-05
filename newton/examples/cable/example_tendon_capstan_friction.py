@@ -19,9 +19,9 @@
 # The XPBD constraint solver couples the pulley's rotational inertia
 # I/R^2 to the system through the shared body.  The capstan bound
 # activates only when the required tension ratio exceeds exp(mu*theta).
-# The pulleys use explicit high inertia and the planar weights keep a
-# fixed orientation so contact with the pulley does not tumble the
-# light body over the rim.
+# The pulleys use explicit high inertia. Vertical guides with travel stops
+# keep the weights below the rim and the fixed rolling links within their
+# supported zero-to-half-turn wraps.
 # With dynamic pulleys, low finite friction spins the pulley only partially.
 # The red tab on each pulley marks rim rotation; the frictionless pulley
 # should translate the cable without spinning.
@@ -35,15 +35,18 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton._src.sim.builder import Axis
-from newton._src.sim.tendon import TendonLinkType
+from newton import Axis, TendonLinkType
 from newton.examples.cable.cable import (
+    assert_circular_tendon_wraps,
+    assert_tendon_material_length,
     assert_tendon_total_length,
     get_tendon_attachment_worlds,
     get_tendon_cable_lines,
 )
 
-DYNAMIC_CAPSTAN_MUS = (0.0, 0.40, 10.0)
+# The middle case must be below the no-slip threshold. With physical contact
+# moments, 0.4 already locks this lightly asymmetric Atwood machine.
+DYNAMIC_CAPSTAN_MUS = (0.0, 0.05, 10.0)
 
 
 class Example:
@@ -84,8 +87,7 @@ class Example:
         q_cyl = wp.quat(np.sin(np.pi / 4.0), 0.0, 0.0, np.cos(np.pi / 4.0))
 
         Dof = newton.ModelBuilder.JointDofConfig
-        planar_lin = [Dof(axis=Axis.X), Dof(axis=Axis.Z)]
-        planar_ang = []
+        guide_lin = [Dof(axis=Axis.Z, limit_lower=-1.8, limit_upper=1.7, limit_ke=1.0e5, limit_kd=100.0)]
 
         self.pulley_indices = []
         self.left_indices = []
@@ -147,8 +149,8 @@ class Example:
             j1 = builder.add_joint_d6(
                 parent=-1,
                 child=left,
-                linear_axes=planar_lin,
-                angular_axes=planar_ang,
+                linear_axes=guide_lin,
+                angular_axes=[],
                 parent_xform=wp.transform(p=left_pos),
                 child_xform=wp.transform(),
             )
@@ -164,8 +166,8 @@ class Example:
             j2 = builder.add_joint_d6(
                 parent=-1,
                 child=right,
-                linear_axes=planar_lin,
-                angular_axes=planar_ang,
+                linear_axes=guide_lin,
+                angular_axes=[],
                 parent_xform=wp.transform(p=right_pos),
                 child_xform=wp.transform(),
             )
@@ -272,6 +274,8 @@ class Example:
             )
 
     def test_post_step(self):
+        assert_tendon_material_length(self)
+        assert_circular_tendon_wraps(self)
         assert_tendon_total_length(self, rel_tol=0.60)
         body_q = self.state_0.body_q.numpy()
         assert np.isfinite(body_q).all(), "Dynamic capstan produced non-finite body state"

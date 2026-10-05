@@ -1,324 +1,258 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Warp kernels for tendon (cable joint) simulation in the XPBD solver.
-
-Implements the Cable Joints method [Müller et al. SCA 2018]. The solver
-supports rolling contacts, fixed attachments, frictional pinholes, and finite
-capstan slip through the link friction coefficient.
-"""
+"""Shape-independent XPBD stretch rows with condensed sliding material modes."""
 
 import warp as wp
 
-from ...sim.tendon import TendonLinkType
-from ..tendon_kernels import (  # noqa: F401
-    advance_point_on_circle,
-    signed_arc_length,
-    tangent_point_circle,
-    tendon_material_tangent,
-    tendon_material_tension,
-    update_tendon_attachments,
-)
+from ..tendon_kernels import tendon_material_tangent, tendon_material_tension
+
+
+@wp.struct
+class TendonStretchRow:
+    body_l: int
+    body_r: int
+    linear: wp.vec3
+    angular_l: wp.vec3
+    angular_r: wp.vec3
+    residual: float
+    compliance: float
+    motion_scale: float
+    tension: float
+    weight: float
+    next: int
 
 
 @wp.kernel
-def solve_tendon_stretch(
+def prepare_stretch_rows(
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_com: wp.array[wp.vec3],
-    body_inv_mass: wp.array[float],
-    body_inv_inertia: wp.array[wp.mat33],
-    tendon_link_body: wp.array[int],
-    tendon_link_type: wp.array[int],
-    tendon_link_offset: wp.array[wp.vec3],
-    tendon_link_axis: wp.array[wp.vec3],
-    seg_rest_length: wp.array[float],
-    seg_attachment_l: wp.array[wp.vec3],
-    seg_attachment_r: wp.array[wp.vec3],
-    seg_attachment_l_local: wp.array[wp.vec3],
-    seg_attachment_r_local: wp.array[wp.vec3],
-    seg_compliance: wp.array[float],
-    seg_damping: wp.array[float],
-    seg_lambda: wp.array[float],
-    seg_delta_lambda: wp.array[float],
-    seg_active: wp.array[int],
-    seg_active_link_l: wp.array[int],
-    seg_active_link_r: wp.array[int],
-    compliance_lambda_scale: float,
-    relaxation: float,
+    link_body: wp.array[int],
+    active: wp.array[int],
+    link_l: wp.array[int],
+    link_r: wp.array[int],
+    attachment_l: wp.array[wp.vec3],
+    attachment_r: wp.array[wp.vec3],
+    rest: wp.array[float],
+    stretch: wp.array[float],
+    compliance: wp.array[float],
+    damping: wp.array[float],
     dt: float,
-    sigmoid_ea_low: float,
-    sigmoid_ea_ratio: float,
-    sigmoid_transition_strain: float,
-    sigmoid_transition_width: float,
-    # outputs
-    seg_material_tension: wp.array[float],
-    body_deltas: wp.array[wp.spatial_vector],
+    ea_low: float,
+    ea_ratio: float,
+    transition_strain: float,
+    transition_width: float,
+    rows: wp.array[TendonStretchRow],
+    material_tension: wp.array[float],
 ):
-    """Phase 3: Solve unilateral distance constraints for each tendon segment.
-
-    Launched with dim = tendon_segment_count. Each segment is a distance
-    constraint between attachment points on two rigid bodies.
-    """
+    """Build physical contact Jacobians without knowing the roller shape."""
     seg = wp.tid()
-    seg_material_tension[seg] = 0.0
-    if seg_active[seg] == 0:
-        seg_lambda[seg] = 0.0
-        seg_delta_lambda[seg] = 0.0
-        return
+    row = TendonStretchRow()
+    row.body_l = -1
+    row.body_r = -1
+    row.next = -1
+    material_tension[seg] = 0.0
+    if active[seg] != 0:
+        bl = link_body[link_l[seg]]
+        br = link_body[link_r[seg]]
+        pl = attachment_l[seg]
+        pr = attachment_r[seg]
+        length = wp.length(pr - pl)
+        if length > 1.0e-8:
+            row.body_l = bl
+            row.body_r = br
+            row.linear = (pr - pl) / length
+            row.angular_l = -wp.cross(pl - wp.transform_point(body_q[bl], body_com[bl]), row.linear)
+            row.angular_r = wp.cross(pr - wp.transform_point(body_q[br], body_com[br]), row.linear)
+            rate = wp.dot(row.linear, wp.spatial_top(body_qd[br]) - wp.spatial_top(body_qd[bl]))
+            rate += wp.dot(row.angular_l, wp.spatial_bottom(body_qd[bl]))
+            rate += wp.dot(row.angular_r, wp.spatial_bottom(body_qd[br]))
+            force = tendon_material_tension(
+                length, rest[seg], compliance[seg], ea_low, ea_ratio, transition_strain, transition_width
+            )
+            if ea_low <= 0.0:
+                # Keep the material solve's small stretch, rather than losing it
+                # by subtracting rounded lengths again on a stiff cable.
+                force = wp.max(stretch[seg], 0.0) / wp.max(compliance[seg], 1.0e-30)
+            row.compliance = compliance[seg]
+            row.residual = stretch[seg]
+            row.motion_scale = dt + compliance[seg] * damping[seg]
+            if ea_low > 0.0:
+                tangent = tendon_material_tangent(
+                    length, rest[seg], compliance[seg], ea_low, ea_ratio, transition_strain, transition_width
+                )
+                # Material transfer varies rest length, not geometric length.
+                # For T(strain), -dT/drest = dT/dlength * length/rest.
+                row.compliance = wp.max(rest[seg], 1.0e-8) / (wp.max(length, 1.0e-8) * tangent)
+                row.residual = row.compliance * force
+                row.motion_scale = row.compliance * (dt * tangent + damping[seg])
+            row.residual += row.compliance * damping[seg] * rate
+            row.tension = wp.max(force + damping[seg] * rate, 0.0)
+            if ea_low <= 0.0:
+                # Classify the capstan branch with the same signed elastic
+                # term as the residual, not a separately clamped spring force.
+                row.tension = wp.max(row.residual / wp.max(row.compliance, 1.0e-30), 0.0)
+            row.weight = 1.0
+            material_tension[seg] = force
+    rows[seg] = row
 
-    link_l = seg_active_link_l[seg]
-    link_r = seg_active_link_r[seg]
 
-    body_l = tendon_link_body[link_l]
-    body_r = tendon_link_body[link_r]
-    link_type_l = tendon_link_type[link_l]
-    link_type_r = tendon_link_type[link_r]
+@wp.func
+def _body_row(row: TendonStretchRow, body: int):
+    linear = wp.vec3(0.0)
+    angular = wp.vec3(0.0)
+    if body == row.body_l:
+        linear -= row.linear
+        angular += row.angular_l
+    if body == row.body_r:
+        linear += row.linear
+        angular += row.angular_r
+    return linear, angular
 
-    pose_l = body_q[body_l]
-    pose_r = body_q[body_r]
-    vel_l = wp.spatial_top(body_qd[body_l])  # linear velocity
-    omega_l = wp.spatial_bottom(body_qd[body_l])  # angular velocity
-    vel_r = wp.spatial_top(body_qd[body_r])
-    omega_r = wp.spatial_bottom(body_qd[body_r])
 
-    com_l = body_com[body_l]
-    com_r = body_com[body_r]
-    m_inv_l = body_inv_mass[body_l]
-    m_inv_r = body_inv_mass[body_r]
-    I_inv_l = body_inv_inertia[body_l]
-    I_inv_r = body_inv_inertia[body_r]
-
-    x_l = wp.transform_point(pose_l, seg_attachment_l_local[seg])
-    x_r = wp.transform_point(pose_r, seg_attachment_r_local[seg])
-    seg_attachment_l[seg] = x_l
-    seg_attachment_r[seg] = x_r
-    rest = seg_rest_length[seg]
-    compliance = seg_compliance[seg]
-    damping = seg_damping[seg]
-
-    diff = x_r - x_l
-    d = wp.length(diff)
-
-    # Keep signed stretch because positive length rate may activate damping
-    # before geometric stretch becomes positive.
-    err = d - rest
-    if d <= 1.0e-8:
-        seg_lambda[seg] = 0.0
-        seg_delta_lambda[seg] = 0.0
-        return
-
-    material_tension = tendon_material_tension(
-        d,
-        rest,
-        compliance,
-        sigmoid_ea_low,
-        sigmoid_ea_ratio,
-        sigmoid_transition_strain,
-        sigmoid_transition_width,
-    )
-    seg_material_tension[seg] = material_tension
-
-    # constraint direction
-    n = diff / d
-
-    world_com_l = wp.transform_point(pose_l, com_l)
-    world_com_r = wp.transform_point(pose_r, com_r)
-
-    r_l = x_l - world_com_l
-    r_r = x_r - world_com_r
-
-    # Jacobians
-    linear_l = -n
-    linear_r = n
-    angular_l = -wp.cross(r_l, n)
-    angular_r = wp.cross(r_r, n)
-    # Remove only spin about the roller center; motion of an off-center roller
-    # remains part of the rigid-body Jacobian.
-    if link_type_l == int(TendonLinkType.ROLLING):
-        center_l = wp.transform_point(pose_l, tendon_link_offset[link_l])
-        normal_l = wp.transform_vector(pose_l, tendon_link_axis[link_l])
-        radial_l = x_l - center_l
-        angular_l = angular_l - wp.dot(wp.cross(radial_l, linear_l), normal_l) * normal_l
-    if link_type_r == int(TendonLinkType.ROLLING):
-        center_r = wp.transform_point(pose_r, tendon_link_offset[link_r])
-        normal_r = wp.transform_vector(pose_r, tendon_link_axis[link_r])
-        radial_r = x_r - center_r
-        angular_r = angular_r - wp.dot(wp.cross(radial_r, linear_r), normal_r) * normal_r
-
-    rot_l = wp.transform_get_rotation(pose_l)
-    rot_r = wp.transform_get_rotation(pose_r)
-
-    derr = 0.0
-    denom = 0.0
-    if body_l == body_r:
-        # A shared body has one velocity, so combine its endpoint Jacobians before
-        # forming the effective mass instead of treating it as two independent bodies.
-        linear = linear_l + linear_r
-        angular = angular_l + angular_r
-        derr = wp.dot(linear, vel_l) + wp.dot(angular, omega_l)
-        rot_ang = wp.quat_rotate_inv(rot_l, angular)
-        denom = wp.length_sq(linear) * m_inv_l + wp.dot(rot_ang, I_inv_l * rot_ang)
-    else:
-        derr = (
-            wp.dot(linear_l, vel_l) + wp.dot(linear_r, vel_r) + wp.dot(angular_l, omega_l) + wp.dot(angular_r, omega_r)
-        )
-        denom = wp.length_sq(linear_l) * m_inv_l + wp.length_sq(linear_r) * m_inv_r
-        rot_ang_l = wp.quat_rotate_inv(rot_l, angular_l)
-        rot_ang_r = wp.quat_rotate_inv(rot_r, angular_r)
-        denom += wp.dot(rot_ang_l, I_inv_l * rot_ang_l)
-        denom += wp.dot(rot_ang_r, I_inv_r * rot_ang_r)
-
-    lambda_prev = seg_lambda[seg]
-    if sigmoid_ea_low > 0.0:
-        tangent = tendon_material_tangent(
-            d,
-            rest,
-            compliance,
-            sigmoid_ea_low,
-            sigmoid_ea_ratio,
-            sigmoid_transition_strain,
-            sigmoid_transition_width,
-        )
-        d_lambda = -(lambda_prev + dt * (material_tension + damping * derr))
-        nonlinear_denom = 1.0 + (dt * dt * tangent + dt * damping) * denom
-        d_lambda = d_lambda / nonlinear_denom
-    else:
-        alpha = compliance * compliance_lambda_scale
-        gamma = compliance * damping
-        d_lambda = -(err + alpha * lambda_prev + gamma * derr)
-        linear_denom = (dt + gamma) * denom + compliance / dt
-        if linear_denom > 0.0:
-            d_lambda = d_lambda / linear_denom
-
-    d_lambda = d_lambda * relaxation
-
-    # A cable may transmit tension but not compression. Applying the
-    # unilateral bound to the accumulated multiplier also lets positive
-    # length rate activate damping at zero geometric stretch.
-    lambda_new = wp.min(lambda_prev + d_lambda, 0.0)
-    d_lambda = lambda_new - lambda_prev
-    seg_lambda[seg] = lambda_new
-    seg_delta_lambda[seg] = d_lambda
-
-    # apply positional corrections
-    lin_delta_l = linear_l * d_lambda
-    ang_delta_l = angular_l * d_lambda
-    lin_delta_r = linear_r * d_lambda
-    ang_delta_r = angular_r * d_lambda
-
-    if body_l == body_r:
-        wp.atomic_add(
-            body_deltas,
-            body_l,
-            wp.spatial_vector(lin_delta_l + lin_delta_r, ang_delta_l + ang_delta_r),
-        )
-    else:
-        wp.atomic_add(body_deltas, body_l, wp.spatial_vector(lin_delta_l, ang_delta_l))
-        wp.atomic_add(body_deltas, body_r, wp.spatial_vector(lin_delta_r, ang_delta_r))
+@wp.func
+def _inverse_mass_product(
+    a: TendonStretchRow,
+    b: TendonStretchRow,
+    body_q: wp.array[wp.transform],
+    inv_mass: wp.array[float],
+    inv_inertia: wp.array[wp.mat33],
+):
+    result = float(0.0)
+    for side in range(2):
+        body = a.body_l if side == 0 else a.body_r
+        if body < 0 or (side == 1 and a.body_l == a.body_r):
+            continue
+        la, aa = _body_row(a, body)
+        lb, ab = _body_row(b, body)
+        rotation = wp.transform_get_rotation(body_q[body])
+        aa = wp.quat_rotate_inv(rotation, aa)
+        ab = wp.quat_rotate_inv(rotation, ab)
+        result += inv_mass[body] * wp.dot(la, lb) + wp.dot(aa, inv_inertia[body] * ab)
+    return result
 
 
 @wp.kernel
-def solve_tendon_slip(
+def solve_stretch_blocks(
     body_q: wp.array[wp.transform],
-    tendon_link_seg_left: wp.array[int],
-    tendon_link_body: wp.array[int],
-    tendon_link_type: wp.array[int],
-    tendon_link_radius: wp.array[float],
-    tendon_link_mu: wp.array[float],
-    tendon_link_active: wp.array[bool],
-    tendon_link_offset: wp.array[wp.vec3],
-    tendon_link_axis: wp.array[wp.vec3],
-    seg_attachment_l: wp.array[wp.vec3],
-    seg_attachment_r: wp.array[wp.vec3],
-    seg_compliance: wp.array[float],
-    seg_material_tension: wp.array[float],
-    seg_damping_tension: wp.array[float],
-    seg_delta_lambda: wp.array[float],
+    inv_mass: wp.array[float],
+    inv_inertia: wp.array[wp.mat33],
+    tendon_start: wp.array[int],
+    cone_l: wp.array[int],
+    cone_r: wp.array[int],
+    cap_ratio: wp.array[float],
+    rest: wp.array[float],
+    dt: float,
     relaxation: float,
-    sigmoid_ea_low: float,
-    # outputs
+    settle_tol: float,
+    rows: wp.array[TendonStretchRow],
+    impulse: wp.array[float],
+    delta_impulse: wp.array[float],
     body_deltas: wp.array[wp.spatial_vector],
 ):
-    """Solve one rolling slip/friction row per authored tendon link.
+    """Condense capstan-bound spans into one impulse mode, leaving sticking spans independent.
 
-    Stretch carries the common cable load.  This pass handles the tangential
-    coupling between adjacent spans and pulley rim motion.  The capstan cone
-    controls both rest-length transfer and the admissible spin-axis torque.
+    Sliding fixes neighboring tension ratios. Summing the corresponding material
+    equations eliminates their internal transfer. The resulting scalar solve uses
+    all cross terms of J M^-1 J^T, including repeated bodies and opposing moments.
+    No dense matrix or shape-specific spin correction is needed.
     """
-    link_idx = wp.tid()
-    if tendon_link_type[link_idx] != int(TendonLinkType.ROLLING):
-        return
-    if not tendon_link_active[link_idx]:
-        return
+    tendon = wp.tid()
+    first = tendon_start[tendon] - tendon
+    end = tendon_start[tendon + 1] - tendon - 1
+    for seg in range(first, end):
+        delta_impulse[seg] = 0.0
+        if rows[seg].body_l < 0:
+            impulse[seg] = 0.0
 
-    radius = tendon_link_radius[link_idx]
-    seg_left = tendon_link_seg_left[link_idx]
-    if radius <= 0.0 or seg_left < 0:
-        return
+    # Record the active sliding connections. Depleted spans cannot freely
+    # exchange material, even if their contact has zero friction.
+    for link in range(tendon_start[tendon] + 1, tendon_start[tendon + 1] - 1):
+        left = cone_l[link]
+        right = cone_r[link]
+        if left < first or right >= end or left < 0 or right <= left:
+            continue
+        l = rows[left]
+        r = rows[right]
+        if l.body_l < 0 or r.body_l < 0 or rest[left] <= 1.001e-6 or rest[right] <= 1.001e-6:
+            continue
+        ratio = cap_ratio[link]
+        scale = wp.max(l.tension, r.tension)
+        tolerance = wp.max(4.0 * settle_tol, 2.0e-4) * scale
+        factor = float(0.0)
+        if ratio == 1.0:
+            factor = 1.0
+        elif scale > 1.0e-8:
+            if wp.abs(l.tension - ratio * r.tension) <= tolerance:
+                factor = 1.0 / ratio
+            elif wp.abs(r.tension - ratio * l.tension) <= tolerance:
+                factor = ratio
+        if factor > 0.0:
+            l.next = right
+            r.weight = factor
+            rows[left] = l
+            rows[right] = r
 
-    seg_right = seg_left + 1
-    body = tendon_link_body[link_idx]
-    pose = body_q[body]
-    center = wp.transform_point(pose, tendon_link_offset[link_idx])
-    normal = wp.transform_vector(pose, tendon_link_axis[link_idx])
-
-    pt_left = seg_attachment_r[seg_left]
-    pt_right = seg_attachment_l[seg_right]
-    r_left = pt_left - center
-    r_right = pt_right - center
-    r_left = r_left - wp.dot(r_left, normal) * normal
-    r_right = r_right - wp.dot(r_right, normal) * normal
-    len_rl = wp.length(r_left)
-    len_rr = wp.length(r_right)
-    theta = wp.pi
-    if len_rl > 1.0e-8 and len_rr > 1.0e-8:
-        u_left = r_left / len_rl
-        u_right = r_right / len_rr
-        theta = wp.abs(wp.atan2(wp.dot(wp.cross(u_left, u_right), normal), wp.dot(u_left, u_right)))
-
-    cap_ratio = wp.exp(wp.min(wp.max(tendon_link_mu[link_idx], 0.0) * theta, 20.0))
-    beta = (cap_ratio - 1.0) / (cap_ratio + 1.0)
-
-    # Match the stretch row's constitutive tension and add its damping component.
-    compliance_l = seg_compliance[seg_left]
-    compliance_r = seg_compliance[seg_right]
-    nonlinear_material = sigmoid_ea_low > 0.0
-    damping_tension_l = seg_damping_tension[seg_left] if nonlinear_material or compliance_l > 0.0 else 0.0
-    damping_tension_r = seg_damping_tension[seg_right] if nonlinear_material or compliance_r > 0.0 else 0.0
-    force_l = wp.max(seg_material_tension[seg_left] + damping_tension_l, 0.0)
-    force_r = wp.max(seg_material_tension[seg_right] + damping_tension_r, 0.0)
-
-    force_sum = force_l + force_r
-    force_diff = wp.abs(force_l - force_r)
-    allowed_diff = beta * force_sum
-    scale = wp.min(1.0, allowed_diff / wp.max(force_diff, 1.0e-8))
-
-    # Stretch retains center-motion torque; add only friction-limited spin
-    # about the roller center here.
-    spin_delta = wp.vec3(0.0, 0.0, 0.0)
-
-    x_l = seg_attachment_l[seg_left]
-    x_r = seg_attachment_r[seg_left]
-    diff = x_r - x_l
-    dist = wp.length(diff)
-    if dist > 1.0e-8:
-        n = diff / dist
-        r = x_r - center
-        angular = wp.cross(r, n)
-        candidate = angular * seg_delta_lambda[seg_left]
-        spin_delta = spin_delta + normal * wp.dot(candidate, normal)
-
-    x_l = seg_attachment_l[seg_right]
-    x_r = seg_attachment_r[seg_right]
-    diff = x_r - x_l
-    dist = wp.length(diff)
-    if dist > 1.0e-8:
-        n = diff / dist
-        r = x_l - center
-        angular = -wp.cross(r, n)
-        candidate = angular * seg_delta_lambda[seg_right]
-        spin_delta = spin_delta + normal * wp.dot(candidate, normal)
-
-    spin_delta = spin_delta * scale * beta
-    wp.atomic_add(body_deltas, body, wp.spatial_vector(wp.vec3(0.0, 0.0, 0.0), spin_delta))
+    first_group = first
+    while first_group < end:
+        if rows[first_group].body_l < 0:
+            first_group += 1
+            continue
+        last = first_group
+        root = rows[first_group]
+        root.weight = 0.0
+        rows[first_group] = root
+        maximum = float(0.0)
+        while rows[last].next >= 0:
+            next_seg = rows[last].next
+            row = rows[next_seg]
+            row.weight = wp.log(row.weight) + rows[last].weight
+            maximum = wp.max(maximum, row.weight)
+            rows[next_seg] = row
+            last = next_seg
+        # Log weights avoid overflowing products of many capstan ratios.
+        for seg in range(first_group, last + 1):
+            row = rows[seg]
+            row.weight = wp.exp(row.weight - maximum)
+            rows[seg] = row
+        rhs = float(0.0)
+        denominator = float(0.0)
+        for i in range(first_group, last + 1):
+            a = rows[i]
+            if a.body_l < 0:
+                continue
+            rhs -= a.residual
+            denominator += a.compliance * a.weight / dt
+            for j in range(first_group, last + 1):
+                b = rows[j]
+                if b.body_l < 0:
+                    continue
+                mass = a.motion_scale * _inverse_mass_product(a, b, body_q, inv_mass, inv_inertia)
+                denominator += mass * b.weight
+                rhs += mass * impulse[j]
+        if denominator <= 0.0:
+            if wp.abs(rhs) > 1.0e-9:
+                wp.printf(
+                    "ERROR: Tendon %d has a singular or non-monotone sliding stretch block at segment %d.\n",
+                    tendon,
+                    first_group,
+                )
+            first_group = last + 1
+            continue
+        target = wp.min(rhs / denominator, 0.0)
+        for seg in range(first_group, last + 1):
+            row = rows[seg]
+            if row.body_l < 0:
+                continue
+            delta = relaxation * (row.weight * target - impulse[seg])
+            impulse[seg] += delta
+            delta_impulse[seg] = delta
+            delta_l = wp.spatial_vector(-row.linear * delta, row.angular_l * delta)
+            delta_r = wp.spatial_vector(row.linear * delta, row.angular_r * delta)
+            if row.body_l == row.body_r:
+                wp.atomic_add(body_deltas, row.body_l, delta_l + delta_r)
+            else:
+                wp.atomic_add(body_deltas, row.body_l, delta_l)
+                wp.atomic_add(body_deltas, row.body_r, delta_r)
+        first_group = last + 1

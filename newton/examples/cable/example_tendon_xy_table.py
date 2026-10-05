@@ -361,6 +361,9 @@ class Example:
         )
 
         passive_pulley_joints = []
+        # Express world-Z hinge motion as local-X twist. XPBD's swing-coordinate
+        # velocity drives lose authority near a half turn; twist stays regular.
+        pulley_joint_frame = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), -0.5 * np.pi)
 
         def add_passive_pulley(parent, local_pos, radius, label, color):
             mass = 0.05
@@ -391,9 +394,9 @@ class Example:
             joint = builder.add_joint_revolute(
                 parent=parent,
                 child=body,
-                axis=Axis.Z,
-                parent_xform=wp.transform(p=local_pos),
-                child_xform=wp.transform(),
+                axis=Axis.X,
+                parent_xform=wp.transform(local_pos, pulley_joint_frame),
+                child_xform=wp.transform(wp.vec3(0.0), pulley_joint_frame),
                 friction=0.0,
                 label=f"{label}_z",
             )
@@ -465,7 +468,7 @@ class Example:
             )
 
         drive_args = {
-            "axis": Axis.Z,
+            "axis": Axis.X,
             "target_ke": 0.0,
             "target_kd": 0.2,
             "armature": 0.0,
@@ -477,16 +480,16 @@ class Example:
         j_p2 = builder.add_joint_revolute(
             parent=-1,
             child=p2,
-            parent_xform=wp.transform(p=p2_pos),
-            child_xform=wp.transform(),
+            parent_xform=wp.transform(p2_pos, pulley_joint_frame),
+            child_xform=wp.transform(wp.vec3(0.0), pulley_joint_frame),
             label="drive_p2_z",
             **drive_args,
         )
         j_p6 = builder.add_joint_revolute(
             parent=-1,
             child=p6,
-            parent_xform=wp.transform(p=p6_pos),
-            child_xform=wp.transform(),
+            parent_xform=wp.transform(p6_pos, pulley_joint_frame),
+            child_xform=wp.transform(wp.vec3(0.0), pulley_joint_frame),
             label="drive_p6_z",
             **drive_args,
         )
@@ -527,10 +530,14 @@ class Example:
         self.model = builder.finalize()
         self.solver = newton.solvers.SolverXPBD(
             self.model,
-            iterations=20,
-            joint_linear_relaxation=0.8,
+            iterations=64,
+            # Several stiff spans share the table and slider bodies.
+            joint_linear_relaxation=0.5,
         )
-        self._apply_cable_pretension(0.99995)
+        # The kinematic reference assumes a taut, sticking cable. A tiny
+        # relative shortening lets spans unload during the drive ramp.
+        self.cable_pretension = 20.0
+        self._apply_cable_pretension(self.cable_pretension)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -551,7 +558,10 @@ class Example:
         self.lower_guide_rotation_indices = (0, 3)
         self._initial_lower_guide_validation_frames = 40
         self._pulley_theta = [0.0 for _ in self.pulley_indices]
-        self._last_pulley_angle = [None for _ in self.pulley_indices]
+        # Include first-frame motion in the measured rotations. Starting from
+        # None silently discards that frame and biases mirrored-guide checks.
+        initial_body_q = self.state_0.body_q.numpy()
+        self._last_pulley_angle = [self._hinge_z_angle(initial_body_q[idx]) for idx in self.pulley_indices]
         self._pulley_rotation_history = []
         self._table_xy_history = []
         self._slider_x_history = []
@@ -572,19 +582,16 @@ class Example:
         ends = wp.array(pts[1:], dtype=wp.vec3)
         return starts, ends
 
-    def _apply_cable_pretension(self, scale: float):
-        tendon_total = self.solver.tendon_total_cable.numpy() * scale
-        segment_rest = self.solver.tendon_seg_rest_length.numpy() * scale
-        self.solver.tendon_total_cable = wp.array(
-            tendon_total,
-            dtype=wp.float32,
-            device=self.model.device,
-        )
-        self.solver.tendon_seg_rest_length = wp.array(
-            segment_rest,
-            dtype=wp.float32,
-            device=self.model.device,
-        )
+    def _apply_cable_pretension(self, tension: float):
+        """Set uniform initial tension [N], leaving wrapped length unchanged."""
+        old_rest = self.solver.tendon_seg_rest_length.numpy()
+        compliance = self.solver.tendon_seg_active_compliance.numpy()
+        segment_rest = self.solver.tendon_seg_length.numpy() - tension * compliance
+        if np.any(segment_rest <= 0.0):
+            raise ValueError("XY cable pretension exceeds the available free-span length")
+        tendon_total = self.solver.tendon_total_cable.numpy() + np.sum(segment_rest - old_rest, dtype=np.float64)
+        self.solver.tendon_total_cable.assign(tendon_total)
+        self.solver.tendon_seg_rest_length.assign(segment_rest)
 
     def _set_drive_targets(self, t: float):
         active_t = min(t, DRIVE_HOLD_TIME)
@@ -763,8 +770,11 @@ class Example:
         assert_reference_window(7.5, 10.0, 0.012, 0.0065)
 
         guide_rotation = np.max(np.abs(pulley_rot[:, :5]), axis=0)
-        assert float(np.min(guide_rotation)) > 0.05, (
-            f"All passive guide pulleys should rotate with the cable: rotations={guide_rotation}"
+        # During pure X travel the lower guides should stay nearly still.
+        # Their rotation is checked below once the Y phase has actually run.
+        x_guides = [i for i in range(5) if i not in self.lower_guide_rotation_indices]
+        assert float(np.min(guide_rotation[x_guides])) > 0.05, (
+            f"X-path guide pulleys should rotate with the cable: rotations={guide_rotation}"
         )
 
         lower_mirror_error = float(
@@ -872,9 +882,18 @@ class Example:
                     f"Right drive pulley should not reverse after the final direction change: min_vel={min_positive_vel:.5f}"
                 )
             if positive_end > drive_vibration_start + 2:
-                max_rhs_drive_acc = float(np.max(np.abs(drive_acc[drive_vibration_start : positive_end - 1, 1])))
-                assert max_rhs_drive_acc < 250.0, (
-                    f"Right drive pulley acceleration spike suggests visible vibration: max_acc={max_rhs_drive_acc:.5f}"
+                # The piecewise-linear target intentionally changes velocity abruptly.
+                # Compare identical finite differences so commanded corners are not
+                # mistaken for vibration, even when tracking is exact.
+                rhs_target = self.drive_target_scale * np.array(
+                    [_interp_target(min(float(t), DRIVE_HOLD_TIME), P6_TARGET)[0] for t in sample_times]
+                )
+                rhs_target_acc = np.diff(rhs_target, n=2) / self.frame_dt**2
+                rhs_acc_error = drive_acc[:, 1] - rhs_target_acc
+                max_rhs_acc_error = float(np.max(np.abs(rhs_acc_error[drive_vibration_start : positive_end - 1])))
+                assert max_rhs_acc_error < 250.0, (
+                    f"Right drive pulley uncommanded acceleration spike suggests visible vibration: "
+                    f"max_acc_error={max_rhs_acc_error:.5f}"
                 )
 
         if len(table_xy) >= 720:

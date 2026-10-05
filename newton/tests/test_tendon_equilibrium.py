@@ -13,6 +13,7 @@ from newton.tests.unittest_utils import sanitize_identifier
 
 
 def build_atwood_equal_weights(mass=2.0, pulley_mass=0.5, pulley_radius=0.15):
+    """Build a guided Atwood equilibrium, not a pair of swinging pendulums."""
     builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=-9.81)
 
     pulley = builder.add_body(
@@ -32,8 +33,7 @@ def build_atwood_equal_weights(mass=2.0, pulley_mass=0.5, pulley_radius=0.15):
     )
     builder.add_articulation([j_pulley])
 
-    planar_lin = [Dof(axis=Axis.X), Dof(axis=Axis.Z)]
-    planar_ang = [Dof(axis=Axis.Y)]
+    guided_lin = [Dof(axis=Axis.Z)]
 
     left = builder.add_link(
         xform=wp.transform(p=wp.vec3(-0.5, 0.0, 2.0), q=wp.quat_identity()),
@@ -43,8 +43,8 @@ def build_atwood_equal_weights(mass=2.0, pulley_mass=0.5, pulley_radius=0.15):
     j1 = builder.add_joint_d6(
         parent=-1,
         child=left,
-        linear_axes=planar_lin,
-        angular_axes=planar_ang,
+        linear_axes=guided_lin,
+        angular_axes=[],
         parent_xform=wp.transform(p=wp.vec3(-0.5, 0.0, 2.0), q=wp.quat_identity()),
         child_xform=wp.transform(),
     )
@@ -58,8 +58,8 @@ def build_atwood_equal_weights(mass=2.0, pulley_mass=0.5, pulley_radius=0.15):
     j2 = builder.add_joint_d6(
         parent=-1,
         child=right,
-        linear_axes=planar_lin,
-        angular_axes=planar_ang,
+        linear_axes=guided_lin,
+        angular_axes=[],
         parent_xform=wp.transform(p=wp.vec3(0.5, 0.0, 2.0), q=wp.quat_identity()),
         child_xform=wp.transform(),
     )

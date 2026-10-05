@@ -163,6 +163,11 @@ def update_profile_cones(
             delta = float(orientations[link]) * (exit - entry)
             if delta < 0.0:
                 delta += profiles[link].period
+            # Independent tangent queries can reverse coincident contacts by a
+            # few ULPs. Do not interpret a zero-wrap boundary as a full circuit.
+            # Retain finite boundary travel along a sector's straight edge.
+            if wp.abs(signed_turn) <= 1.0e-5 and delta >= (1.0 - 2.0e-6) * profiles[link].period:
+                delta = 0.0
             wrap_length[link] = wp.abs(profile_arc_length(profiles[link], entry, float(orientations[link]) * delta))
     cone_l[link] = left
     cone_r[link] = right

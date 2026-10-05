@@ -5,8 +5,17 @@
 
 import warp as wp
 
-from ..math import quat_velocity
 from ..sim.tendon import TendonLinkFlags, TendonLinkType
+
+
+@wp.func
+def _is_supported_rolling_wrap(oriented_angle: float) -> bool:
+    """Classify an oriented atan2 result, allowing roundoff at zero and half wrap."""
+    # atan2 can return either sign of pi at antipodal contacts. Both represent
+    # the supported half wrap. This tolerance is angular roundoff, not an
+    # extension to negative wraps or a change to material/geometry evaluation.
+    angle_tol = 1.0e-6
+    return oriented_angle >= -angle_tol or oriented_angle <= -wp.pi + angle_tol
 
 
 @wp.func
@@ -28,6 +37,34 @@ def tendon_material_tension(
     transition = wp.tanh((strain - sigmoid_transition_strain) / sigmoid_transition_width)
     ea = sigmoid_ea_low * (1.0 + (sigmoid_ea_ratio - 1.0) * 0.5 * (1.0 + transition))
     return ea * strain
+
+
+@wp.kernel
+def update_tendon_material_tensions(
+    active: wp.array[int],
+    lengths: wp.array[float],
+    rest: wp.array[float],
+    compliance: wp.array[float],
+    sigmoid_ea_low: float,
+    sigmoid_ea_ratio: float,
+    sigmoid_transition_strain: float,
+    sigmoid_transition_width: float,
+    tension: wp.array[float],
+):
+    """Report constitutive tension at the accepted route, without altering impulses."""
+    seg = wp.tid()
+    if active[seg] == 0:
+        tension[seg] = 0.0
+        return
+    tension[seg] = tendon_material_tension(
+        lengths[seg],
+        rest[seg],
+        compliance[seg],
+        sigmoid_ea_low,
+        sigmoid_ea_ratio,
+        sigmoid_transition_strain,
+        sigmoid_transition_width,
+    )
 
 
 @wp.func
@@ -435,18 +472,6 @@ def _tendon_segment_length_rate_from_twists(
     angular_l = -wp.cross(x_l - world_com_l, direction)
     angular_r = wp.cross(x_r - world_com_r, direction)
 
-    # Rolling contact does not transmit spin about the roller axis.
-    if tendon_link_type[link_l] == int(TendonLinkType.ROLLING):
-        center_l = wp.transform_point(pose_l, tendon_link_offset[link_l])
-        normal_l = wp.transform_vector(pose_l, tendon_link_axis[link_l])
-        radial_l = x_l - center_l
-        angular_l = angular_l - wp.dot(wp.cross(radial_l, linear_l), normal_l) * normal_l
-    if tendon_link_type[link_r] == int(TendonLinkType.ROLLING):
-        center_r = wp.transform_point(pose_r, tendon_link_offset[link_r])
-        normal_r = wp.transform_vector(pose_r, tendon_link_axis[link_r])
-        radial_r = x_r - center_r
-        angular_r = angular_r - wp.dot(wp.cross(radial_r, linear_r), normal_r) * normal_r
-
     return (
         wp.dot(linear_l, velocity_l)
         + wp.dot(linear_r, velocity_r)
@@ -506,56 +531,16 @@ def tendon_segment_length_rate_from_poses(
     x_r_local: wp.vec3,
     x_l: wp.vec3,
     x_r: wp.vec3,
-    remove_roller_spin: bool = True,
 ):
     """Return free-span length rate from the current and previous body poses."""
     body_l = tendon_link_body[link_l]
     body_r = tendon_link_body[link_r]
-    pose_l = body_q[body_l]
-    pose_r = body_q[body_r]
     pose_l_prev = body_q_prev[body_l]
     pose_r_prev = body_q_prev[body_r]
-    # Preserve VBD's discrete damping except where rolling contact requires removing roller-axis spin.
-    if not remove_roller_spin or (
-        tendon_link_type[link_l] != int(TendonLinkType.ROLLING)
-        and tendon_link_type[link_r] != int(TendonLinkType.ROLLING)
-    ):
-        x_l_prev = wp.transform_point(pose_l_prev, x_l_local)
-        x_r_prev = wp.transform_point(pose_r_prev, x_r_local)
-        return (wp.length(x_r - x_l) - wp.length(x_r_prev - x_l_prev)) / dt
-
-    world_com_l = wp.transform_point(pose_l, body_com[body_l])
-    world_com_r = wp.transform_point(pose_r, body_com[body_r])
-    world_com_l_prev = wp.transform_point(pose_l_prev, body_com[body_l])
-    world_com_r_prev = wp.transform_point(pose_r_prev, body_com[body_r])
-    velocity_l = (world_com_l - world_com_l_prev) / dt
-    velocity_r = (world_com_r - world_com_r_prev) / dt
-    omega_l = quat_velocity(
-        wp.transform_get_rotation(pose_l),
-        wp.transform_get_rotation(pose_l_prev),
-        dt,
-    )
-    omega_r = quat_velocity(
-        wp.transform_get_rotation(pose_r),
-        wp.transform_get_rotation(pose_r_prev),
-        dt,
-    )
-    return _tendon_segment_length_rate_from_twists(
-        body_q,
-        body_com,
-        tendon_link_body,
-        tendon_link_type,
-        tendon_link_offset,
-        tendon_link_axis,
-        link_l,
-        link_r,
-        x_l,
-        x_r,
-        velocity_l,
-        velocity_r,
-        omega_l,
-        omega_r,
-    )
+    # Use the same physical contact points as the force Jacobian.
+    x_l_prev = wp.transform_point(pose_l_prev, x_l_local)
+    x_r_prev = wp.transform_point(pose_r_prev, x_r_local)
+    return (wp.length(x_r - x_l) - wp.length(x_r_prev - x_l_prev)) / dt
 
 
 @wp.kernel
@@ -888,7 +873,7 @@ def update_tendon_cone_rows(
             u_right = r_right / len_r_right
             signed_wrap_angle = wp.atan2(wp.dot(wp.cross(u_left, u_right), normal), wp.dot(u_left, u_right))
             oriented_wrap_angle = signed_wrap_angle * float(tendon_link_orientation[link_idx])
-            if oriented_wrap_angle < 0.0:
+            if not _is_supported_rolling_wrap(oriented_wrap_angle):
                 wp.printf(
                     "ERROR: Tendon %d ROLLING link %d crossed the supported wrap range [0, pi] "
                     "(oriented angle %f deg). Cable rest length and tension may be invalid. "
@@ -1002,7 +987,6 @@ def solve_tendon_material(
     sigmoid_ea_ratio: float,
     sigmoid_transition_strain: float,
     sigmoid_transition_width: float,
-    profile_routing: bool,
 ):
     """Update free-span rest-length transfer for one tendon.
 
@@ -1097,7 +1081,6 @@ def solve_tendon_material(
                             seg_attachment_r_local[seg],
                             seg_attachment_l[seg],
                             seg_attachment_r[seg],
-                            not profile_routing,
                         )
                     else:
                         seg_damping_tension[seg] = seg_active_damping[seg] * tendon_segment_length_rate(
@@ -1114,7 +1097,7 @@ def solve_tendon_material(
                             seg_attachment_r[seg],
                         )
 
-        if profile_routing and apply_rolling_transfer != 0:
+        if apply_rolling_transfer != 0:
             # Construct the complete no-slip trial before projecting any cone;
             # a later link must not invalidate an earlier link's early-out.
             for link_idx in range(link_start + 1, link_end - 1):
@@ -1124,6 +1107,40 @@ def solve_tendon_material(
                     if left >= 0 and right >= 0:
                         seg_stretch[left] -= seg_rolling_delta_r[left]
                         seg_stretch[right] -= seg_rolling_delta_l[right]
+
+            # Project the no-slip trial onto the free-material bounds before
+            # testing capstan cones. Clipping each rest length independently
+            # would manufacture cable whenever rolling exhausts a span. Move
+            # only the missing material from connected spans, never across an
+            # internal attachment. This correction runs only on depletion.
+            block_start = seg_offset
+            for boundary in range(link_start + 1, link_end):
+                if boundary != link_end - 1 and tendon_link_type[boundary] != int(TendonLinkType.ATTACHMENT):
+                    continue
+                block_end = seg_offset + boundary - link_start
+                for recipient in range(block_start, block_end):
+                    if seg_active[recipient] == 0:
+                        continue
+                    missing = wp.max(seg_stretch[recipient] - (seg_length[recipient] - min_rest), 0.0)
+                    if missing > 0.0:
+                        for donor in range(block_start, block_end):
+                            if donor == recipient or seg_active[donor] == 0:
+                                continue
+                            available = wp.max(seg_length[donor] - seg_stretch[donor] - min_rest, 0.0)
+                            transfer = wp.min(missing, available)
+                            seg_stretch[recipient] -= transfer
+                            seg_stretch[donor] += transfer
+                            missing -= transfer
+                            if missing <= 0.0:
+                                break
+                        if missing > 1.0e-7:
+                            wp.printf(
+                                "WARNING: tendon %d has insufficient free material after rolling; "
+                                "the minimum-rest clamp adds %.9g m. This route is unsupported.\n",
+                                tendon_id,
+                                missing,
+                            )
+                block_start = block_end
 
         material_sweep_count = int(4)
         if adaptive_cone_sweeps != 0:
@@ -1162,13 +1179,6 @@ def solve_tendon_material(
 
                 if seg_left < 0 or seg_right < 0:
                     continue
-
-                if material_sweep == 0 and is_rolling and not profile_routing:
-                    # The common mode is material exchanged with the changing wrapped arc. Apply
-                    # it before relaxation so the capstan projection sees the conserved cable.
-                    common_rest_delta = 0.5 * (seg_rolling_delta_r[seg_left] + seg_rolling_delta_l[seg_right])
-                    seg_stretch[seg_left] = seg_stretch[seg_left] - common_rest_delta
-                    seg_stretch[seg_right] = seg_stretch[seg_right] - common_rest_delta
 
                 cap_ratio = tendon_link_cap_ratio[link_idx]
 
@@ -1248,9 +1258,12 @@ def solve_tendon_material(
                         # rest_right -= delta must keep rest_right >= min_rest.
                         max_delta = wp.max(len_r - d_r_raw - min_rest, 0.0)
                         max_delta = wp.min(max_delta, effective_stretch_l)
-                        delta = (comp_r * effective_stretch_l - cap_ratio * comp_l * effective_stretch_r) / (
-                            comp_r + cap_ratio * comp_l
-                        )
+                        # Retain the receiving span's slack in the root. Clamping
+                        # it to zero leaves spurious tension that only decays
+                        # over repeated sweeps, especially at high friction.
+                        delta = (
+                            comp_r * effective_stretch_l - cap_ratio * comp_l * (d_r_raw + comp_r * damping_tension_r)
+                        ) / (comp_r + cap_ratio * comp_l)
                         delta = wp.max(delta, 0.0)
                         delta = wp.min(delta, max_delta)
                     # rest_left += delta => d_l -= delta ; rest_right -= delta => d_r += delta
@@ -1310,9 +1323,9 @@ def solve_tendon_material(
                     else:
                         max_delta = wp.max(len_l - d_l_raw - min_rest, 0.0)
                         max_delta = wp.min(max_delta, effective_stretch_r)
-                        delta = (comp_l * effective_stretch_r - cap_ratio * comp_r * effective_stretch_l) / (
-                            comp_l + cap_ratio * comp_r
-                        )
+                        delta = (
+                            comp_l * effective_stretch_r - cap_ratio * comp_r * (d_l_raw + comp_l * damping_tension_l)
+                        ) / (comp_l + cap_ratio * comp_r)
                         delta = wp.max(delta, 0.0)
                         delta = wp.min(delta, max_delta)
                     seg_stretch[seg_left] = d_l_raw + delta
@@ -1359,39 +1372,6 @@ def solve_tendon_material(
             rel_change = sweep_dtension / wp.max(settle_tension_reference, 1.0e-30)
             if adaptive_cone_sweeps != 0 and rel_change < tendon_settle_tol:
                 converged = 1
-
-        # Apply the friction-limited differential transport once after material relaxation so
-        # cone sweeps cannot iteratively erode it.
-        if apply_rolling_transfer != 0 and not profile_routing:
-            for i_roll in range(1, num_links - 1):
-                link_idx = link_start + i_roll
-                if tendon_link_type[link_idx] != int(TendonLinkType.ROLLING):
-                    continue
-                if not tendon_link_active[link_idx]:
-                    continue
-
-                seg_left = tendon_link_cone_seg_l[link_idx]
-                seg_right = tendon_link_cone_seg_r[link_idx]
-                if seg_left < 0 or seg_right < 0:
-                    continue
-
-                cap_ratio = tendon_link_cap_ratio[link_idx]
-                beta = (cap_ratio - 1.0) / (cap_ratio + 1.0)
-
-                # Apply only the friction-limited differential mode after relaxation. The common
-                # mode above is independent of friction and already accounts for wrapped material.
-                rolling_delta_diff = 0.5 * (seg_rolling_delta_r[seg_left] - seg_rolling_delta_l[seg_right])
-                len_al = seg_length[seg_left]
-                len_ar = seg_length[seg_right]
-                rest_l = len_al - seg_stretch[seg_left]
-                rest_r = len_ar - seg_stretch[seg_right]
-                rolling_transfer = rolling_delta_diff * beta
-                # Bound the zero-sum transfer as a pair. Clamping either span independently would
-                # discard the clipped amount and create cable material at the minimum rest length.
-                rolling_transfer = wp.max(rolling_transfer, min_rest - rest_l)
-                rolling_transfer = wp.min(rolling_transfer, rest_r - min_rest)
-                seg_stretch[seg_left] = seg_stretch[seg_left] - rolling_transfer
-                seg_stretch[seg_right] = seg_stretch[seg_right] + rolling_transfer
 
         # rebuild rest lengths from the telescoped stretch state (one cancellation per call,
         # paid once instead of every sweep -- this is what keeps the capstan accurate for stiff

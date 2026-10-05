@@ -5,10 +5,9 @@
 # Example Tendon Cable Machine
 #
 # Cable machine with three pulleys of varying sizes routing a single
-# tendon from a light capsule weight to a heavy box weight.  The box
-# descends under gravity, pulling the capsule upward through the pulley
-# chain.  All three pulleys rotate through the frictional rolling
-# constraints.
+# tendon between unequal capsule and box weights on vertical guides.
+# Travel stops keep the weights below their pulleys and preserve supported
+# wraps. All three pulleys rotate through the frictional rolling constraints.
 #
 # Demonstrates complex multi-pulley routing with diverse body shapes
 # (capsules, boxes, cylinders).
@@ -22,9 +21,14 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton._src.sim.builder import Axis
-from newton._src.sim.tendon import TendonLinkType
-from newton.examples.cable.cable import assert_tendon_total_length, get_tendon_attachment_worlds, get_tendon_cable_lines
+from newton import Axis, TendonLinkType
+from newton.examples.cable.cable import (
+    assert_circular_tendon_wraps,
+    assert_tendon_material_length,
+    assert_tendon_total_length,
+    get_tendon_attachment_worlds,
+    get_tendon_cable_lines,
+)
 
 
 class Example:
@@ -137,8 +141,10 @@ class Example:
             label="pulley_3_y",
         )
 
-        planar_lin = [Dof(axis=Axis.X), Dof(axis=Axis.Z)]
-        planar_ang = []
+        # Guide reactions prevent the inclined spans from pulling the weights
+        # sideways through the pulley route. Stops keep both anchors below it.
+        left_guide = [Dof(axis=Axis.Z, limit_lower=-2.7, limit_upper=0.12, limit_ke=1.0e5, limit_kd=100.0)]
+        right_guide = [Dof(axis=Axis.Z, limit_lower=-2.4, limit_upper=0.45, limit_ke=1.0e5, limit_kd=100.0)]
 
         capsule_pos = wp.vec3(-0.9, 0.0, 3.25)
         q_vert = wp.quat(np.sin(np.pi / 4.0), 0.0, 0.0, np.cos(np.pi / 4.0))
@@ -158,8 +164,8 @@ class Example:
         j1 = builder.add_joint_d6(
             parent=-1,
             child=left,
-            linear_axes=planar_lin,
-            angular_axes=planar_ang,
+            linear_axes=left_guide,
+            angular_axes=[],
             parent_xform=wp.transform(p=capsule_pos, q=wp.quat_identity()),
             child_xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.0), q=wp.quat_identity()),
         )
@@ -174,8 +180,8 @@ class Example:
         j2 = builder.add_joint_d6(
             parent=-1,
             child=right,
-            linear_axes=planar_lin,
-            angular_axes=planar_ang,
+            linear_axes=right_guide,
+            angular_axes=[],
             parent_xform=wp.transform(p=box_pos, q=wp.quat_identity()),
             child_xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.0), q=wp.quat_identity()),
         )
@@ -345,6 +351,8 @@ class Example:
         )
 
     def test_post_step(self):
+        assert_tendon_material_length(self)
+        assert_circular_tendon_wraps(self)
         assert_tendon_total_length(self, rel_tol=0.30)
         body_q = self.state_0.body_q.numpy()
         assert np.isfinite(body_q).all(), "Cable machine produced non-finite body state"
@@ -373,10 +381,12 @@ class Example:
         body_q = self.state_0.body_q.numpy()
         assert np.isfinite(body_q).all(), "Non-finite values in body positions"
 
-        capsule_z = body_q[self.left_idx][2]
-        box_z = body_q[self.right_idx][2]
-        assert abs(box_z - self._initial_box_z) > 0.1 or abs(capsule_z - self._initial_capsule_z) > 0.1, (
-            f"Cable machine bodies should move: capsule_z={capsule_z}, box_z={box_z}"
+        # A weight can rebound from its travel stop and return near its start;
+        # check motion over the run, not just the final sample.
+        capsule_travel = float(np.max(np.abs(np.array(self._capsule_z_history) - self._initial_capsule_z)))
+        box_travel = float(np.max(np.abs(np.array(self._box_z_history) - self._initial_box_z)))
+        assert box_travel > 0.1 or capsule_travel > 0.1, (
+            f"Cable machine bodies should move: capsule_travel={capsule_travel}, box_travel={box_travel}"
         )
 
         rotations = np.array(self._pulley_rotation_history, dtype=np.float64)

@@ -4,10 +4,10 @@
 ###########################################################################
 # Example Tendon Equilibrium
 #
-# Two equal-mass weights connected by a tendon over a dynamic pulley.
-# With equal masses, neither side should move — the system stays in
-# static equilibrium, verifying that the XPBD tendon constraint
-# correctly balances symmetric loads.
+# Two equal-mass, vertically guided weights connected over a dynamic pulley.
+# After the small elastic settling displacement, neither side should move.
+# The guides react the inclined cable's horizontal force and attachment torque;
+# without them this is a swinging system, not a static-equilibrium test.
 #
 # Command: python -m newton.examples tendon_equilibrium
 #
@@ -56,8 +56,9 @@ class Example:
             child_xform=wp.transform(),
         )
 
-        planar_lin = [Dof(axis=Axis.X), Dof(axis=Axis.Z)]
-        planar_ang = [Dof(axis=Axis.Y)]
+        # Keep the inclined spans in their supported wrap range. Free sideways
+        # swing can carry the weights under the pulley and exceed a half wrap.
+        guided_lin = [Dof(axis=Axis.Z)]
 
         self.left_idx = left = builder.add_link(
             xform=wp.transform(p=wp.vec3(-0.5, 0.0, 2.0), q=wp.quat_identity()),
@@ -67,8 +68,8 @@ class Example:
         j1 = builder.add_joint_d6(
             parent=-1,
             child=left,
-            linear_axes=planar_lin,
-            angular_axes=planar_ang,
+            linear_axes=guided_lin,
+            angular_axes=[],
             parent_xform=wp.transform(p=wp.vec3(-0.5, 0.0, 2.0), q=wp.quat_identity()),
             child_xform=wp.transform(),
         )
@@ -81,8 +82,8 @@ class Example:
         j2 = builder.add_joint_d6(
             parent=-1,
             child=right,
-            linear_axes=planar_lin,
-            angular_axes=planar_ang,
+            linear_axes=guided_lin,
+            angular_axes=[],
             parent_xform=wp.transform(p=wp.vec3(0.5, 0.0, 2.0), q=wp.quat_identity()),
             child_xform=wp.transform(),
         )
@@ -183,9 +184,9 @@ class Example:
         drift_right = abs(y_right - self.y_right_0)
         drift_diff = abs((y_left - self.y_left_0) - (y_right - self.y_right_0))
 
-        assert drift_left < 0.05, f"Left weight drifted {drift_left:.4f} m"
-        assert drift_right < 0.05, f"Right weight drifted {drift_right:.4f} m"
-        assert drift_diff < 0.02, f"Asymmetric drift: {drift_diff:.4f} m"
+        assert drift_left < 0.002, f"Left weight drifted {drift_left:.4f} m"
+        assert drift_right < 0.002, f"Right weight drifted {drift_right:.4f} m"
+        assert drift_diff < 0.001, f"Asymmetric drift: {drift_diff:.4f} m"
 
     def render(self):
         if self.viewer is not None:
