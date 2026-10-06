@@ -4527,7 +4527,8 @@ class ModelBuilder:
             dynamic: Whether the tendon solver should treat this ROLLING link
                 as a one-sided obstacle selected by ``orientation``. The initial
                 state is resolved from the route geometry before tendon rest
-                lengths are measured.
+                lengths are measured. Supported for circular rollers only,
+                including circles adjacent to fixed non-circular profiles.
             offset: Local-frame position of the cable plane center on the body [m].
             axis: Local-frame normal of the cable plane on the body.
             compliance: Compliance [m/N] for the segment ending at this link
@@ -4537,7 +4538,7 @@ class ModelBuilder:
                 If negative, will be computed from initial body positions during
                 finalization.
             profile: Experimental roller cross-section. Omit to retain the
-                existing circular radius API. Explicit profiles use prescribed
+                existing circular radius API. Non-circular profiles use prescribed
                 planar routing in XPBD and VBD.
             profile_axis: Body-local profile +X direction, perpendicular to axis.
 
@@ -4549,8 +4550,10 @@ class ModelBuilder:
         if profile is not None:
             if not isinstance(profile, RollerProfile):
                 raise TypeError("profile must be a RollerProfile")
-            if link_type != int(TendonLinkType.ROLLING) or dynamic:
-                raise ValueError("Explicit profiles require a prescribed ROLLING link")
+            if link_type != int(TendonLinkType.ROLLING):
+                raise ValueError("Explicit profiles require a ROLLING link")
+            if dynamic and not isinstance(profile, RollerProfileCircle):
+                raise ValueError("Only circular roller profiles support dynamic routing")
             if radius != 0.0:
                 raise ValueError("Specify either radius or profile, not both")
             if isinstance(profile, RollerProfileCircle):
@@ -10615,8 +10618,11 @@ class ModelBuilder:
             if m.tendon_profile_routing:
                 if requires_grad:
                     raise NotImplementedError("Explicit roller-profile routing does not support autodiff")
-                if any(f & int(TendonLinkFlags.DYNAMIC) for f in self.tendon_link_flags):
-                    raise ValueError("Profile routing currently requires all tendon links to be prescribed")
+                if any(
+                    f & int(TendonLinkFlags.DYNAMIC) and p is not None and not isinstance(p, RollerProfileCircle)
+                    for f, p in zip(self.tendon_link_flags, self.tendon_link_profile, strict=True)
+                ):
+                    raise ValueError("Only circular roller profiles support dynamic routing")
                 if any(b < 0 for b in self.tendon_link_body):
                     raise ValueError("Profile routing requires body-backed tendon links")
                 for start, end in pairwise(tendon_start):

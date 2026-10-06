@@ -29,9 +29,18 @@ builder.add_tendon_link(
 )
 ```
 
-Explicit profiles currently select prescribed planar routing for the whole
-model in XPBD and VBD. Mixing them with dynamic links, terminal rollers, or
-autodiff is rejected. Builder merging/replication and fixed-joint collapse with explicit
+Explicit profiles select planar profile routing for the whole model in XPBD
+and VBD. Circles (either `radius=...` or `RollerProfileCircle`) may be dynamic,
+including between fixed ellipse/sector neighbors. Ellipses and sectors retain
+prescribed routing: `dynamic=True` is rejected for these shapes. The existing
+restriction against consecutive dynamic rollers remains. Activation uses the
+neighbors' common supporting tangent and the same radius-relative
+`tendon_activation_tol` hysteresis as ordinary circles. Segment split/merge
+conserves free-plus-wrapped material and carries the fixed neighbors' boundary
+contact history across changing segment slots.
+
+Terminal rollers and autodiff are rejected in profile mode.
+Builder merging/replication and fixed-joint collapse with explicit
 profiles are also rejected until their profile bookkeeping is implemented.
 The supported tangent turn is 0–180 degrees; multiple wraps and 3D routing are
 not implemented. Wrapped boundary length remains inextensible, as in the
@@ -640,3 +649,92 @@ untracked regression files. Ruff checks, Ruff format checks, and
 `git diff --check` pass. The acceleration-check follow-up changes example
 validation and adds a regression, not solver behavior. These checks cover the
 XPBD/VBD follow-up on `2976-roller-profiles`.
+
+## Dynamic circular profiles — 2026-10-06
+
+Circular activation now works in mixed profile models in both solvers. The
+switching circle uses the actual bypass tangent between its fixed neighbors,
+not circle approximations to an ellipse or sector. Existing isolated-circle
+segment split/merge rules are retained. Persistent neighboring profiles carry
+their old boundary coordinates to the new segment slot; a newly active circle
+gets its initial wrap from the split instead of a stale rolling delta.
+Inactive placeholder segments are excluded from the initial total material.
+
+No dynamic ellipses/sectors, consecutive dynamic rollers, multi-turn wrapping,
+or nonplanar routing are added. Dynamic means contact activation, not whether
+the roller's rigid body can translate or rotate. No extra persistent arrays or
+runtime host readbacks are introduced.
+
+`test_roller_profile_dynamic` covers both solvers and devices: reflected routes,
+ellipse/sector neighbors in both orders, active/inactive initial states,
+radius-only/explicit-circle authoring, moving neighboring profiles, repeated
+switches, multiple independently switching tendons, radius-relative hysteresis,
+and graph replay with a moving loaded endpoint. Total material is checked
+against independent double-precision tangent/arc integration. Loaded circular
+routes also match the existing radius-only implementation. Non-circular dynamic
+profiles are explicitly rejected. The initial mixed-profile regressions failed
+against the previous builder restrictions before implementing this extension.
+
+The final focused selection runs all five profile modules, the equilibrium
+module, and relevant legacy route, material, pinhole, and shared-body force
+checks: **142 tests, 138 passed, 4 expected CPU graph skips**. The broad legacy
+demo rerun was stopped before completion after checking its previous runtime
+(over an hour); it is not claimed as a completed current validation.
+
+Performance evidence and reproducible benchmark/test scripts are saved outside
+the repository in the local `roller-profiles-20261006` artifact directory.
+The reference is commit `6bcd973e`, immediately before this dynamic-circle
+extension, not the original VBD-only prototype. Benchmarks use CUDA graphs on
+the RTX 3080 Laptop GPU, no rendering, no per-step readbacks, and exclude setup,
+compilation, and graph capture. Both variants use the same frictional profile
+example at 10 substeps and 32 iterations, with 30 warm-up frames followed by
+four batches of 120 frames. Final poses and rest lengths match the reference
+exactly for both solvers.
+
+An initial implementation added 4–5% to this fixed-route workload. The final
+implementation bypasses unneeded activation/history checks when a model has
+no dynamic links. One intermediate run recovered the reference XPBD timing,
+but the final back-to-back repeat still measured a small regression:
+
+| Solver | Reference ms/frame | Updated ms/frame | Change |
+|---|---:|---:|---:|
+| XPBD | 26.97 | 27.88 | +3.4% |
+| VBD | 64.29 | 66.57 | +3.5% |
+
+These are timings for this example and laptop, not a general scalability claim.
+No further optimization was made to chase the remaining few percent.
+A separate taut ellipse–circle–sector microbenchmark
+(same geometry, material, and tension; circle fixed versus dynamic but active)
+measured 23.57 versus 24.15 ms per 10 steps in XPBD (+2.5%) and 84.97 versus
+85.97 ms in VBD (+1.2%). This measures switching bookkeeping on a stable route,
+not the relative cost of different switching trajectories or long tendons.
+
+### Known material-sweep artifact at activation
+
+A loaded ellipse–dynamic-circle example exposed a material-sweep artifact at
+finite friction. When the circle reactivates, the sweeps abruptly reduce the
+anchor–ellipse tension and the ellipse briefly rotates clockwise before
+resuming its counterclockwise motion. Increasing XPBD iterations from 32 to
+128 does not remove it. Total material is conserved, but its distribution is
+incorrect: an earlier junction transfer is not retracted after the next
+junction update makes that transfer excessive. Satisfying the friction bounds
+alone does not establish a consistent net slip.
+
+An isolated adapter tested the existing direct material solver from commit
+`1674c49d` against the same profile geometry, damping, loads, and integration
+settings (friction 0.2, XPBD 10 substeps and 32 iterations). No direct-solver
+modules were changed. It removes the clockwise activation kick in both cycles
+of the eight-second run, with no solver failures or invalid-wrap diagnostics
+and less than 1 micrometer of total-material drift. Around the second
+activation, it also matches an independent two-junction reference within
+0.00014 degrees and 0.00045 N.
+
+The side-by-side comparison uses sweeps on the left and the existing direct
+solver on the right; the second activation near 4.45 seconds makes the
+difference clearest. Scripts, traces, and videos are retained outside the
+repository in the same artifact directory. This is a correctness comparison,
+not a performance measurement.
+
+The direct solver is **not integrated into this branch**. The material-sweep
+correction is deferred as a separate follow-up; this prototype still uses
+sweeps and retains this known limitation.

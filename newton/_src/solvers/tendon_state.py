@@ -272,7 +272,7 @@ class TendonStateMixin:
             )
             if self._has_dynamic_tendon_links and model.body_q is not None:
                 # Resolve the initial topology before measuring its free-span rest lengths.
-                self._update_tendon_link_active(model, model.body_q)
+                self._update_tendon_link_active(model, model.body_q, initialize=True)
                 wp.copy(self.tendon_link_active_step, self.tendon_link_active)
 
             route_rest_np, route_seg_mask = self._compute_active_route_rest_lengths(model)
@@ -299,9 +299,35 @@ class TendonStateMixin:
                 device=self.tendon_link_active.device,
             )
 
-    def _update_tendon_link_active(self, model: Model, body_q: wp.array[wp.transform]) -> None:
+    def _update_tendon_link_active(
+        self, model: Model, body_q: wp.array[wp.transform], *, initialize: bool = False
+    ) -> None:
         """Update solver-owned dynamic routing flags from the current body poses."""
         if not self._has_dynamic_tendon_links:
+            return
+
+        if model.tendon_profile_routing:
+            from .roller_profile_kernels import update_profile_link_active  # noqa: PLC0415
+
+            wp.launch(
+                update_profile_link_active,
+                dim=model.tendon_link_count,
+                inputs=[
+                    body_q,
+                    model.tendon_link_body,
+                    model.tendon_link_flags,
+                    model.tendon_link_orientation,
+                    model.tendon_link_offset,
+                    model.tendon_link_axis,
+                    model.tendon_link_profile_axis,
+                    model.tendon_link_profile,
+                    self.tendon_activation_tol,
+                    initialize,
+                    self.tendon_link_active,
+                    self.tendon_link_route_rest_length,
+                ],
+                device=model.device,
+            )
             return
 
         wp.launch(
@@ -525,6 +551,19 @@ class TendonStateMixin:
         link_orientation = model.tendon_link_orientation.numpy()
         link_flags = model.tendon_link_flags.numpy()
         link_active = self.tendon_link_active.numpy()
+        if model.tendon_profile_routing:
+            # Initial activation already queried the exact profile bypass on
+            # the device. Reuse it instead of approximating the neighbors by circles.
+            route_rest = self.tendon_link_route_rest_length.numpy()
+            dynamic = (link_flags & int(TendonLinkFlags.DYNAMIC)) != 0
+            if np.any(route_rest[dynamic] <= 0.0):
+                raise ValueError("Initial dynamic profile route requires a valid nonzero bypass tangent")
+            for t, (start, end) in enumerate(pairwise(tendon_start)):
+                for i in range(start + 1, end - 1):
+                    if dynamic[i] and not link_active[i]:
+                        route_seg_mask[i - t - 1 : i - t + 1] = True
+            return route_rest, route_seg_mask
+
         link_offset = model.tendon_link_offset.numpy()
         link_axis = model.tendon_link_axis.numpy()
         body_q_np = body_q.numpy()
@@ -570,7 +609,7 @@ class TendonStateMixin:
         return route_rest, route_seg_mask
 
     def _update_profile_attachments(self, body_q: wp.array[wp.transform], *, rolling: bool) -> None:
-        """Update the experimental prescribed-profile route on the simulation device."""
+        """Update the active experimental profile route on the simulation device."""
         from .roller_profile_kernels import update_profile_attachments  # noqa: PLC0415
 
         m = self.model
@@ -585,11 +624,15 @@ class TendonStateMixin:
                 m.tendon_link_axis,
                 m.tendon_link_profile_axis,
                 m.tendon_link_profile,
+                self.tendon_seg_active,
+                self.tendon_link_active,
+                self.tendon_link_active_step,
                 self.tendon_seg_active_link_l,
                 self.tendon_seg_active_link_r,
                 self.tendon_profile_parameter_l_step,
                 self.tendon_profile_parameter_r_step,
                 rolling,
+                self._has_dynamic_tendon_links,
             ],
             outputs=[
                 self.tendon_seg_attachment_l,
@@ -607,7 +650,7 @@ class TendonStateMixin:
         )
 
     def _update_profile_cones(self, body_q: wp.array[wp.transform], report: bool) -> None:
-        """Refresh wrapped lengths and capstan bounds for the prescribed profile route."""
+        """Refresh wrapped lengths and capstan bounds for the active profile route."""
         from .roller_profile_kernels import update_profile_cones  # noqa: PLC0415
 
         m = self.model
@@ -624,11 +667,17 @@ class TendonStateMixin:
                 m.tendon_link_mu,
                 m.tendon_link_axis,
                 m.tendon_link_profile,
+                self.tendon_link_active,
+                self.tendon_seg_active,
+                self.tendon_seg_active_link_l,
+                self.tendon_seg_active_link_r,
+                self.tendon_seg_length,
                 self.tendon_seg_attachment_l,
                 self.tendon_seg_attachment_r,
                 self.tendon_profile_parameter_l,
                 self.tendon_profile_parameter_r,
                 report,
+                self._has_dynamic_tendon_links,
             ],
             outputs=[
                 self.tendon_link_cone_seg_l,
@@ -782,8 +831,10 @@ class TendonStateMixin:
             if np.any(self.tendon_profile_tangent_status.numpy()) or np.any(self.tendon_profile_wrap_status.numpy()):
                 raise ValueError("Initial tendon profile route is not a supported coplanar tangent path")
             wraps = self.tendon_profile_wrap_length.numpy()
+            active_rest = np.where(self.tendon_seg_active.numpy() != 0, rest_np, 0.0)
             total = [
-                np.sum(rest_np[start - t : end - t - 1], dtype=np.float64) + np.sum(wraps[start:end], dtype=np.float64)
+                np.sum(active_rest[start - t : end - t - 1], dtype=np.float64)
+                + np.sum(wraps[start:end], dtype=np.float64)
                 for t, (start, end) in enumerate(pairwise(tendon_start_np))
             ]
             self.tendon_total_cable = wp.array(total, dtype=float, device=model.device)

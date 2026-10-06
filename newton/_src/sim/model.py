@@ -365,7 +365,7 @@ class Model:
         self.tendon_segment_count: int = 0
         """Total number of tendon segments (= tendon_link_count - tendon_count)."""
         self.tendon_profile_routing: bool = False
-        """Whether prescribed planar roller-profile routing is enabled (experimental)."""
+        """Whether planar roller-profile routing is enabled (experimental)."""
         self.tendon_link_profile = None
         """Private packed roller profiles; anchors and pinholes are points."""
         self.tendon_link_profile_axis: wp.array[wp.vec3] | None = None
