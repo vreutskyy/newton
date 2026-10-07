@@ -179,6 +179,11 @@ class SolverXPBD(TendonStateMixin, SolverBase):
 
         # tendon state
         self._init_tendon_state(model)
+        # Accumulate the friction reaction across XPBD iterations. VBD applies
+        # constitutive forces directly and does not need this impulse state.
+        self._tendon_link_spin_impulse = (
+            wp.zeros(model.tendon_link_count, dtype=wp.vec3, device=model.device) if model.tendon_count > 0 else None
+        )
 
         if model.particle_count > 1 and model.particle_grid is not None:
             # reserve space for the particle hash grid
@@ -461,6 +466,7 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                 self._update_tendon_link_active(model, state_in.body_q)
                 self._prepare_tendon_route(model, state_in.body_q)
                 self.tendon_seg_lambda.zero_()
+                self._tendon_link_spin_impulse.zero_()
                 self.tendon_seg_material_tension.zero_()
 
             for i in range(self.iterations):
@@ -813,6 +819,7 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                                 self.tendon_sigmoid_ea_ratio,
                                 self.tendon_sigmoid_transition_strain,
                                 self.tendon_sigmoid_transition_width,
+                                self._tendon_link_material_transfer,
                             ],
                             device=model.device,
                         )
@@ -886,9 +893,10 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                                 self.tendon_seg_active_compliance,
                                 self.tendon_seg_material_tension,
                                 self.tendon_seg_damping_tension,
-                                self.tendon_seg_delta_lambda,
-                                self.joint_linear_relaxation,
+                                self.tendon_seg_lambda,
                                 self.tendon_sigmoid_ea_low,
+                                dt,
+                                self._tendon_link_spin_impulse,
                             ],
                             outputs=[body_deltas],
                             device=model.device,
