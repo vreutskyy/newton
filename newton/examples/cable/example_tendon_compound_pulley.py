@@ -44,7 +44,9 @@ class Example:
         self.mass_heavy = 4.0
         self.mass_left_each = 0.5 * self.mass_heavy
         self.mass_left_total = 2.0 * self.mass_left_each
-        self.tendon_compliance = 1.0e-6
+        # Reduce force sensitivity to float32 position rounding at this scene
+        # scale while retaining sub-millimetre extension under gravity.
+        self.tendon_compliance = 1.0e-5
         shape_cfg = newton.ModelBuilder.ShapeConfig(density=0.0)
         pulley_half_height = 0.05
         self.left_half_extent = 0.10

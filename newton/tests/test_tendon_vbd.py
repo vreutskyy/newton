@@ -1629,7 +1629,9 @@ def test_vbd_xy_table_tracks_reference_prefix(test, device):
             example.step()
             example.test_post_step()
 
-        example.test_final()
+        # This half-second X prefix has no Y travel yet. The example's full
+        # trajectory checks also require the lower guide pulleys to rotate.
+        _assert_example_members_have_no_nans(test, example)
 
         table_xy = np.asarray(example._table_xy_history, dtype=np.float64)
         drive_rot = np.asarray(example._drive_rotation_history, dtype=np.float64)
@@ -1641,8 +1643,9 @@ def test_vbd_xy_table_tracks_reference_prefix(test, device):
         y_drift = float(np.max(np.abs(table_xy[:, 1])))
         drive_pair_error = float(np.max(np.abs(drive_rot[:, 0] - drive_rot[:, 1])))
 
-        test.assertLess(reference_rms, 0.008, f"VBD XY table prefix RMS drifted from reference: {reference_rms:.5f}")
-        test.assertLess(reference_max, 0.012, f"VBD XY table prefix max error too high: {reference_max:.5f}")
+        # Match the example's tighter early-X reference-window tolerances.
+        test.assertLess(reference_rms, 0.004, f"VBD XY table prefix RMS drifted from reference: {reference_rms:.5f}")
+        test.assertLess(reference_max, 0.006, f"VBD XY table prefix max error too high: {reference_max:.5f}")
         test.assertLess(y_drift, 0.004, f"VBD XY table should stay on the X reference prefix: y={y_drift:.5f}")
         test.assertLess(
             drive_pair_error,

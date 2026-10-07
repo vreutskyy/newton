@@ -4,7 +4,7 @@
 ###########################################################################
 # Example Tendon Equilibrium
 #
-# Two equal-mass weights connected by a tendon over a dynamic pulley.
+# Two vertically guided equal-mass weights connected over a dynamic pulley.
 # With equal masses, neither side should move — the system stays in
 # static equilibrium, verifying that the XPBD tendon constraint
 # correctly balances symmetric loads.
@@ -56,8 +56,9 @@ class Example:
             child_xform=wp.transform(),
         )
 
-        planar_lin = [Dof(axis=Axis.X), Dof(axis=Axis.Z)]
-        planar_ang = [Dof(axis=Axis.Y)]
+        # Without guides the angled spans pull both weights inward; equal
+        # masses alone do not make that swinging configuration an equilibrium.
+        weight_axes = [Dof(axis=Axis.Z)]
 
         self.left_idx = left = builder.add_link(
             xform=wp.transform(p=wp.vec3(-0.5, 0.0, 2.0), q=wp.quat_identity()),
@@ -67,8 +68,8 @@ class Example:
         j1 = builder.add_joint_d6(
             parent=-1,
             child=left,
-            linear_axes=planar_lin,
-            angular_axes=planar_ang,
+            linear_axes=weight_axes,
+            angular_axes=[],
             parent_xform=wp.transform(p=wp.vec3(-0.5, 0.0, 2.0), q=wp.quat_identity()),
             child_xform=wp.transform(),
         )
@@ -81,8 +82,8 @@ class Example:
         j2 = builder.add_joint_d6(
             parent=-1,
             child=right,
-            linear_axes=planar_lin,
-            angular_axes=planar_ang,
+            linear_axes=weight_axes,
+            angular_axes=[],
             parent_xform=wp.transform(p=wp.vec3(0.5, 0.0, 2.0), q=wp.quat_identity()),
             child_xform=wp.transform(),
         )
