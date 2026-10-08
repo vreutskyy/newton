@@ -735,6 +735,37 @@ difference clearest. Scripts, traces, and videos are retained outside the
 repository in the same artifact directory. This is a correctness comparison,
 not a performance measurement.
 
-The direct solver is **not integrated into this branch**. The material-sweep
-correction is deferred as a separate follow-up; this prototype still uses
-sweeps and retains this known limitation.
+The direct solver is **not integrated into this branch**; it remains an
+independent reference for the comparison below.
+
+### Material-sweep correction — 2026-10-08
+
+The net-slip correction from `2976-tendon-sweep-consistency` (`cf643a3c`) is
+now ported to the profile solver. Each junction remembers its net transfer
+within a material solve and can retract excess transfer after a neighbor
+changes the tension. The existing full rolling trial, material-conserving
+depletion handling, and generalized profile force/torque formulation are
+unchanged. One private per-link scratch array is reset inside each material
+kernel invocation; no additional launches or host readbacks are needed.
+
+The six material regressions cover finite-friction net slip, damped sigmoid
+material, sticking, slack spans, rolling grip, and rest-length depletion on
+CPU and CUDA. Before the port, the CPU tests exposed eight failing net-slip
+subcases; all pass after the correction.
+
+The unchanged eight-second ellipse–dynamic-circle example was rerun with
+corrected sweeps and the direct reference in both XPBD and VBD, using friction
+0.2, 10 substeps, and 32 iterations. Both cycles complete without the previous
+clockwise activation kick. All frame checks pass, with no direct-solver
+failures, and both methods activate/deactivate at the same sampled frames.
+
+| Solver | Maximum ellipse-angle difference | Maximum segment-tension difference | Maximum slider-position difference |
+|---|---:|---:|---:|
+| XPBD | 0.00032 degrees | 0.0021 N | 0.97 micrometers |
+| VBD | 0.00064 degrees | 0.0014 N | 0.67 micrometers |
+
+The corrected sweeps' maximum total-material drift is 1.12 micrometers in
+XPBD and 0.66 micrometers in VBD. These are correctness checks of this
+reproducer, not general accuracy bounds or performance measurements.
+Scripts, exact settings, traces, and comparison results are saved outside the
+repository in the local `tendon-integration-20261008` artifact directory.

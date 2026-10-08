@@ -160,6 +160,7 @@ class TendonStateMixin:
             self.tendon_seg_rest_length_step = None
             self.tendon_seg_route_rest_length = None
             self.tendon_seg_stretch = None
+            self._tendon_link_material_transfer = None
             self.tendon_seg_material_tension = None
             self.tendon_seg_damping_tension = None
             self.tendon_seg_attachment_l = None
@@ -261,6 +262,7 @@ class TendonStateMixin:
             # scratch: per-segment stretch d = len - rest, snapshot+telescoped inside the capstan
             # transport (kept at its own scale so stiff-cable friction transfers survive float32)
             self.tendon_seg_stretch = wp.zeros_like(self.tendon_seg_rest_length)
+            self._tendon_link_material_transfer = wp.zeros(model.tendon_link_count, dtype=float, device=model.device)
 
             link_type_np = model.tendon_link_type.numpy()
             link_flags_np = model.tendon_link_flags.numpy()
@@ -532,6 +534,7 @@ class TendonStateMixin:
                 self.tendon_sigmoid_ea_ratio,
                 self.tendon_sigmoid_transition_strain,
                 self.tendon_sigmoid_transition_width,
+                self._tendon_link_material_transfer,
             ],
             device=model.device,
         )
@@ -813,6 +816,7 @@ class TendonStateMixin:
                 self.tendon_sigmoid_ea_ratio,
                 self.tendon_sigmoid_transition_strain,
                 self.tendon_sigmoid_transition_width,
+                self._tendon_link_material_transfer,
             ],
             device=model.device,
         )
