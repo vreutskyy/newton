@@ -1217,7 +1217,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             tendon_settle_tol: Relative capstan-complementarity tolerance
                 for adaptive tendon sweeps. Zero disables early-out. Ignored by direct solves.
             tendon_settle_atol: Experimental absolute force tolerance [N] for adaptive tendon sweeps,
-                allowing slack cables to settle. Ignored by direct solves.
+                allowing slack cables to settle. Ignored when ``tendon_settle_tol`` is zero or by direct solves.
             rigid_enable_dahl_friction: Deprecated and ignored. Dahl friction is auto-detected
                 from ``model.vbd.dahl_eps_max`` / ``model.vbd.dahl_tau``.
             tendon_activation_tol: Relative radius gap that inactive dynamic rollers must cross before
@@ -1605,9 +1605,6 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             raise ValueError("tendon_settle_atol must be finite and non-negative")
         self.tendon_settle_tol = tendon_settle_tol
         self.tendon_settle_atol = tendon_settle_atol
-        # Sparse updates eliminate sliding material coordinates using positive
-        # friction secants. Keep the existing local-body metric unchanged.
-        self._tendon_sliding_curvature = rigid_articulation_solve in ("block_sparse_joints", "block_sparse_levels")
         self.tendon_activation_tol = tendon_activation_tol
         self.tendon_route_hysteresis = tendon_route_hysteresis
         self.tendon_route_min_span_ratio = tendon_route_min_span_ratio
@@ -6320,11 +6317,14 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         report_unsupported_wrap: bool,
         skip_material: bool = False,
         latch_failure: bool | None = None,
+        sliding_curvature: bool = False,
     ) -> None:
         """Update VBD routed-tendon geometry and rolling rest transfer for this iteration.
 
         ``skip_material`` refreshes the route geometry and re-bases the rest lengths on the
         step-start route (deactivation merge, activation split) but transfers no material.
+        ``sliding_curvature`` enables the friction secants used only by sparse assembly;
+        local body updates, including sparse fallback bodies, retain their local metric.
         """
         model = self.model
         if model.tendon_segment_count == 0 or state_in.body_q is None:
@@ -6468,7 +6468,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.tendon_sigmoid_transition_strain,
                     self.tendon_sigmoid_transition_width,
                     self._tendon_link_material_transfer,
-                    int(self._tendon_sliding_curvature),
+                    int(sliding_curvature),
                 ],
                 outputs=[self.tendon_material_modes],
                 device=self.device,
@@ -7469,7 +7469,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if model.tendon_count:
             # Project geometry and material at the common pre-update pose. All
             # bodies in a sparse group then use this same frozen material state.
-            self._update_tendon_routing(state_in, dt, report_unsupported_wrap)
+            self._update_tendon_routing(state_in, dt, report_unsupported_wrap, sliding_curvature=True)
             wp.launch(
                 accumulate_sparse_tendon_diagonal,
                 dim=layout.articulation_body_count,

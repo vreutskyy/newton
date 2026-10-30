@@ -85,13 +85,28 @@ def _material_sweep_tension(
 
 
 @wp.func
-def _material_sweep_contact_error(tension_l: float, tension_r: float, ratio: float, transfer: float) -> float:
-    """Check both cone feasibility and the boundary selected by net slip."""
+def _material_sweep_contact_error(
+    tension_l: float,
+    tension_r: float,
+    ratio: float,
+    transfer: float,
+    can_decrease: bool,
+    can_increase: bool,
+) -> float:
+    """Check friction complementarity in the feasible material-transfer directions."""
+    increase_error = tension_l - ratio * tension_r
+    decrease_error = tension_r - ratio * tension_l
     if transfer > 0.0:
-        return wp.abs(tension_l - ratio * tension_r)
-    if transfer < 0.0:
-        return wp.abs(tension_r - ratio * tension_l)
-    return wp.max(wp.max(tension_l - ratio * tension_r, tension_r - ratio * tension_l), 0.0)
+        decrease_error = -increase_error
+    elif transfer < 0.0:
+        increase_error = -decrease_error
+    # Positive transfer takes material from the right span. At its rest floor,
+    # further transfer is impossible, but returning material must remain allowed.
+    if not can_increase:
+        increase_error = 0.0
+    if not can_decrease:
+        decrease_error = 0.0
+    return wp.max(wp.max(increase_error, decrease_error), 0.0)
 
 
 @wp.func
@@ -1875,7 +1890,14 @@ def _make_solve_tendon_material(direct_enabled: bool):
                                 seg_active_damping[right] / dt,
                             )
                             error = _material_sweep_contact_error(
-                                tension_l, tension_r, tendon_link_cap_ratio[link], link_material_transfer[link]
+                                tension_l,
+                                tension_r,
+                                tendon_link_cap_ratio[link],
+                                link_material_transfer[link],
+                                # Compare in stretch space, where the updates live: subtracting
+                                # stretch from length again can round a bound slightly above min_rest.
+                                seg_stretch[left] < seg_length[left] - min_rest,
+                                seg_stretch[right] < seg_length[right] - min_rest,
                             )
                             if error > tendon_settle_atol + tendon_settle_tol * wp.max(tension_l, tension_r):
                                 converged = 0

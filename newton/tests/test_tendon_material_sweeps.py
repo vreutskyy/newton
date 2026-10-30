@@ -112,10 +112,13 @@ def solve_material_case(
     segment_compliance=0.01,
     direct=False,
     capture=False,
+    segment_lengths=None,
 ):
     """Hold geometry fixed and exercise the production material-transfer kernel."""
     count = len(tensions)
-    length = np.ones(count, dtype=np.float32)
+    length = (
+        np.ones(count, dtype=np.float32) if segment_lengths is None else np.asarray(segment_lengths, dtype=np.float32)
+    )
     compliance = np.full(count, segment_compliance, dtype=np.float32)
     rest = length - compliance * np.asarray(tensions, dtype=np.float32)
     damping_values = (
@@ -125,7 +128,8 @@ def solve_material_case(
     )
     if nonlinear:
         rest = np.array(
-            [material_rest(1.0, t - d) for t, d in zip(tensions, damping_values, strict=True)], dtype=np.float32
+            [material_rest(l, t - d) for l, t, d in zip(length, tensions, damping_values, strict=True)],
+            dtype=np.float32,
         )
     else:
         rest += compliance * damping_values
@@ -136,8 +140,9 @@ def solve_material_case(
     rest_gpu = wp.array(rest, device=device)
     stretch = wp.zeros(count, device=device)
     damping = wp.zeros(count, device=device)
-    points_l = wp.array([[i, 0, 0] for i in range(count)], dtype=wp.vec3, device=device)
-    points_r = wp.array([[i + 1, 0, 0] for i in range(count)], dtype=wp.vec3, device=device)
+    positions = np.concatenate(([0.0], np.cumsum(length)))
+    points_l = wp.array([[x, 0, 0] for x in positions[:-1]], dtype=wp.vec3, device=device)
+    points_r = wp.array([[x, 0, 0] for x in positions[1:]], dtype=wp.vec3, device=device)
     poses = wp.array([wp.transform_identity()] * (count + 1), dtype=wp.transform, device=device)
     link_active = wp.ones(count + 1, dtype=bool, device=device)
     sweep_count = wp.zeros(1, dtype=int, device=device)
@@ -260,6 +265,51 @@ def test_adaptive_sweeps_check_final_force_scale(test, device):
             np.testing.assert_allclose(tension, full, atol=3.0e-6, rtol=5.0e-3)
             np.testing.assert_allclose(rest.sum(), initial_rest.sum(), atol=3.0e-7, rtol=0)
             test.assertLess(count, 256, "Converged material should stop before exhausting its budget")
+
+
+def test_adaptive_sweeps_exhausted_span(test, device):
+    """Accept a material-bound optimum, not an impossible capstan equality."""
+    for reverse in (False, True):
+        for capture in (False, True) if device.is_cuda else (False,):
+            lengths, tensions = [1.0, 0.001], [5.0, 0.0]
+            if reverse:
+                lengths, tensions = lengths[::-1], tensions[::-1]
+            with test.subTest(reverse=reverse, capture=capture):
+                force, rest, initial, count = solve_material_case(
+                    device, tensions, [2.0], segment_lengths=lengths, capture=capture
+                )
+                donor = 0 if reverse else 1
+                receiver = 1 - donor
+                expected_rest = initial.copy()
+                expected_rest[receiver] += expected_rest[donor] - 1.0e-6
+                expected_rest[donor] = 1.0e-6
+                np.testing.assert_allclose(rest, expected_rest, atol=1.0e-7, rtol=0)
+                test.assertGreater(force[receiver], 2.0 * force[donor])
+                test.assertLessEqual(count, 2, "The donor bound already prevents any further transfer")
+                full, full_rest, _, full_count = solve_material_case(
+                    device, tensions, [2.0], segment_lengths=lengths, tol=0.0, atol=100.0
+                )
+                test.assertEqual(full_count, 256, "Zero relative tolerance disables early-out, including atol")
+                np.testing.assert_array_equal(force, full)
+                np.testing.assert_array_equal(rest, full_rest)
+
+
+def test_adaptive_sweeps_replenished_donor(test, device):
+    """Recheck a depleted middle span after its other neighbor replenishes it."""
+    for reverse in (False, True):
+        lengths, tensions, ratios = [1.0, 0.1, 1.0], [50.0, 0.0, -25.0], [1.2, 1.4]
+        expected = 25.0 * np.array([1.68, 1.4, 1.0]) / 4.08
+        if reverse:
+            lengths, tensions, ratios, expected = lengths[::-1], tensions[::-1], ratios[::-1], expected[::-1]
+        with test.subTest(reverse=reverse):
+            force, rest, initial, count = solve_material_case(
+                device, tensions, ratios, segment_lengths=lengths, tol=1.0e-6
+            )
+            test.assertGreater(count, 1)
+            test.assertLess(count, 256)
+            np.testing.assert_allclose(force, expected, atol=3.0e-5, rtol=0)
+            np.testing.assert_allclose(rest.sum(), initial.sum(), atol=2.0e-7, rtol=0)
+            test.assertGreater(rest[1], 1.0e-6)
 
 
 def test_adaptive_sweeps_preserve_small_corrections(test, device):
@@ -416,7 +466,9 @@ def test_slack_projection_stops_at_anchor(test, device):
 def _evaluate_contact_error(values: wp.array2d[float], result: wp.array[float]):
     """Evaluate force residuals for independently specified contact states."""
     i = wp.tid()
-    result[i] = _material_sweep_contact_error(values[i, 0], values[i, 1], values[i, 2], values[i, 3])
+    result[i] = _material_sweep_contact_error(
+        values[i, 0], values[i, 1], values[i, 2], values[i, 3], values[i, 4] != 0.0, values[i, 5] != 0.0
+    )
 
 
 def test_material_convergence_requires_slip_boundary(test, device):
@@ -430,6 +482,7 @@ def test_material_convergence_requires_slip_boundary(test, device):
         [3.0, 1.0, 2.0, 0.0],
         [0.0, 0.0, 2.0, 0.1],
     ]
+    rows = [[*row, 1.0, 1.0] for row in rows]
     errors = wp.empty(len(rows), dtype=float, device=device)
     wp.launch(
         _evaluate_contact_error,
@@ -439,6 +492,29 @@ def test_material_convergence_requires_slip_boundary(test, device):
         device=device,
     )
     np.testing.assert_allclose(errors.numpy(), [0.0, 0.5, 0.5, 0.0, 0.0, 1.0, 0.0], atol=1e-7, rtol=0)
+
+
+def test_material_convergence_bound_directions(test, device):
+    """An exhausted donor can stop transfer, but cannot prevent release from its bound."""
+    rows = [
+        [3.0, 1.0, 2.0, 0.1, 1.0, 0.0],  # upper bound, force drives into it
+        [1.0, 3.0, 2.0, -0.1, 0.0, 1.0],  # lower bound, force drives into it
+        [1.5, 1.0, 2.0, 0.1, 1.0, 0.0],  # upper bound must release
+        [1.0, 1.5, 2.0, -0.1, 0.0, 1.0],  # lower bound must release
+        [3.0, 1.0, 2.0, 0.0, 1.0, 0.0],  # no slip, upper bound
+        [1.0, 3.0, 2.0, 0.0, 1.0, 0.0],  # no slip, can move away
+        [3.0, 1.0, 2.0, 0.1, 1.0, 1.0],  # neighbor replenished donor
+        [1.0, 3.0, 2.0, -0.1, 1.0, 1.0],
+    ]
+    errors = wp.empty(len(rows), dtype=float, device=device)
+    wp.launch(
+        _evaluate_contact_error,
+        dim=len(rows),
+        inputs=[wp.array(rows, dtype=float, device=device)],
+        outputs=[errors],
+        device=device,
+    )
+    np.testing.assert_allclose(errors.numpy(), [0.0, 0.0, 0.5, 0.5, 0.0, 1.0, 1.0, 1.0], atol=1e-7, rtol=0)
 
 
 def test_material_sweep_tolerances_are_validated(test, device):
@@ -689,6 +765,24 @@ def test_vbd_spin_reaction_matches_capstan_projection(test, device):
 
 
 devices = get_test_devices()
+add_function_test(
+    TestTendonMaterialSweeps,
+    "test_adaptive_sweeps_replenished_donor",
+    test_adaptive_sweeps_replenished_donor,
+    devices=devices,
+)
+add_function_test(
+    TestTendonMaterialSweeps,
+    "test_material_convergence_bound_directions",
+    test_material_convergence_bound_directions,
+    devices=devices,
+)
+add_function_test(
+    TestTendonMaterialSweeps,
+    "test_adaptive_sweeps_exhausted_span",
+    test_adaptive_sweeps_exhausted_span,
+    devices=devices,
+)
 add_function_test(
     TestTendonMaterialSweeps,
     "test_adaptive_sweeps_stop_at_satisfied_projection",

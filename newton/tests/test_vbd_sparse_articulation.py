@@ -1966,6 +1966,7 @@ for _test in (
         mode="block_sparse_levels",
     )
 for tendon_test in (
+    test_tendon_sparse.test_sparse_tendon_local_fallback_metric,
     test_tendon_sparse.test_sparse_tendon_implicit_step,
     test_tendon_sparse.test_sparse_tendon_merges_articulations,
     test_tendon_sparse.test_sparse_tendon_world_isolation,

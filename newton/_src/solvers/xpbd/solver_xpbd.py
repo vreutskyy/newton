@@ -215,7 +215,7 @@ class SolverXPBD(TendonStateMixin, SolverBase, CouplingInterface):
             tendon_settle_tol: Relative capstan-complementarity tolerance
                 for adaptive tendon sweeps. Zero disables early-out. Ignored by direct solves.
             tendon_settle_atol: Experimental absolute force tolerance [N] for adaptive tendon sweeps,
-                allowing slack cables to settle. Ignored by direct solves.
+                allowing slack cables to settle. Ignored when ``tendon_settle_tol`` is zero or by direct solves.
         """
         if model._has_rod_joints and JointType.ROD in model.joint_type.numpy():  # pyright: ignore[reportPrivateUsage]
             raise ValueError("SolverXPBD does not support JointType.ROD joints.")

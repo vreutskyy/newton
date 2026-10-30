@@ -154,8 +154,6 @@ def test_direct_slip_matches_transfer(test, device):
                     if solver_type is newton.solvers.SolverVBD:
                         options["tendon_material_direct_settle_iterations"] = 0
                     solver = solver_type(model, iterations=1, tendon_material_direct=True, **options)
-                    if solver_type is newton.solvers.SolverVBD:
-                        solver._tendon_sliding_curvature = True
                     initial = solver.tendon_seg_rest_length.numpy().copy()
                     # Seed all slots to expose stale endpoints and non-sliding anchors too.
                     solver._tendon_link_material_transfer.fill_(7.0)
@@ -173,6 +171,8 @@ def test_direct_slip_matches_transfer(test, device):
                     if not nonlinear:
                         np.testing.assert_allclose(slip[[1, 3]], sign * np.array([0.01, -0.01]), atol=2.0e-7)
                     if solver_type is newton.solvers.SolverVBD:
+                        # The sparse metric is opt-in for assembly, never for local updates.
+                        solver._update_tendon_routing(next_state, 1.0 / 240.0, False, sliding_curvature=True)
                         modes = solver.tendon_material_modes.numpy()
                         np.testing.assert_array_equal(modes["first"], [0, 0, 2, 2])
                         weights = modes["transfer_weight"][[0, 2]]

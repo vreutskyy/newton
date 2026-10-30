@@ -82,6 +82,64 @@ def test_sparse_tendon_implicit_step(test, device, sparse_mode="block_sparse_joi
     _check_implicit_step(test, device, sparse_mode=sparse_mode)
 
 
+def test_sparse_tendon_local_fallback_metric(test, device, sparse_mode="block_sparse_joints"):
+    """Sparse selection must not change friction curvature on locally solved bodies."""
+
+    def two_steps(solver, state, next_state, control):
+        solver.step(state, next_state, control, None, 1.0 / 600.0)
+        solver.step(next_state, state, control, None, 1.0 / 600.0)
+
+    for mixed in (False, True):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        guide = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 2.0), wp.quat_identity()), mass=0.0)
+        ends = []
+        for x, mass in ((-0.3, 1.0), (0.3, 1.6)):
+            ends.append(
+                builder.add_link(
+                    xform=wp.transform(wp.vec3(x, 0.0, 1.0), wp.quat_identity()),
+                    mass=mass,
+                    inertia=wp.mat33(np.eye(3) * 0.01),
+                )
+            )
+        builder.add_tendon()
+        for body in (ends[0], guide, ends[1]):
+            builder.add_tendon_link(
+                body,
+                link_type=newton.TendonLinkType.PINHOLE if body == guide else newton.TendonLinkType.ATTACHMENT,
+                compliance=1.0e-5,
+                damping=0.0,
+                mu=0.1,
+            )
+        if mixed:
+            pose = wp.transform(wp.vec3(10.0, 0.0, 0.0), wp.quat_identity())
+            body = builder.add_link(xform=pose, mass=1.0, inertia=wp.mat33(np.eye(3)))
+            joint = builder.add_joint_prismatic(-1, body, parent_xform=pose, axis=(1.0, 0.0, 0.0))
+            builder.add_articulation([joint])
+        builder.color()
+        model = builder.finalize(device=device)
+        results = []
+        for mode in ("local", sparse_mode):
+            for capture in (False, True) if device.is_cuda else (False,):
+                solver = newton.solvers.SolverVBD(model, iterations=4, rigid_articulation_solve=mode)
+                state, next_state, control = model.state(), model.state(), model.control()
+
+                two_steps(solver, state, next_state, control)  # Compile before capture with the same history.
+                if capture:
+                    with wp.ScopedCapture(device=device) as captured:
+                        two_steps(solver, state, next_state, control)
+                    for _ in range(29):
+                        wp.capture_launch(captured.graph)
+                else:
+                    for _ in range(29):
+                        two_steps(solver, state, next_state, control)
+                results.append(state.body_q.numpy()[ends])
+                if mode == sparse_mode:
+                    test.assertEqual(solver.rigid_articulation_sparse_layout is not None, mixed)
+        with test.subTest(mixed=mixed):
+            for result in results[1:]:
+                np.testing.assert_array_equal(results[0], result)
+
+
 def test_sparse_tendon_merges_articulations(test, device, sparse_mode="block_sparse_joints"):
     """Solve tendon-connected articulations as one coupled system."""
     _check_implicit_step(test, device, sparse_mode=sparse_mode, separate_articulations=True)
