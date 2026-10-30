@@ -5,8 +5,9 @@
 # Example Tendon Rolling Pulley
 #
 # Atwood machine: two weights connected by a tendon routed over a
-# dynamic pulley constrained by a hinge joint.  The heavier weight
-# descends, pulling the lighter weight up; the pulley rotates freely
+# dynamic pulley constrained by a hinge joint. The weights have vertical
+# guides and end stops. The heavier weight descends, pulling the lighter
+# weight up; the pulley rotates freely
 # under cable tension — no kinematic rotation tracking needed.
 #
 # The pulley has finite mass and inertia, so the XPBD constraint
@@ -22,8 +23,7 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton._src.sim.builder import Axis
-from newton._src.sim.tendon import TendonLinkType
+from newton import Axis, TendonLinkType
 from newton.examples.cable.cable import assert_tendon_total_length, get_tendon_attachment_worlds, get_tendon_cable_lines
 
 
@@ -67,7 +67,7 @@ class Example:
                 inertia_xz,
             )
 
-        pulley = builder.add_body(
+        pulley = builder.add_link(
             xform=wp.transform(p=wp.vec3(0.0, 0.0, self.pulley_height), q=wp.quat_identity()),
             mass=pulley_mass,
             inertia=cylinder_inertia(pulley_mass, self.pulley_radius, pulley_half_height),
@@ -83,8 +83,6 @@ class Example:
         )
         self.pulley_idx = pulley
 
-        Dof = newton.ModelBuilder.JointDofConfig
-
         # Hinge joint: pulley fixed in space, free to rotate about Y
         j_pulley = builder.add_joint_revolute(
             parent=-1,
@@ -94,34 +92,44 @@ class Example:
             child_xform=wp.transform(),
         )
 
-        planar_lin = [Dof(axis=Axis.X), Dof(axis=Axis.Z)]
-        planar_ang = [Dof(axis=Axis.Y)]
+        weight_height = 1.35
+        self.weight_travel = 0.8
+        left_pos = wp.vec3(-self.pulley_radius, 0.0, weight_height)
+        right_pos = wp.vec3(self.pulley_radius, 0.0, weight_height)
+        # Let each shape supply exactly the specified weight mass and inertia.
+        # Adding a default-density shape to a 1/2 kg body made them 5.096/10 kg.
+        left_cfg = contact_cfg.copy()
+        left_cfg.density = 1.0 / (8.0 * 0.08**3)
+        right_cfg = contact_cfg.copy()
+        right_cfg.density = 2.0 / (8.0 * 0.10**3)
 
         self.left_idx = left = builder.add_link(
-            xform=wp.transform(p=wp.vec3(-0.5, 0.0, 2.16), q=wp.quat_identity()),
-            mass=1.0,
+            xform=wp.transform(p=left_pos),
+            mass=0.0,
         )
-        builder.add_shape_box(left, hx=0.08, hy=0.08, hz=0.08, cfg=contact_cfg)
-        j1 = builder.add_joint_d6(
+        builder.add_shape_box(left, hx=0.08, hy=0.08, hz=0.08, cfg=left_cfg)
+        j1 = builder.add_joint_prismatic(
             parent=-1,
             child=left,
-            linear_axes=planar_lin,
-            angular_axes=planar_ang,
-            parent_xform=wp.transform(p=wp.vec3(-0.5, 0.0, 2.16), q=wp.quat_identity()),
+            axis=Axis.Z,
+            limit_lower=-self.weight_travel,
+            limit_upper=self.weight_travel,
+            parent_xform=wp.transform(p=left_pos),
             child_xform=wp.transform(),
         )
 
         self.right_idx = right = builder.add_link(
-            xform=wp.transform(p=wp.vec3(0.5, 0.0, 2.16), q=wp.quat_identity()),
-            mass=2.0,
+            xform=wp.transform(p=right_pos),
+            mass=0.0,
         )
-        builder.add_shape_box(right, hx=0.10, hy=0.10, hz=0.10, cfg=contact_cfg)
-        j2 = builder.add_joint_d6(
+        builder.add_shape_box(right, hx=0.10, hy=0.10, hz=0.10, cfg=right_cfg)
+        j2 = builder.add_joint_prismatic(
             parent=-1,
             child=right,
-            linear_axes=planar_lin,
-            angular_axes=planar_ang,
-            parent_xform=wp.transform(p=wp.vec3(0.5, 0.0, 2.16), q=wp.quat_identity()),
+            axis=Axis.Z,
+            limit_lower=-self.weight_travel,
+            limit_upper=self.weight_travel,
+            parent_xform=wp.transform(p=right_pos),
             child_xform=wp.transform(),
         )
 
@@ -176,15 +184,19 @@ class Example:
         self._initial_left_z = float(self.state_0.body_q.numpy()[self.left_idx][2])
         self._initial_right_z = float(self.state_0.body_q.numpy()[self.right_idx][2])
         self._pulley_theta = 0.0
-        self._last_pulley_angle = None
+        self._last_pulley_angle = self._hinge_y_angle(self.state_0.body_q.numpy()[self.pulley_idx])
         self._left_z_history = []
         self._right_z_history = []
         self._left_position_history = []
         self._right_position_history = []
         self._left_attachment_history = []
-        self._left_pulley_distance_history = []
         self._pulley_rotation_history = []
         self._direction_validation_frames = 120
+        masses = self.model.body_mass.numpy()
+        inertia = float(self.model.body_inertia.numpy()[self.pulley_idx, 1, 1])
+        self._expected_acceleration = float(
+            (masses[right] - masses[left]) * 9.81 / (masses[left] + masses[right] + inertia / self.pulley_radius**2)
+        )
 
         if self.viewer is not None:
             self.viewer.set_model(self.model)
@@ -227,9 +239,6 @@ class Example:
         self._right_position_history.append(np.array(body_q[self.right_idx][:3], dtype=np.float64))
         att_l, _ = get_tendon_attachment_worlds(self.solver, self.model, self.state_0)
         self._left_attachment_history.append(np.array(att_l[0], dtype=np.float64))
-        self._left_pulley_distance_history.append(
-            float(np.linalg.norm(body_q[self.left_idx][:3] - body_q[self.pulley_idx][:3]))
-        )
 
     def _assert_light_attachment_stays_below_pulley(self, attachment, body_q, label="Rolling pulley"):
         pulley_center = body_q[self.pulley_idx][:3]
@@ -267,8 +276,8 @@ class Example:
         if self._left_attachment_history:
             self._assert_light_attachment_stays_below_pulley(self._left_attachment_history[-1], body_q)
 
-        if len(self._pulley_rotation_history) <= self._direction_validation_frames:
-            assert_tendon_total_length(self, rel_tol=0.30)
+        assert_tendon_total_length(self, rel_tol=0.005)
+        assert not np.any(self.solver._tendon_route_failure.numpy()), "Rolling pulley entered an unsupported wrap"
         if self.sim_time < self.frame_dt * 1.5:
             pulley_z = body_q[self.pulley_idx][2]
             assert att_r[0][2] >= pulley_z - 1.0e-4, (
@@ -286,23 +295,23 @@ class Example:
         left_rise = self._left_z_history[sample] - self._initial_left_z
         right_drop = self._initial_right_z - self._right_z_history[sample]
         theta = self._pulley_rotation_history[sample]
-        min_left_attachment_distance = min(
-            np.linalg.norm(attachment - self.state_0.body_q.numpy()[self.pulley_idx][:3])
-            for attachment in self._left_attachment_history
-        )
         left_step = float(np.max(np.linalg.norm(np.diff(np.array(self._left_position_history), axis=0), axis=1)))
         right_step = float(np.max(np.linalg.norm(np.diff(np.array(self._right_position_history), axis=0), axis=1)))
         assert np.isfinite([left_rise, right_drop, theta]).all(), (
             f"Rolling pulley produced non-finite values inside the validated prefix: "
             f"left_rise={left_rise:.4f}, right_drop={right_drop:.4f}, theta={theta:.4f}"
         )
-        assert left_rise > 0.05, f"Light side should rise over the validated prefix: dz={left_rise:.4f}"
-        assert right_drop > 0.05, f"Heavy side should descend over the validated prefix: dz={right_drop:.4f}"
-        assert theta > 0.5, f"High-friction pulley should rotate with cable travel: theta={theta:.4f}"
-        assert min_left_attachment_distance < self.pulley_radius + 0.12, (
-            f"Light-side cable attachment should reach the pulley contact neighborhood, not avoid it: "
-            f"min_attachment_distance={min_left_attachment_distance:.4f}"
-        )
+        # The prefix is before either end stop: a=(m_right-m_left)g/(m_left+m_right+I/r^2).
+        # Check distance and rim travel against this independent inextensible reference.
+        times = (np.arange(sample + 1) + 1) * self.frame_dt
+        expected = 0.5 * self._expected_acceleration * times**2
+        left = np.asarray(self._left_z_history[: sample + 1]) - self._initial_left_z
+        right = self._initial_right_z - np.asarray(self._right_z_history[: sample + 1])
+        rim = self.pulley_radius * np.asarray(self._pulley_rotation_history[: sample + 1])
+        for name, travel in (("light rise", left), ("heavy drop", right), ("pulley rim", rim)):
+            error = float(np.max(np.abs(travel - expected)))
+            assert error < 0.01, f"Atwood {name} differs from analytical travel by {error:.5f} m"
+        assert theta > 0.0, f"High-friction pulley should rotate with cable travel: theta={theta:.4f}"
         assert max(left_step, right_step) < 0.35, (
             f"Rolling pulley contact should stay bounded without frame jumps: "
             f"left_step={left_step:.4f}, right_step={right_step:.4f}"

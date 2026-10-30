@@ -544,10 +544,10 @@ def test_accepted_dynamic_route_release(test, device, capture=False):
     solver.body_q_prev.assign(state.body_q)
     solver._snapshot_tendon_step_state()
     solver._update_tendon_link_active(model, state.body_q)
-    solver._prepare_tendon_route(model, state.body_q, 1e-8)
+    solver._prepare_tendon_route(model, 1e-8)
     solver._update_tendon_routing(state, 1 / 1200, False)
     solver._snapshot_tendon_step_state()
-    solver._prepare_tendon_route(model, state.body_q, 1e-8)
+    solver._prepare_tendon_route(model, 1e-8)
     test.assertTrue(solver.tendon_link_active.numpy()[link])
     initial = _oriented_route_material_length(solver, model, state, link)
     graph = None

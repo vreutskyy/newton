@@ -17,6 +17,7 @@ from .tendon_material_nonlinear import _secant_compliance_float
 
 @wp.struct
 class TendonALMMaterialState:
+    physical: bool
     reference: wp.array[float]
     extension: wp.array[float]
     offset: wp.array[float]
@@ -29,6 +30,18 @@ class TendonALMMaterialState:
     multiplier: wp.array[float]
     penalty: wp.array[float]
     dt: float
+
+
+@wp.func
+def _physical_compliance(state: TendonALMMaterialState, seg: int) -> float:
+    return wp.max(state.physical_compliance[seg], 1.0e-30 if state.physical else 1.0e-8)
+
+
+@wp.func
+def _penalty(state: TendonALMMaterialState, seg: int) -> float:
+    if state.physical:
+        return 0.0
+    return state.penalty[seg]
 
 
 @wp.func
@@ -53,13 +66,13 @@ def alm_material_coefficients(
     width: float,
 ):
     """Express the segment ALM row as T=max((e+offset)/compliance,0)."""
-    physical_c = wp.max(state.physical_compliance[seg], 1.0e-8)
+    physical_c = _physical_compliance(state, seg)
     if ea_low > 0.0:
         physical_c = _secant_compliance_float(state.length[seg], extension, ea_low, ea_ratio, knee, width)
     damping_force = wp.min(state.damping_force[seg], 0.0)
     compliance = physical_c
     offset = physical_c * damping_force
-    rho = state.penalty[seg]
+    rho = _penalty(state, seg)
     metric = 1.0 + physical_c * state.damping[seg] / state.dt
     if rho > 0.0:
         compliance = physical_c + metric / rho
@@ -113,7 +126,7 @@ def alm_material_linearization(
     metric_derivative = physical_derivative * state.damping[seg] / state.dt
     c_derivative = physical_derivative
     offset_derivative = physical_derivative * wp.min(state.damping_force[seg], 0.0)
-    rho = state.penalty[seg]
+    rho = _penalty(state, seg)
     if rho > 0.0:
         c_derivative += metric_derivative / rho
         offset_derivative += metric_derivative * state.multiplier[seg] / rho
@@ -131,6 +144,85 @@ def alm_material_linearization(
     if tangent > 0.0 and wp.isfinite(tangent):
         return 1.0 / tangent, force / tangent - extension
     return c, offset
+
+
+@wp.func_native("""
+#ifdef __CUDA_ARCH__
+return nextafterf(value, -INFINITY);
+#else
+return __builtin_nextafterf(value, -INFINITY);
+#endif
+""")
+def _next_float_down(value: float) -> float: ...
+
+
+@wp.func
+def _alm_zero_force_limit(
+    state: TendonALMMaterialState,
+    seg: int,
+    ea_low: float,
+    ea_ratio: float,
+    knee: float,
+    width: float,
+):
+    """Find the upper endpoint of the actual force-free interval, not its tangent.
+
+    Positive damping vanishes at a slack endpoint. Writing u=lambda/rho and
+    B=min(viscous,0)+u*damping/dt, the numerator is e+u+C(e)*B.
+    For the sigmoid law it is affine below zero and monotone above zero when
+    B<0. If B reaches the low-strain axial rigidity, no force-free interval exists.
+    """
+    length = state.length[seg]
+    bound = length - 1.0e-6
+    u = float(0.0)
+    if _penalty(state, seg) > 0.0:
+        u = state.multiplier[seg] / _penalty(state, seg)
+    b = wp.min(state.damping_force[seg], 0.0) + u * state.damping[seg] / state.dt
+    endpoint = -u - _physical_compliance(state, seg) * b
+    if ea_low > 0.0:
+        ea_zero = ea_low * (1.0 + 0.5 * (ea_ratio - 1.0) * (1.0 + wp.tanh(-knee / width)))
+        if b >= ea_zero:
+            return False, 0.0
+        endpoint = -(ea_zero * u + length * b) / (ea_zero - b)
+        if endpoint > 0.0 and bound > 0.0:
+            # Increasing EA makes the low-strain affine root an upper bracket.
+            lower = float(0.0)
+            upper = wp.min(endpoint, bound)
+            c = _secant_compliance_float(length, upper, ea_low, ea_ratio, knee, width)
+            if upper + u + c * b <= 0.0:
+                lower = upper
+            else:
+                trial = 0.5 * upper
+                for _ in range(32):
+                    rest = length - trial
+                    strain = trial / rest
+                    transition = wp.tanh((strain - knee) / width)
+                    delta = 0.5 * ea_low * (ea_ratio - 1.0)
+                    ea = ea_low + delta * (1.0 + transition)
+                    c = rest / ea
+                    residual = trial + u + c * b
+                    if residual <= 0.0:
+                        lower = trial
+                    else:
+                        upper = trial
+                    if upper - lower <= 2.0 * 1.1920928955078125e-7 * wp.max(upper, 1.0e-30):
+                        break
+                    c_derivative = -1.0 / ea - c * delta * (1.0 - transition * transition) * length / (
+                        width * rest * rest * ea
+                    )
+                    proposal = trial - residual / (1.0 + b * c_derivative)
+                    if not wp.isfinite(proposal) or proposal <= lower or proposal >= upper:
+                        proposal = 0.5 * (lower + upper)
+                    trial = proposal
+            endpoint = lower
+    endpoint = wp.min(endpoint, bound)
+    # Round toward the force-free side using the same arithmetic as publication.
+    for _ in range(4):
+        c, offset = alm_material_coefficients(state, seg, endpoint, ea_low, ea_ratio, knee, width)
+        if endpoint + offset <= 0.0:
+            return True, endpoint
+        endpoint = _next_float_down(endpoint)
+    return False, endpoint
 
 
 @wp.func_native("""
@@ -175,8 +267,24 @@ def _make_project_alm_material(cooperative: bool):
             reference_sum += state.reference[row + slot]
         for slot in range(lane, count, stride):
             state.extension[row + slot] = state.reference[row + slot]
+            i = row + slot
+            feasible, limit = _alm_zero_force_limit(state, ids[i], ea_low, ea_ratio, knee, width)
+            state.offset[i] = -limit
+            initial[i] = state.reference[i] - limit
+            compliance[i] = 1.0 if feasible else 0.0
+            upper[i] = state.length[ids[i]] - 1.0e-6 - limit
         if wp.static(cooperative):
             warp_broadcast(0)
+        slack_candidate = bool(True)
+        if lane == 0:
+            deficit = wp.float64(0.0)
+            for slot in range(count):
+                i = row + slot
+                deficit += wp.float64(initial[i])
+                slack_candidate = slack_candidate and compliance[i] > 0.0
+            slack_candidate = slack_candidate and deficit <= wp.float64(0.0)
+        if wp.static(cooperative):
+            slack_candidate = bool(warp_broadcast(int(slack_candidate)))
         for iteration in range(128):
             if lane == 0:
                 state.iterations[row] = iteration + 1
@@ -188,11 +296,12 @@ def _make_project_alm_material(cooperative: bool):
                     # Try the all-slack branch first when the material inventory permits it.
                     # Publication still requires the full-force certificate below.
                     trial_extension = wp.min(trial_extension, 0.0)
-                c, offset = alm_material_linearization(state, seg, trial_extension, ea_low, ea_ratio, knee, width)
-                initial[i] = state.reference[i] + offset
-                compliance[i] = c
-                state.offset[i] = offset
-                upper[i] = state.length[seg] - 1.0e-6 + offset
+                if iteration != 0 or not slack_candidate:
+                    c, offset = alm_material_linearization(state, seg, trial_extension, ea_low, ea_ratio, knee, width)
+                    initial[i] = state.reference[i] + offset
+                    compliance[i] = c
+                    state.offset[i] = offset
+                    upper[i] = state.length[seg] - 1.0e-6 + offset
             if wp.static(cooperative):
                 warp_broadcast(0)
             if lane == 0:
@@ -245,6 +354,8 @@ def _make_project_alm_material(cooperative: bool):
                 i = row + slot
                 seg = ids[i]
                 output[i] = output[i] - state.offset[i]
+                if status[row] == int(TendonMaterialStatus.SLACK_UNCHANGED):
+                    output[i] = state.reference[i]
                 c, offset = alm_material_coefficients(state, seg, output[i], ea_low, ea_ratio, knee, width)
                 state.force[i] = wp.max((output[i] + offset) / c, 0.0)
                 if status[row] == int(TendonMaterialStatus.SLACK_UNCHANGED) or status[row] == int(
@@ -289,7 +400,7 @@ def _make_project_alm_material(cooperative: bool):
                                 step_fraction, 0.9 * wp.max(bound - state.extension[i], 0.0) / direction
                             )
                         seg = ids[i]
-                        if state.penalty[seg] > 0.0 and state.extension[i] >= bound - 0.01 * wp.abs(bound):
+                        if _penalty(state, seg) > 0.0 and state.extension[i] >= bound - 0.01 * wp.abs(bound):
                             # A finite ALM penalty puts an artificial force ceiling on
                             # a short span, even when the physical material is feasible.
                             # Once Newton reaches that ceiling, strengthen this row's

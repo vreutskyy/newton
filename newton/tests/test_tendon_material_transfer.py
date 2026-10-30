@@ -119,6 +119,7 @@ class _MaterialFixture:
                 1,
                 solver.tendon_max_sweeps,
                 solver.tendon_settle_tol,
+                solver.tendon_settle_atol,
                 0.0,
                 0.0,
                 0.0,

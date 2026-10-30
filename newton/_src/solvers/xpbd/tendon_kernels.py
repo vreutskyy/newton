@@ -11,6 +11,7 @@ capstan slip through the link friction coefficient.
 import warp as wp
 
 from ...sim.tendon import TendonLinkType
+from ..tendon_damping import tendon_damping_tension
 from ..tendon_kernels import (  # noqa: F401
     advance_point_on_circle,
     signed_arc_length,
@@ -100,8 +101,7 @@ def solve_tendon_stretch(
     diff = x_r - x_l
     d = wp.length(diff)
 
-    # Keep signed stretch because positive length rate may activate damping
-    # before geometric stretch becomes positive.
+    # Keep signed stretch for unilateral release; damping excludes slack travel.
     err = d - rest
     if d <= 1.0e-8:
         seg_lambda[seg] = 0.0
@@ -170,6 +170,10 @@ def solve_tendon_stretch(
         denom += wp.dot(rot_ang_r, I_inv_r * rot_ang_r)
 
     lambda_prev = seg_lambda[seg]
+    damped = tendon_damping_tension(err, damping * derr, damping, dt)
+    body_damping = damping
+    if err <= 0.0 and derr > 0.0:
+        body_damping = 0.0
     if sigmoid_ea_low > 0.0:
         tangent = tendon_material_tangent(
             d,
@@ -180,13 +184,13 @@ def solve_tendon_stretch(
             sigmoid_transition_strain,
             sigmoid_transition_width,
         )
-        d_lambda = -(lambda_prev + dt * (material_tension + damping * derr))
-        nonlinear_denom = 1.0 + (dt * dt * tangent + dt * damping) * denom
+        d_lambda = -(lambda_prev + dt * (material_tension + damped))
+        nonlinear_denom = 1.0 + (dt * dt * tangent + dt * body_damping) * denom
         d_lambda = d_lambda / nonlinear_denom
     else:
         alpha = compliance * compliance_lambda_scale
-        gamma = compliance * damping
-        d_lambda = -(err + alpha * lambda_prev + gamma * derr)
+        gamma = compliance * body_damping
+        d_lambda = -(err + alpha * lambda_prev + compliance * damped)
         linear_denom = (dt + gamma) * denom + compliance / dt
         if linear_denom > 0.0:
             d_lambda = d_lambda / linear_denom
@@ -194,8 +198,8 @@ def solve_tendon_stretch(
     d_lambda = d_lambda * relaxation
 
     # A cable may transmit tension but not compression. Applying the
-    # unilateral bound to the accumulated multiplier also lets positive
-    # length rate activate damping at zero geometric stretch.
+    # unilateral bound to the accumulated multiplier releases tension as the
+    # span becomes slack.
     lambda_new = wp.min(lambda_prev + d_lambda, 0.0)
     d_lambda = lambda_new - lambda_prev
     seg_lambda[seg] = lambda_new

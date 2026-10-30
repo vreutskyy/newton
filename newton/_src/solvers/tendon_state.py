@@ -17,6 +17,7 @@ import warp as wp
 
 from ..sim import Model
 from ..sim.tendon import TendonLinkFlags, TendonLinkType
+from .tendon_alm_material import TendonALMMaterialState
 from .tendon_kernels import (
     prepare_tendon_route,
     snapshot_tendon_link_active,
@@ -29,6 +30,7 @@ from .tendon_kernels import (
 from .tendon_material import TendonMaterialStatus
 from .tendon_material_cooperative_kernels import solve_tendon_material_cooperative
 from .tendon_material_nonlinear import TendonMaterialNonlinearStatus, allocate_tendon_material_nonlinear_state
+from .tendon_material_slack import TendonSlackBlock
 from .tendon_material_state import TendonMaterialState
 
 # Largest ratio of per-unit-length compliance within one tendon that is reported as physical.
@@ -267,6 +269,8 @@ class TendonStateMixin:
             self.tendon_max_sweeps = 256
         if not hasattr(self, "tendon_settle_tol"):
             self.tendon_settle_tol = 1.0e-3
+        if not hasattr(self, "tendon_settle_atol"):
+            self.tendon_settle_atol = 1.0e-6
         if not hasattr(self, "tendon_activation_tol"):
             self.tendon_activation_tol = 2.0e-3
         if not hasattr(self, "tendon_route_hysteresis"):
@@ -288,10 +292,16 @@ class TendonStateMixin:
             self.tendon_sigmoid_transition_strain = 0.0
         if not hasattr(self, "tendon_sigmoid_transition_width"):
             self.tendon_sigmoid_transition_width = 1.0
-        if not 1 <= self.tendon_max_sweeps <= 256:
-            raise ValueError(f"tendon_max_sweeps must be between 1 and 256, got {self.tendon_max_sweeps}")
-        if self.tendon_settle_tol < 0.0:
-            raise ValueError(f"tendon_settle_tol must be non-negative, got {self.tendon_settle_tol}")
+        # The kernel loop honors the requested budget. Its argument is int32,
+        # so reject overflow without imposing the default budget as a limit.
+        if not isinstance(self.tendon_max_sweeps, (int, np.integer)) or not (
+            1 <= self.tendon_max_sweeps <= np.iinfo(np.int32).max
+        ):
+            raise ValueError(f"tendon_max_sweeps must be a positive 32-bit integer, got {self.tendon_max_sweeps}")
+        if not np.isfinite(self.tendon_settle_tol) or self.tendon_settle_tol < 0.0:
+            raise ValueError("tendon_settle_tol must be finite and non-negative")
+        if not np.isfinite(self.tendon_settle_atol) or self.tendon_settle_atol < 0.0:
+            raise ValueError("tendon_settle_atol must be finite and non-negative")
         if not 0.0 <= self.tendon_activation_tol < 1.0:
             raise ValueError(
                 f"tendon_activation_tol must be between 0 (inclusive) and 1 (exclusive), "
@@ -318,6 +328,12 @@ class TendonStateMixin:
                     f"tendon_sigmoid_transition_width must be positive, got {self.tendon_sigmoid_transition_width}"
                 )
         self._init_direct_tendon_material(model)
+        if not self._tendon_material_state.enabled:
+            self._tendon_material_state.slack_enabled = True
+            self._tendon_material_state.slack = wp.zeros(model.tendon_segment_count, dtype=int, device=model.device)
+            self._tendon_material_state.slack_blocks = wp.zeros(
+                model.tendon_segment_count, dtype=TendonSlackBlock, device=model.device
+            )
         if model.tendon_segment_count == 0:
             self.tendon_seg_rest_length = None
             self.tendon_seg_rest_length_step = None
@@ -359,6 +375,8 @@ class TendonStateMixin:
             self.tendon_link_cone_seg_l = None
             self.tendon_link_cone_seg_r = None
             self.tendon_link_cap_ratio = None
+            self._tendon_link_arc = None
+            self._tendon_link_arc_step = None
             self.tendon_total_cable = None
             return
 
@@ -420,6 +438,8 @@ class TendonStateMixin:
             self.tendon_link_cone_seg_l = wp.full(model.tendon_link_count, -1, dtype=wp.int32)
             self.tendon_link_cone_seg_r = wp.full(model.tendon_link_count, -1, dtype=wp.int32)
             self.tendon_link_cap_ratio = wp.ones(model.tendon_link_count, dtype=float)
+            self._tendon_link_arc = wp.zeros(model.tendon_link_count, dtype=float)
+            self._tendon_link_arc_step = wp.zeros(model.tendon_link_count, dtype=float)
             self.tendon_total_cable = wp.zeros(model.tendon_count, dtype=float)
 
             tendon_start_np = model.tendon_start.numpy()
@@ -479,6 +499,20 @@ class TendonStateMixin:
         # at construction, so the diagnostic below runs once, never per step.
         self._warn_on_tendon_compliance_spread(model)
 
+        direct = self._tendon_material_state
+        if direct.enabled:
+            direct.engagement = True
+            direct.engagement_rows = wp.zeros(model.tendon_segment_count, dtype=int, device=model.device)
+            direct.alm = TendonALMMaterialState()
+            direct.alm.physical = True
+            for name in ("reference", "extension", "offset", "force"):
+                setattr(direct.alm, name, wp.zeros(model.tendon_segment_count, dtype=float, device=model.device))
+            direct.alm.iterations = wp.zeros(model.tendon_segment_count, dtype=int, device=model.device)
+            direct.alm.length = self.tendon_seg_length
+            direct.alm.physical_compliance = self.tendon_seg_active_compliance
+            direct.alm.damping = self.tendon_seg_active_damping
+            direct.alm.damping_force = self.tendon_seg_damping_tension
+
     def _warn_on_tendon_compliance_spread(self, model: Model) -> None:
         """Warn once per tendon whose per-segment compliance is not proportional to span length.
 
@@ -531,6 +565,7 @@ class TendonStateMixin:
         wp.copy(self.tendon_seg_rest_length_step, self.tendon_seg_rest_length)
         wp.copy(self.tendon_seg_attachment_l_local_step, self.tendon_seg_attachment_l_local)
         wp.copy(self.tendon_seg_attachment_r_local_step, self.tendon_seg_attachment_r_local)
+        wp.copy(self._tendon_link_arc_step, self._tendon_link_arc)
         if self._has_dynamic_tendon_links:
             wp.launch(
                 kernel=snapshot_tendon_link_active,
@@ -568,7 +603,6 @@ class TendonStateMixin:
     def _prepare_tendon_route(
         self,
         model: Model,
-        body_q: wp.array[wp.transform],
         compliance_floor: float = 0.0,
     ) -> None:
         """Build the active route and merged segment properties for one solver step."""
@@ -583,23 +617,16 @@ class TendonStateMixin:
             kernel=prepare_tendon_route,
             dim=model.tendon_count,
             inputs=[
-                body_q,
                 model.tendon_start,
-                model.tendon_link_body,
                 model.tendon_link_type,
                 model.tendon_link_flags,
-                model.tendon_link_radius,
-                model.tendon_link_orientation,
-                model.tendon_link_offset,
-                model.tendon_link_axis,
                 self.tendon_seg_rest_length_step,
                 model.tendon_seg_compliance,
                 model.tendon_seg_damping,
                 self.tendon_link_active,
                 self.tendon_link_active_step,
                 self.tendon_link_route_rest_length,
-                self.tendon_seg_attachment_l_local_step,
-                self.tendon_seg_attachment_r_local_step,
+                self._tendon_link_arc_step,
                 compliance_floor,
             ],
             outputs=[
@@ -619,6 +646,8 @@ class TendonStateMixin:
         body_q: wp.array[wp.transform],
         report_unsupported_wrap: bool,
         latch_unsupported_wrap: bool = False,
+        *,
+        conserve_rolling: bool = True,
     ) -> None:
         """Cache geometry-dependent segment pairs and capstan ratios for material rows."""
         wp.launch(
@@ -646,6 +675,9 @@ class TendonStateMixin:
                 int(report_unsupported_wrap),
                 self._tendon_material_state.enabled,
                 latch_unsupported_wrap and self._tendon_material_state.enabled,
+                self.tendon_link_active_step,
+                self._tendon_link_arc_step,
+                conserve_rolling,
             ],
             outputs=[
                 self.tendon_link_cone_seg_l,
@@ -653,6 +685,9 @@ class TendonStateMixin:
                 self.tendon_link_cap_ratio,
                 self._tendon_route_failure,
                 self._tendon_route_failure_angle,
+                self._tendon_link_arc,
+                self.tendon_seg_rolling_delta_l,
+                self.tendon_seg_rolling_delta_r,
             ],
             device=model.device,
         )
@@ -753,7 +788,7 @@ class TendonStateMixin:
             self.tendon_seg_attachment_l_local = wp.array(att_l_local, dtype=wp.vec3, device=model.device)
             self.tendon_seg_attachment_r_local = wp.array(att_r_local, dtype=wp.vec3, device=model.device)
 
-        self._prepare_tendon_route(model, body_q)
+        self._prepare_tendon_route(model)
 
         wp.launch(
             kernel=update_tendon_attachments,
@@ -835,6 +870,7 @@ class TendonStateMixin:
                 0,
                 self.tendon_max_sweeps,
                 self.tendon_settle_tol,
+                self.tendon_settle_atol,
                 self.tendon_sigmoid_ea_low,
                 self.tendon_sigmoid_ea_ratio,
                 self.tendon_sigmoid_transition_strain,
@@ -853,6 +889,7 @@ class TendonStateMixin:
             if auto_mask[i] and not route_seg_mask[i]:
                 rest_np[i] = np.linalg.norm(att_r_np[i] - att_l_np[i])
         self.tendon_seg_rest_length = wp.array(rest_np, dtype=float, device=model.device)
+        self._update_tendon_cone_rows(model, body_q, False, conserve_rolling=False)
         self._snapshot_tendon_step_state()
 
         link_type_np = model.tendon_link_type.numpy()

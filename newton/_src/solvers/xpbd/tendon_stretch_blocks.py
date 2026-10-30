@@ -5,6 +5,7 @@
 
 import warp as wp
 
+from ..tendon_damping import linear_damped_coefficients, linear_damped_tension, tendon_damping_tension
 from ..tendon_kernels import tendon_material_tangent, tendon_material_tension
 
 
@@ -75,24 +76,31 @@ def prepare_stretch_rows(
                 # Keep the material solve's small stretch, rather than losing it
                 # by subtracting rounded lengths again on a stiff cable.
                 force = wp.max(stretch[seg], 0.0) / wp.max(compliance[seg], 1.0e-30)
-            row.compliance = compliance[seg]
-            row.residual = stretch[seg]
-            row.motion_scale = dt + compliance[seg] * damping[seg]
+            raw_damping = damping[seg] * rate
+            damped = tendon_damping_tension(stretch[seg], raw_damping, damping[seg], dt)
+            body_damping = damping[seg]
+            if stretch[seg] <= 0.0 and raw_damping > 0.0:
+                body_damping = 0.0
+            effective_compliance, offset = linear_damped_coefficients(
+                stretch[seg], compliance[seg], raw_damping, damping[seg] / dt
+            )
+            row.compliance = effective_compliance
+            row.residual = stretch[seg] + offset
+            row.motion_scale = row.compliance * (dt / wp.max(compliance[seg], 1.0e-30) + body_damping)
+            row.tension = linear_damped_tension(stretch[seg], compliance[seg], raw_damping, damping[seg] / dt)
             if ea_low > 0.0:
                 tangent = tendon_material_tangent(
                     length, rest[seg], compliance[seg], ea_low, ea_ratio, transition_strain, transition_width
                 )
                 # Material transfer varies rest length, not geometric length.
                 # For T(strain), -dT/drest = dT/dlength * length/rest.
-                row.compliance = wp.max(rest[seg], 1.0e-8) / (wp.max(length, 1.0e-8) * tangent)
-                row.residual = row.compliance * force
-                row.motion_scale = row.compliance * (dt * tangent + damping[seg])
-            row.residual += row.compliance * damping[seg] * rate
-            row.tension = wp.max(force + damping[seg] * rate, 0.0)
-            if ea_low <= 0.0:
-                # Classify the capstan branch with the same signed elastic
-                # term as the residual, not a separately clamped spring force.
-                row.tension = wp.max(row.residual / wp.max(row.compliance, 1.0e-30), 0.0)
+                transfer_tangent = tangent * wp.max(length, 1.0e-8) / wp.max(rest[seg], 1.0e-8)
+                if raw_damping > damping[seg] * wp.max(stretch[seg], 0.0) / dt:
+                    transfer_tangent += damping[seg] / dt
+                row.compliance = 1.0 / transfer_tangent
+                row.residual = row.compliance * (force + damped)
+                row.motion_scale = row.compliance * (dt * tangent + body_damping)
+                row.tension = wp.max(force + damped, 0.0)
             row.weight = 1.0
             material_tension[seg] = force
     rows[seg] = row

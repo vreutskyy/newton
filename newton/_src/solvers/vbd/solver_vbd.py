@@ -191,6 +191,7 @@ from .tendon_kernels import (
     update_tendon_segment_diagnostics,
 )
 from .tendon_modes import TendonMaterialMode, prepare_tendon_material_modes
+from .tendon_sparse_kernels import accumulate_sparse_tendon_diagonal, assemble_sparse_tendon_cross_blocks
 from .vbd_coupling_kernels import (
     _harvest_vbd_body_particle_contact_forces_on_proxy_bodies_kernel,
     _harvest_vbd_proxy_particle_body_contact_forces_kernel,
@@ -761,6 +762,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         rigid_tendon_relaxation: float = 0.7,  # Compatibility parameter; ignored
         tendon_max_sweeps: int = 256,
         tendon_settle_tol: float = 1.0e-3,
+        tendon_settle_atol: float = 1.0e-6,
         rigid_enable_dahl_friction: bool | None = None,  # Deprecated: auto-detected from model attributes
         tendon_activation_tol: float = 2.0e-3,
         tendon_route_hysteresis: float = 1.0e-4,
@@ -1031,7 +1033,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 ``"block_sparse_levels"`` modes enable a block-sparse
                 articulation solve for joint coupling while keeping contacts on body-diagonal
                 Hessian blocks. The implementation uses a serial block solve on CPU and a
-                cooperative single-CTA solve on CUDA. Each articulation is one factorization
+                cooperative single-CTA solve on CUDA. Each articulation starts as one factorization
                 group covering every joint in its range, so loop closures declared through
                 :meth:`~newton.ModelBuilder.add_articulation` with ``allow_closed_loops=True``
                 are solved together with the tree joints. Bodies outside every declared
@@ -1042,6 +1044,15 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 rows; angular drives and limits retain continuous turn counts. Mimic joints keep
                 one reaction-force projection per iteration using the assembled body-diagonal
                 blocks, rather than being added to the sparse factorization.
+                Experimental tendon support assembles the condensed spring-damper forces and
+                cross-body stiffness, including friction and material transfer. Tendons connecting
+                several articulations merge their factorization groups; unarticulated bodies
+                retain local updates. Sliding guides use a positive friction-secant stiffness
+                approximation without changing the material forces. Material-solver convergence
+                still requires sufficient sweeps or the direct material solve, independently of
+                the body iteration count. Tendon ALM and tendon-coupled articulations containing
+                reduced elastic bodies are not supported by the sparse path. Independent elastic
+                articulations may coexist with tendon-bearing rigid articulations.
                 Reduced elastic bodies in an articulation are solved inside its factorization, with
                 their joints at the deformed attachments; ``rigid_articulation_elastic_solve`` selects
                 how. Joint mimics, and armature, passive damping, or friction on joints attached to
@@ -1203,7 +1214,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             rigid_tendon_relaxation: Compatibility parameter retained for existing callers. Native VBD tendon
                 force elements do not use XPBD relaxation.
             tendon_max_sweeps: Maximum capstan material-relaxation sweeps per VBD iteration.
-            tendon_settle_tol: Relative tension-change tolerance for stopping capstan material relaxation.
+            tendon_settle_tol: Relative capstan-complementarity tolerance
+                for adaptive tendon sweeps. Zero disables early-out. Ignored by direct solves.
+            tendon_settle_atol: Experimental absolute force tolerance [N] for adaptive tendon sweeps,
+                allowing slack cables to settle. Ignored by direct solves.
             rigid_enable_dahl_friction: Deprecated and ignored. Dahl friction is auto-detected
                 from ``model.vbd.dahl_eps_max`` / ``model.vbd.dahl_tau``.
             tendon_activation_tol: Relative radius gap that inactive dynamic rollers must cross before
@@ -1579,12 +1593,21 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             raise ValueError("Tendons require VBD to integrate their rigid bodies.")
         if rigid_joint_limit_alm:
             raise ValueError("The legacy revolute-limit ALM experiment is not ported; use current main joint ALM.")
-        if model.tendon_count and rigid_articulation_solve != "local":
+        if model.tendon_count and rigid_articulation_solve != "local" and (tendon_alm or tendon_alm_per_segment):
             raise ValueError(
-                "Tendons currently require rigid_articulation_solve=local; sparse tendon coupling is unvalidated."
+                "Tendon ALM currently requires rigid_articulation_solve='local'; "
+                "the sparse tendon solve supports the condensed spring-damper formulation."
             )
         self.tendon_max_sweeps = tendon_max_sweeps
+        if not isfinite(tendon_settle_tol) or tendon_settle_tol < 0.0:
+            raise ValueError("tendon_settle_tol must be finite and non-negative")
+        if not isfinite(tendon_settle_atol) or tendon_settle_atol < 0.0:
+            raise ValueError("tendon_settle_atol must be finite and non-negative")
         self.tendon_settle_tol = tendon_settle_tol
+        self.tendon_settle_atol = tendon_settle_atol
+        # Sparse updates eliminate sliding material coordinates using positive
+        # friction secants. Keep the existing local-body metric unchanged.
+        self._tendon_sliding_curvature = rigid_articulation_solve in ("block_sparse_joints", "block_sparse_levels")
         self.tendon_activation_tol = tendon_activation_tol
         self.tendon_route_hysteresis = tendon_route_hysteresis
         self.tendon_route_min_span_ratio = tendon_route_min_span_ratio
@@ -1655,9 +1678,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             )
         self._tendon_material_state.legacy_alm_damping = self._tendon_alm_rows
         self.tendon_material_modes = wp.zeros(model.tendon_segment_count, dtype=TendonMaterialMode, device=model.device)
+        if self._has_dynamic_tendon_links:
+            self._tendon_material_state.changed_routes = wp.zeros(model.tendon_count, dtype=int, device=self.device)
         if self.tendon_alm_per_segment:
             self._tendon_material_state.segment_alm = True
-            self._tendon_material_state.changed_routes = wp.zeros(model.tendon_count, dtype=int, device=self.device)
             self._tendon_material_state.alm = TendonALMMaterialState()
             alm = self._tendon_material_state.alm
             for name in ("reference", "extension", "offset", "force"):
@@ -4418,7 +4442,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if self.tendon_seg_lambda is not None and state_in.body_q is not None:
             self._snapshot_tendon_step_state()
             self._update_tendon_link_active(self.model, state_in.body_q)
-            self._prepare_tendon_route(self.model, state_in.body_q, 1.0e-8)
+            self._prepare_tendon_route(self.model, 1.0e-8)
             self.tendon_seg_material_tension.zero_()
             if self.iterations == 0 or self.integrate_with_external_rigid_solver:
                 self.tendon_seg_lambda.zero_()
@@ -6408,6 +6432,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 1,
                 self.tendon_max_sweeps,
                 self.tendon_settle_tol,
+                self.tendon_settle_atol,
                 self.tendon_sigmoid_ea_low,
                 self.tendon_sigmoid_ea_ratio,
                 self.tendon_sigmoid_transition_strain,
@@ -6442,6 +6467,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.tendon_sigmoid_ea_ratio,
                     self.tendon_sigmoid_transition_strain,
                     self.tendon_sigmoid_transition_width,
+                    self._tendon_link_material_transfer,
+                    int(self._tendon_sliding_curvature),
                 ],
                 outputs=[self.tendon_material_modes],
                 device=self.device,
@@ -6450,7 +6477,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
     def _finalize_tendon_routing(self, state_in: State, dt: float) -> None:
         """Accept material, then merge dynamic rollers crossed during this step."""
-        if not self.tendon_alm_per_segment or not self._has_dynamic_tendon_links:
+        if not self._has_dynamic_tendon_links:
             self._update_tendon_routing(state_in, dt, True)
             return
         model = self.model
@@ -6478,11 +6505,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 self.tendon_link_active,
                 self.tendon_seg_alm_lambda,
                 self.tendon_seg_alm_k,
+                self.tendon_alm_lambda,
+                self.tendon_alm_k,
                 self._tendon_material_state.changed_routes,
             ],
             device=self.device,
         )
-        self._prepare_tendon_route(model, state_in.body_q, 1.0e-8)
+        self._prepare_tendon_route(model, 1.0e-8)
         self._tendon_material_state.process_changed_routes = True
         self._update_tendon_routing(state_in, dt, True)
         self._tendon_material_state.process_changed_routes = False
@@ -6567,7 +6596,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         )
 
     def _snapshot_tendon_segment_length_reference(self, body_q: wp.array[wp.transform], dt: float) -> None:
-        """Preserve previous-pose segment lengths through rigid finalization."""
+        """Preserve ALM row length rates through rigid finalization."""
+        if not self._tendon_alm_rows:
+            return
         model = self.model
         # Native VBD does not accumulate XPBD delta lambdas, so this existing
         # per-segment scratch can hold the damping reference until finalization.
@@ -6594,7 +6625,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         )
 
     def _update_tendon_segment_diagnostics(self, state_out: State, dt: float) -> None:
-        """Update tendon geometry and damping from the accepted rigid pose."""
+        """Publish native material diagnostics or evaluate accepted ALM rows."""
         model = self.model
         wp.launch(
             kernel=update_tendon_segment_diagnostics,
@@ -6606,6 +6637,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 self.tendon_seg_attachment_l_local,
                 self.tendon_seg_attachment_r_local,
                 self.tendon_seg_rest_length,
+                self.tendon_seg_length,
+                self.tendon_seg_stretch,
                 self.tendon_seg_active_compliance,
                 self.tendon_seg_active_damping,
                 self.tendon_seg_active,
@@ -6641,7 +6674,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         iteration: int = 0,
     ):
         if self.rigid_articulation_solve in ("block_sparse_joints", "block_sparse_levels"):
-            self._solve_rigid_body_iteration_block_sparse_joints(state_in, state_out, control, contacts, dt)
+            self._solve_rigid_body_iteration_block_sparse_joints(
+                state_in, state_out, control, contacts, dt, report_unsupported_wrap, iteration
+            )
         else:
             self._solve_rigid_body_iteration_local(
                 state_in,
@@ -7382,16 +7417,34 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         control: Control,
         contacts: Contacts | None,
         dt: float,
+        report_unsupported_wrap: bool = False,
+        iteration: int = 0,
     ):
         """Solve one rigid iteration with coupled sparse articulation updates."""
         model = self.model
         if self.integrate_with_external_rigid_solver or model.body_count == 0:
-            self._solve_rigid_body_iteration_local(state_in, state_out, control, contacts, dt)
+            self._solve_rigid_body_iteration_local(
+                state_in,
+                state_out,
+                control,
+                contacts,
+                dt,
+                report_unsupported_wrap=report_unsupported_wrap,
+                iteration=iteration,
+            )
             return
 
         layout = self.rigid_articulation_sparse_layout
         if layout is None or layout.articulation_count == 0:
-            self._solve_rigid_body_iteration_local(state_in, state_out, control, contacts, dt)
+            self._solve_rigid_body_iteration_local(
+                state_in,
+                state_out,
+                control,
+                contacts,
+                dt,
+                report_unsupported_wrap=report_unsupported_wrap,
+                iteration=iteration,
+            )
             return
 
         assert self.rigid_articulation_sparse_values is not None
@@ -7413,6 +7466,32 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if model.elastic_body_count > 0:
             self._accumulate_elastic_frame_coupling(state_in, state_out, dt)
         self._accumulate_rigid_contact_forces(state_in, contacts, dt, layout.articulation_bodies, state_out)
+        if model.tendon_count:
+            # Project geometry and material at the common pre-update pose. All
+            # bodies in a sparse group then use this same frozen material state.
+            self._update_tendon_routing(state_in, dt, report_unsupported_wrap)
+            wp.launch(
+                accumulate_sparse_tendon_diagonal,
+                dim=layout.articulation_body_count,
+                inputs=[
+                    layout.articulation_bodies,
+                    state_in.body_q,
+                    model.body_com,
+                    self.tendon_adjacency,
+                    model.tendon_link_body,
+                    self.tendon_seg_active,
+                    self.tendon_seg_active_link_l,
+                    self.tendon_seg_active_link_r,
+                ],
+                outputs=[
+                    self.body_forces,
+                    self.body_torques,
+                    self.body_hessian_ll,
+                    self.body_hessian_al,
+                    self.body_hessian_aa,
+                ],
+                device=self.device,
+            )
         if self.rigid_articulation_diagonal_regularization > 0.0:
             # The coupled backend regularizes the frame rows of mixed articulations itself.
             wp.launch(
@@ -7502,7 +7581,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         # prefix is every articulation; under "coupled" the mixed articulations follow below (they are
         # factored by the variable-size block solve, also under "block_sparse_levels").
         if layout.rigid_articulation_count > 0:
-            if use_block32 or has_sparse_elastic:
+            if use_block32 or has_sparse_elastic or model.tendon_count:
                 wp.launch(
                     kernel=assemble_articulation_body_diagonal_scalar,
                     dim=layout.rigid_body_row_count,
@@ -7544,6 +7623,27 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 if has_sparse_elastic:
                     self._assemble_sparse_elastic_bodies(state_in, state_out, control, contacts, dt)
 
+                if layout.tendon_pair_count:
+                    wp.launch(
+                        assemble_sparse_tendon_cross_blocks,
+                        dim=layout.tendon_pair_count,
+                        inputs=[
+                            layout.tendon_pair_body_row,
+                            layout.tendon_pair_body_col,
+                            layout.tendon_pair_slot,
+                            state_in.body_q,
+                            model.body_com,
+                            self.body_inv_mass_effective,
+                            self.tendon_adjacency,
+                            model.tendon_link_body,
+                            self.tendon_seg_active,
+                            self.tendon_seg_active_link_l,
+                            self.tendon_seg_active_link_r,
+                        ],
+                        outputs=[self._rigid_articulation_sparse_values_scalar],
+                        device=self.device,
+                    )
+
             if not use_block32:
                 wp.launch(
                     kernel=solve_articulation_sparse_serial_scalar_bdf2
@@ -7566,7 +7666,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         self.body_hessian_aa,
                         self.rigid_articulation_relaxation,
                         self._has_joint_mimics,
-                        not has_sparse_elastic,
+                        not has_sparse_elastic and not model.tendon_count,
                         self._rigid_articulation_sparse_values_scalar,
                         self._rigid_articulation_sparse_rhs_scalar,
                         self.rigid_articulation_sparse_values,
@@ -7703,6 +7803,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 contacts,
                 dt,
                 body_color_groups=layout.local_body_color_groups,
+                report_unsupported_wrap=report_unsupported_wrap,
+                iteration=iteration,
             )
             return
 

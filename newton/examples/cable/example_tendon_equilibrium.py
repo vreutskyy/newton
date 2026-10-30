@@ -4,8 +4,8 @@
 ###########################################################################
 # Example Tendon Equilibrium
 #
-# Two equal-mass weights connected by a tendon over a dynamic pulley.
-# With equal masses, neither side should move — the system stays in
+# Two equal-mass, vertically guided weights connected over a dynamic pulley.
+# After the small elastic settling, neither side should move — the system stays in
 # static equilibrium, verifying that the XPBD tendon constraint
 # correctly balances symmetric loads.
 #
@@ -39,14 +39,15 @@ class Example:
         pulley_mass = 0.5
         weight_mass = 2.0
 
-        pulley = builder.add_body(
+        pulley = builder.add_link(
             xform=wp.transform(p=wp.vec3(0.0, 0.0, 3.5), q=wp.quat_identity()),
-            mass=pulley_mass,
+            mass=0.0,
         )
         q_cyl = wp.quat(np.sin(np.pi / 4.0), 0.0, 0.0, np.cos(np.pi / 4.0))
-        builder.add_shape_cylinder(pulley, xform=wp.transform(q=q_cyl), radius=self.pulley_radius, half_height=0.04)
-
-        Dof = newton.ModelBuilder.JointDofConfig
+        pulley_cfg = newton.ModelBuilder.ShapeConfig(density=pulley_mass / (np.pi * self.pulley_radius**2 * 0.08))
+        builder.add_shape_cylinder(
+            pulley, xform=wp.transform(q=q_cyl), radius=self.pulley_radius, half_height=0.04, cfg=pulley_cfg
+        )
 
         j_pulley = builder.add_joint_revolute(
             parent=-1,
@@ -56,33 +57,30 @@ class Example:
             child_xform=wp.transform(),
         )
 
-        planar_lin = [Dof(axis=Axis.X), Dof(axis=Axis.Z)]
-        planar_ang = [Dof(axis=Axis.Y)]
+        weight_cfg = newton.ModelBuilder.ShapeConfig(density=weight_mass / (8.0 * 0.08**3))
 
         self.left_idx = left = builder.add_link(
             xform=wp.transform(p=wp.vec3(-0.5, 0.0, 2.0), q=wp.quat_identity()),
-            mass=weight_mass,
+            mass=0.0,
         )
-        builder.add_shape_box(left, hx=0.08, hy=0.08, hz=0.08)
-        j1 = builder.add_joint_d6(
+        builder.add_shape_box(left, hx=0.08, hy=0.08, hz=0.08, cfg=weight_cfg)
+        j1 = builder.add_joint_prismatic(
             parent=-1,
             child=left,
-            linear_axes=planar_lin,
-            angular_axes=planar_ang,
+            axis=Axis.Z,
             parent_xform=wp.transform(p=wp.vec3(-0.5, 0.0, 2.0), q=wp.quat_identity()),
             child_xform=wp.transform(),
         )
 
         self.right_idx = right = builder.add_link(
             xform=wp.transform(p=wp.vec3(0.5, 0.0, 2.0), q=wp.quat_identity()),
-            mass=weight_mass,
+            mass=0.0,
         )
-        builder.add_shape_box(right, hx=0.08, hy=0.08, hz=0.08)
-        j2 = builder.add_joint_d6(
+        builder.add_shape_box(right, hx=0.08, hy=0.08, hz=0.08, cfg=weight_cfg)
+        j2 = builder.add_joint_prismatic(
             parent=-1,
             child=right,
-            linear_axes=planar_lin,
-            angular_axes=planar_ang,
+            axis=Axis.Z,
             parent_xform=wp.transform(p=wp.vec3(0.5, 0.0, 2.0), q=wp.quat_identity()),
             child_xform=wp.transform(),
         )
@@ -126,7 +124,8 @@ class Example:
 
         self.solver = newton.solvers.SolverXPBD(
             self.model,
-            iterations=8,
+            # Resolve coupled sticking rows so material tension balances gravity.
+            iterations=32,
             joint_linear_relaxation=0.8,
         )
 
@@ -160,6 +159,12 @@ class Example:
 
     def test_post_step(self):
         assert_tendon_total_length(self)
+        arrival = self.solver.tendon_seg_attachment_r_local.numpy()[0]
+        departure = self.solver.tendon_seg_attachment_l_local.numpy()[1]
+        angle = np.arctan2(np.cross(arrival, departure)[1], np.dot(arrival, departure))
+        assert np.isfinite(angle) and angle >= -1.0e-5, (
+            f"Equilibrium pulley left the supported half-wrap range: {np.degrees(angle):.4f} degrees"
+        )
         if self.sim_time < self.frame_dt * 1.5:
             att_r = self.solver.tendon_seg_attachment_r.numpy()
             att_l = self.solver.tendon_seg_attachment_l.numpy()
@@ -186,6 +191,41 @@ class Example:
         assert drift_left < 0.05, f"Left weight drifted {drift_left:.4f} m"
         assert drift_right < 0.05, f"Right weight drifted {drift_right:.4f} m"
         assert drift_diff < 0.02, f"Asymmetric drift: {drift_diff:.4f} m"
+
+        if self.sim_time >= 1.0:
+            # A stationary pose alone can hide unconverged material tension.
+            spans = self.solver.tendon_seg_attachment_r.numpy() - self.solver.tendon_seg_attachment_l.numpy()
+            vertical_fraction = np.abs(spans[:, 2]) / np.linalg.norm(spans, axis=1)
+            masses = self.model.body_mass.numpy()[[self.left_idx, self.right_idx]]
+            expected = masses * 9.81 / vertical_fraction
+            reported = np.maximum(
+                self.solver.tendon_seg_material_tension.numpy() + self.solver.tendon_seg_damping_tension.numpy(), 0.0
+            )
+            np.testing.assert_allclose(
+                reported, expected, rtol=0.05, atol=0.0, err_msg="Equilibrium tendon tension should balance gravity"
+            )
+
+            # Independently recover straight tangent lengths from the accepted
+            # body pose, not the solver's pre-correction attachment cache.
+            offsets = self.model.tendon_link_offset.numpy()[[0, 2]]
+            anchors = np.array(
+                [
+                    wp.transform_point(wp.transform(*body_q[body]), wp.vec3(offset))
+                    for body, offset in zip((self.left_idx, self.right_idx), offsets, strict=True)
+                ],
+                dtype=np.float64,
+            )
+            distance = np.linalg.norm(anchors - body_q[0, :3], axis=1)
+            lengths = np.sqrt(distance**2 - self.pulley_radius**2)
+            extension = lengths - self.solver.tendon_seg_rest_length.numpy().astype(np.float64)
+            material = np.maximum(extension, 0.0) / self.solver.tendon_seg_active_compliance.numpy()
+            np.testing.assert_allclose(
+                material,
+                expected,
+                rtol=0.05,
+                atol=0.0,
+                err_msg="Accepted cable extension should agree with the equilibrium force",
+            )
 
     def render(self):
         if self.viewer is not None:

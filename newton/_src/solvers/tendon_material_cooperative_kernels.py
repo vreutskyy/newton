@@ -11,6 +11,7 @@ import warp as wp
 
 from ..sim.tendon import TendonLinkType
 from .tendon_alm_material import project_alm_material_cooperative
+from .tendon_damping import tendon_damping_tension
 from .tendon_kernels import (
     oriented_wrap_arc_length,
     physical_tendon_length_rate,
@@ -22,6 +23,8 @@ from .tendon_material_cooperative import solve_tendon_material_nonlinear_compone
 from .tendon_material_cooperative import warp_broadcast
 from .tendon_material_state import (
     TendonMaterialState,
+    needs_engagement_projection,
+    publish_tendon_material,
     record_tendon_material_failure_span,
     reject_tendon_material,
 )
@@ -79,11 +82,13 @@ def prepare_material(
     adaptive_cone_sweeps: int,
     tendon_max_sweeps: int,
     tendon_settle_tol: float,
+    tendon_settle_atol: float,
     sigmoid_ea_low: float,
     sigmoid_ea_ratio: float,
     sigmoid_transition_strain: float,
     sigmoid_transition_width: float,
     direct: TendonMaterialState,
+    link_material_transfer: wp.array[float],
 ) -> int:
     if direct.process_changed_routes and direct.changed_routes[tendon_id] == 0:
         return 0
@@ -94,6 +99,8 @@ def prepare_material(
     num_links = link_end - link_start
     num_segs = num_links - 1
     tendon_cone_sweep_count[tendon_id] = 0
+    for link in range(link_start, link_end):
+        link_material_transfer[link] = 0.0
     if num_segs < 1:
         return 0
     seg_offset = link_start - tendon_id
@@ -136,15 +143,50 @@ def prepare_material(
         rest_r = wp.max(min_rest, free_rest - rest_l)
         seg_rest_length[seg_left] = rest_l
         seg_rest_length[seg_right] = rest_r
-    if apply_rolling_transfer != 0 or apply_pinhole_slip != 0:
-        for s_snap in range(num_segs):
-            seg = seg_offset + s_snap
-            if seg_active[seg] != 0:
-                len_snap = seg_length[seg]
-                seg_stretch[seg] = len_snap - seg_rest_length[seg]
-                if seg_active_damping[seg] != 0.0:
+    # Holding material freezes its allocation, not its force. Refresh the
+    # current stretch and damping even when projection is suppressed.
+    for s_snap in range(num_segs):
+        seg = seg_offset + s_snap
+        if seg_active[seg] != 0:
+            len_snap = seg_length[seg]
+            seg_stretch[seg] = len_snap - seg_rest_length[seg]
+            if seg_active_damping[seg] != 0.0:
+                if damping_from_pose_delta != 0:
+                    seg_damping_tension[seg] = seg_active_damping[seg] * tendon_segment_length_rate_from_poses(
+                        dt,
+                        body_q,
+                        body_q_prev,
+                        body_com,
+                        tendon_link_body,
+                        tendon_link_type,
+                        tendon_link_offset,
+                        tendon_link_axis,
+                        seg_active_link_l[seg],
+                        seg_active_link_r[seg],
+                        seg_attachment_l_local[seg],
+                        seg_attachment_r_local[seg],
+                        seg_attachment_l[seg],
+                        seg_attachment_r[seg],
+                    )
+                else:
+                    seg_damping_tension[seg] = seg_active_damping[seg] * tendon_segment_length_rate(
+                        body_q,
+                        body_qd,
+                        body_com,
+                        tendon_link_body,
+                        tendon_link_type,
+                        tendon_link_offset,
+                        tendon_link_axis,
+                        seg_active_link_l[seg],
+                        seg_active_link_r[seg],
+                        seg_attachment_l[seg],
+                        seg_attachment_r[seg],
+                    )
+                # Condensed rows use the full contact-point Jacobian.
+                # Per-segment ALM retains its authored engagement law.
+                if not direct.legacy_alm_damping:
                     if damping_from_pose_delta != 0:
-                        seg_damping_tension[seg] = seg_active_damping[seg] * tendon_segment_length_rate_from_poses(
+                        seg_damping_tension[seg] = seg_active_damping[seg] * physical_tendon_length_rate_from_poses(
                             dt,
                             body_q,
                             body_q_prev,
@@ -161,7 +203,7 @@ def prepare_material(
                             seg_attachment_r[seg],
                         )
                     else:
-                        seg_damping_tension[seg] = seg_active_damping[seg] * tendon_segment_length_rate(
+                        seg_damping_tension[seg] = seg_active_damping[seg] * physical_tendon_length_rate(
                             body_q,
                             body_qd,
                             body_com,
@@ -174,41 +216,14 @@ def prepare_material(
                             seg_attachment_l[seg],
                             seg_attachment_r[seg],
                         )
-                    # Condensed rows use the full contact-point Jacobian.
-                    # Per-segment ALM retains its authored engagement law.
-                    if not direct.legacy_alm_damping:
-                        if damping_from_pose_delta != 0:
-                            seg_damping_tension[seg] = seg_active_damping[seg] * physical_tendon_length_rate_from_poses(
-                                dt,
-                                body_q,
-                                body_q_prev,
-                                body_com,
-                                tendon_link_body,
-                                tendon_link_type,
-                                tendon_link_offset,
-                                tendon_link_axis,
-                                seg_active_link_l[seg],
-                                seg_active_link_r[seg],
-                                seg_attachment_l_local[seg],
-                                seg_attachment_r_local[seg],
-                                seg_attachment_l[seg],
-                                seg_attachment_r[seg],
-                            )
-                        else:
-                            seg_damping_tension[seg] = seg_active_damping[seg] * physical_tendon_length_rate(
-                                body_q,
-                                body_qd,
-                                body_com,
-                                tendon_link_body,
-                                tendon_link_type,
-                                tendon_link_offset,
-                                tendon_link_axis,
-                                seg_active_link_l[seg],
-                                seg_active_link_r[seg],
-                                seg_attachment_l[seg],
-                                seg_attachment_r[seg],
-                            )
+    if apply_rolling_transfer != 0 or apply_pinhole_slip != 0:
         return 1
+    if not direct.legacy_alm_damping:
+        for s in range(num_segs):
+            seg = seg_offset + s
+            seg_damping_tension[seg] = tendon_damping_tension(
+                seg_stretch[seg], seg_damping_tension[seg], seg_active_damping[seg], dt
+            )
     return 0
 
 
@@ -299,7 +314,7 @@ def pack_material(
         if state.ids[index] != seg:
             state.valid[row] = 0
         state.ids[index] = seg
-        if state.segment_alm:
+        if state.segment_alm or state.engagement:
             state.alm.reference[index] = seg_stretch[seg]
         state.initial[index] = seg_stretch[seg] + seg_compliance[seg] * seg_damping[seg]
         state.compliance[index] = seg_compliance[seg]
@@ -320,54 +335,6 @@ def pack_material(
         record_component(state, row, count, tendon)
         if state.failure[tendon] != 0:
             return False
-    return True
-
-
-@wp.func
-def publish_material(
-    state: TendonMaterialState,
-    tendon: int,
-    link_start: int,
-    num_links: int,
-    seg_offset: int,
-    num_segs: int,
-    tendon_link_type: wp.array[int],
-    tendon_link_active: wp.array[bool],
-    cone_seg_l: wp.array[int],
-    cone_seg_r: wp.array[int],
-    cap_ratio: wp.array[float],
-    seg_active: wp.array[int],
-    seg_compliance: wp.array[float],
-    seg_damping: wp.array[float],
-    seg_length: wp.array[float],
-    seg_stretch: wp.array[float],
-    rolling_delta_l: wp.array[float],
-    rolling_delta_r: wp.array[float],
-    apply_rolling_transfer: int,
-    apply_pinhole_slip: int,
-    min_rest: float,
-) -> bool:
-    row = int(-1)
-    count = int(0)
-    previous = int(-1)
-    for s in range(num_segs):
-        seg = seg_offset + s
-        if seg_active[seg] == 0:
-            continue
-        if previous < 0:
-            row = seg
-            count = 0
-        elif state.next_link[previous] < 0:
-            row = seg
-            count = 0
-        if state.nonlinear_enabled or state.segment_alm:
-            seg_stretch[seg] = state.output[row + count]
-            if state.segment_alm and state.alm.force[row + count] == 0.0:
-                state.alm.multiplier[seg] = 0.0
-        else:
-            seg_stretch[seg] = state.output[row + count] - seg_compliance[seg] * seg_damping[seg]
-        count += 1
-        previous = seg
     return True
 
 
@@ -396,6 +363,7 @@ def transfer_cooperative(
     min_rest: float,
     lane: int,
     latch: int,
+    link_material_transfer: wp.array[float],
 ) -> bool:
     ready = int(0)
     if lane == 0:
@@ -480,11 +448,37 @@ def transfer_cooperative(
                 1e-05,
                 lane,
             )
+            engagement = int(0)
+            if lane == 0 and state.engagement:
+                engagement = int(needs_engagement_projection(state, row, count))
+                state.engagement_rows[row] = engagement
+            engagement = warp_broadcast(engagement)
+            if engagement != 0:
+                project_alm_material_cooperative(
+                    state.alm,
+                    state.ids,
+                    state.initial,
+                    state.compliance,
+                    state.cap,
+                    state.upper,
+                    state.output,
+                    state.status,
+                    state.faces,
+                    state.valid,
+                    state.pieces,
+                    row,
+                    count,
+                    state.ea_low,
+                    state.ea_ratio,
+                    state.transition_strain,
+                    state.transition_width,
+                    lane,
+                )
         failed = int(0)
         if lane == 0:
             if state.status[row] < 0:
                 code = state.status[row]
-                if not state.segment_alm:
+                if not state.segment_alm and (not state.engagement or state.engagement_rows[row] == 0):
                     code -= 200
                 reject_tendon_material(state, code, tendon, row, latch)
                 record_tendon_material_failure_span(state, tendon, row, count, seg_length, seg_compliance, latch)
@@ -494,28 +488,15 @@ def transfer_cooperative(
             return False
         previous = seg
     if lane == 0:
-        publish_material(
+        publish_tendon_material(
             state,
-            tendon,
-            link_start,
-            num_links,
             seg_offset,
             num_segs,
-            tendon_link_type,
-            tendon_link_active,
-            cone_seg_l,
-            cone_seg_r,
-            cap_ratio,
             seg_active,
             seg_compliance,
             seg_damping,
-            seg_length,
             seg_stretch,
-            rolling_delta_l,
-            rolling_delta_r,
-            apply_rolling_transfer,
-            apply_pinhole_slip,
-            min_rest,
+            link_material_transfer,
         )
     ready = warp_broadcast(1)
     return True
@@ -565,6 +546,7 @@ def solve_tendon_material_cooperative(
     adaptive_cone_sweeps: int,
     tendon_max_sweeps: int,
     tendon_settle_tol: float,
+    tendon_settle_atol: float,
     sigmoid_ea_low: float,
     sigmoid_ea_ratio: float,
     sigmoid_transition_strain: float,
@@ -578,6 +560,8 @@ def solve_tendon_material_cooperative(
     # re-tried, and only the accepted pose latches.
     tendon_id = wp.tid() // 32
     lane = wp.tid() % 32
+    if direct.engagement:
+        direct.alm.dt = dt
     ready = int(0)
     if lane == 0:
         ready = prepare_material(
@@ -624,11 +608,13 @@ def solve_tendon_material_cooperative(
             adaptive_cone_sweeps,
             tendon_max_sweeps,
             tendon_settle_tol,
+            tendon_settle_atol,
             sigmoid_ea_low,
             sigmoid_ea_ratio,
             sigmoid_transition_strain,
             sigmoid_transition_width,
             direct,
+            link_material_transfer,
         )
     ready = warp_broadcast(ready)
     if ready == 0:
@@ -662,6 +648,7 @@ def solve_tendon_material_cooperative(
         min_rest,
         lane,
         latch_failure,
+        link_material_transfer,
     ):
         return
     if lane == 0:
@@ -670,3 +657,7 @@ def solve_tendon_material_cooperative(
             if seg_active[seg] != 0:
                 len_wb = seg_length[seg]
                 seg_rest_length[seg] = wp.max(len_wb - seg_stretch[seg], min_rest)
+                if not direct.legacy_alm_damping:
+                    seg_damping_tension[seg] = tendon_damping_tension(
+                        seg_stretch[seg], seg_damping_tension[seg], seg_active_damping[seg], dt
+                    )

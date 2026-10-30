@@ -93,6 +93,11 @@ class RigidArticulationSparseLayout:
     elastic_group_count: int
     elastic_pair_count: int
     cross_block_count: int
+    tendon_pair_body_row: wp.array[wp.int32]
+    tendon_pair_body_col: wp.array[wp.int32]
+    tendon_pair_slot: wp.array[wp.int32]
+    """Lower-triangle blocks between potential tendon bodies, including bypassed guides."""
+    tendon_pair_count: int
     elastic_solve: str
     """How reduced elastic bodies inside articulations are solved: ``"schur"`` or ``"coupled"``."""
     rigid_articulation_count: int
@@ -333,12 +338,17 @@ def build_rigid_articulation_sparse_layout(
     from the per-step or per-iteration path. Repeated articulation topologies,
     such as replicated RL environments, share cached ordering and fill analysis.
 
-    Each articulation is one direct-factorization group: every joint in
+    Each articulation starts as one direct-factorization group: every joint in
     ``[articulation_start, articulation_end)`` is assembled into that group's
     block system, including loop-closing joints added through
     :meth:`~newton.ModelBuilder.add_articulation` with ``allow_closed_loops=True``.
     Bodies outside every articulation remain in the regular local VBD solve.
     Joints outside articulation ranges must not touch articulation bodies.
+
+    Tendons join the groups they connect. Within a group, every pair of bodies
+    on a tendon receives a block: sliding material can couple non-neighboring
+    guides, and dynamic routing can bypass intermediate guides. The pattern
+    therefore remains valid without a host rebuild when the route changes.
 
     Reduced elastic owner joints (:attr:`~newton.JointType.ELASTIC`) carry no
     constraint, add no graph edge, and may lie inside or outside an articulation
@@ -512,6 +522,70 @@ def build_rigid_articulation_sparse_layout(
                 f"rigid_articulation_solve='local'."
             )
 
+    tendon_bodies: list[list[int]] = []
+    if getattr(model, "tendon_count", 0):
+        starts = model.tendon_start.numpy()
+        link_body = model.tendon_link_body.numpy()
+        for start, end in itertools.pairwise(starts):
+            tendon_bodies.append(sorted({int(body) for body in link_body[start:end] if body >= 0}))
+
+        # Merge factorization groups connected by a tendon, retaining declared
+        # joint ranges only for ownership validation above. Unarticulated bodies
+        # remain in the local solve, with the sparse bodies held fixed there.
+        parents = list(range(len(articulation_groups)))
+
+        def root(group):
+            while parents[group] != group:
+                parents[group] = parents[parents[group]]
+                group = parents[group]
+            return group
+
+        for bodies in tendon_bodies:
+            groups = sorted({root(int(body_group[body])) for body in bodies if body_group[body] >= 0})
+            for group in groups[1:]:
+                parents[group] = groups[0]
+        merged: dict[int, tuple[list[int], list[int]]] = {}
+        for group, (bodies, joints) in enumerate(articulation_groups):
+            merged_bodies, merged_joints = merged.setdefault(root(group), ([], []))
+            merged_bodies.extend(bodies)
+            merged_joints.extend(joints)
+        articulation_groups = list(merged.values())
+
+        # Only rigid-frame tendon coupling has been validated. Do not feed its
+        # 6 x 6 blocks into a mixed frame/modal factorization or silently omit
+        # modal coupling. Independent elastic articulations remain supported.
+        tendon_body_set = {body for bodies in tendon_bodies for body in bodies}
+        for bodies, _joints in articulation_groups:
+            if tendon_body_set.intersection(bodies) and any(body_elastic_index[body] >= 0 for body in bodies):
+                raise ValueError(
+                    "Tendon-coupled sparse articulations containing reduced elastic bodies are not supported. "
+                    "Use rigid_articulation_solve='local' for this model."
+                )
+
+    # Merging only rigid groups preserves the rigid/mixed order, but shortens
+    # the rigid prefix. Recompute its count and the body-to-group map.
+    rigid_group_count = len(articulation_groups)
+    if coupled:
+        rigid_group_count = sum(
+            all(body_elastic_index[body] < 0 for body in bodies) for bodies, _joints in articulation_groups
+        )
+
+    body_group.fill(-1)
+    for group, (bodies, _joints) in enumerate(articulation_groups):
+        for body in bodies:
+            body_group[body] = group
+
+    # Index routes once so replicated worlds do not scan each other's tendons.
+    group_tendon_bodies: list[list[list[int]]] = [[] for _ in articulation_groups]
+    for bodies in tendon_bodies:
+        route_groups: dict[int, list[int]] = {}
+        for body in bodies:
+            group = int(body_group[body])
+            if group >= 0:
+                route_groups.setdefault(group, []).append(body)
+        for group, route_bodies in route_groups.items():
+            group_tendon_bodies[group].append(route_bodies)
+
     local_body_color_groups: list[wp.array[wp.int32]] = []
     local_body_count = 0
     for color_group in model.body_color_groups:
@@ -534,6 +608,9 @@ def build_rigid_articulation_sparse_layout(
     cross_joints: list[int] = []
     mixed_elastic_bodies_host: list[int] = []
     mixed_elastic_body_rows_host: list[int] = []
+    tendon_pair_body_row_host: list[int] = []
+    tendon_pair_body_col_host: list[int] = []
+    tendon_pair_slot_host: list[int] = []
 
     symbolic_cache: dict[
         tuple[bool, str, bool, int, tuple[tuple[int, int], ...], tuple[int, ...]],
@@ -543,6 +620,12 @@ def build_rigid_articulation_sparse_layout(
         mixed = coupled and group_index >= rigid_group_count
         local_index = {body: i for i, body in enumerate(bodies)}
         edges: set[tuple[int, int]] = set()
+        tendon_pairs: set[tuple[int, int]] = set()
+        for route_local in group_tendon_bodies[group_index]:
+            for i, a in enumerate(route_local):
+                for b in route_local[:i]:
+                    tendon_pairs.add((a, b))
+                    edges.add((local_index[a], local_index[b]))
         elastic_neighbors: dict[int, list[tuple[int, int]]] = {
             body: [] for body in bodies if body_elastic_index[body] >= 0
         }
@@ -664,6 +747,16 @@ def build_rigid_articulation_sparse_layout(
                         elastic_pair_left_host.append(group_begin + g)
                         elastic_pair_right_host.append(group_begin + h)
                         elastic_pair_slot_host.append(block_lookup[(local_g, local_h)])
+
+        for a, b in sorted(tendon_pairs):
+            row, col = local_index_ordered[a], local_index_ordered[b]
+            body_row, body_col = a, b
+            if row < col:
+                body_row, body_col = b, a
+                row, col = col, row
+            tendon_pair_body_row_host.append(body_row)
+            tendon_pair_body_col_host.append(body_col)
+            tendon_pair_slot_host.append(block_lookup[(row, col)])
 
         for local_col in range(len(ordered_bodies)):
             block_col_offsets_host.append(len(block_col_rows_host))
@@ -944,4 +1037,8 @@ def build_rigid_articulation_sparse_layout(
         )
         if use_levels
         else None,
+        tendon_pair_body_row=wp.array(tendon_pair_body_row_host, dtype=wp.int32, device=device),
+        tendon_pair_body_col=wp.array(tendon_pair_body_col_host, dtype=wp.int32, device=device),
+        tendon_pair_slot=wp.array(tendon_pair_slot_host, dtype=wp.int32, device=device),
+        tendon_pair_count=len(tendon_pair_slot_host),
     )

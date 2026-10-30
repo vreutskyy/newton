@@ -5,6 +5,7 @@ import warp as wp
 
 from ...sim.tendon import TendonLinkFlags, TendonLinkType
 from ..tendon_alm_material import alm_damping_rate
+from ..tendon_damping import tendon_damping_tension
 from ..tendon_kernels import (
     oriented_wrap_arc_length,
     tendon_material_tangent,
@@ -36,6 +37,8 @@ def deactivate_negative_tendon_wraps(
     link_active: wp.array[bool],
     seg_alm_lambda: wp.array[float],
     seg_alm_k: wp.array[float],
+    tendon_alm_lambda: wp.array[float],
+    tendon_alm_k: wp.array[float],
     changed_routes: wp.array[int],
 ):
     """Release dynamic rollers crossed during the accepted body update.
@@ -71,12 +74,14 @@ def deactivate_negative_tendon_wraps(
         if arc < 0.0:
             link_active[link] = False
             changed = True
-    if changed:
+    if changed and seg_alm_lambda.shape[0] > 0:
         # The old dual rows no longer describe this route. Use the physical
         # material law for the accepted merge; next step builds its new metrics.
         for seg in range(start - tendon, end - tendon - 1):
             seg_alm_lambda[seg] = 0.0
             seg_alm_k[seg] = 0.0
+        tendon_alm_lambda[tendon] = 0.0
+        tendon_alm_k[tendon] = 0.0
     changed_routes[tendon] = int(changed)
 
 
@@ -124,7 +129,7 @@ def snapshot_tendon_segment_length_reference(
     seg_active_link_r: wp.array[int],
     seg_length_prev: wp.array[float],
 ):
-    """Snapshot previous-pose segment lengths for final VBD diagnostics."""
+    """Snapshot previous-pose segment lengths for final ALM row diagnostics."""
     seg = wp.tid()
     seg_length_prev[seg] = 0.0
     if seg_active[seg] == 0:
@@ -163,6 +168,8 @@ def update_tendon_segment_diagnostics(
     seg_attachment_l_local: wp.array[wp.vec3],
     seg_attachment_r_local: wp.array[wp.vec3],
     seg_rest_length: wp.array[float],
+    seg_length: wp.array[float],
+    seg_stretch: wp.array[float],
     seg_active_compliance: wp.array[float],
     seg_active_damping: wp.array[float],
     seg_active: wp.array[int],
@@ -182,16 +189,35 @@ def update_tendon_segment_diagnostics(
     seg_damping_tension: wp.array[float],
     seg_lambda: wp.array[float],
 ):
-    """Update tendon geometry and damping from the accepted VBD pose."""
+    """Publish the accepted material state or the ALM row's final tension."""
     seg = wp.tid()
-    seg_attachment_l[seg] = wp.vec3(0.0)
-    seg_attachment_r[seg] = wp.vec3(0.0)
     seg_material_tension[seg] = 0.0
-    seg_damping_tension[seg] = 0.0
     # Native VBD does not solve XPBD constraint multipliers; with the compliant-ALM
     # stretch row enabled the reported multiplier is the row's tension multiplier [N].
     seg_lambda[seg] = 0.0
     if seg_active[seg] == 0:
+        seg_attachment_l[seg] = wp.vec3(0.0)
+        seg_attachment_r[seg] = wp.vec3(0.0)
+        seg_damping_tension[seg] = 0.0
+        return
+
+    compliance = wp.max(seg_active_compliance[seg], _MIN_TENDON_COMPLIANCE)
+    if alm_enabled == 0:
+        # The accepted material solve already updated geometry and damping.
+        # Reconstructing length - rest here loses sub-ULP elastic extensions;
+        # a world/local attachment round trip adds further force-sized error.
+        material = wp.max(seg_stretch[seg], 0.0) / compliance
+        if sigmoid_ea_low > 0.0:
+            material = tendon_material_tension(
+                seg_length[seg],
+                seg_rest_length[seg],
+                compliance,
+                sigmoid_ea_low,
+                sigmoid_ea_ratio,
+                sigmoid_transition_strain,
+                sigmoid_transition_width,
+            )
+        seg_material_tension[seg] = material
         return
 
     link_l = seg_active_link_l[seg]
@@ -205,7 +231,6 @@ def update_tendon_segment_diagnostics(
     seg_attachment_r[seg] = attachment_r
     length = wp.length(attachment_r - attachment_l)
     length_rate = (length - seg_length_prev[seg]) / dt
-    compliance = wp.max(seg_active_compliance[seg], _MIN_TENDON_COMPLIANCE)
     seg_material_tension[seg] = tendon_material_tension(
         length,
         seg_rest_length[seg],
@@ -215,7 +240,9 @@ def update_tendon_segment_diagnostics(
         sigmoid_transition_strain,
         sigmoid_transition_width,
     )
-    seg_damping_tension[seg] = seg_active_damping[seg] * length_rate
+    seg_damping_tension[seg] = tendon_damping_tension(
+        length - seg_rest_length[seg], seg_active_damping[seg] * length_rate, seg_active_damping[seg], dt
+    )
     alm_rho = float(0.0)
     if alm_enabled != 0:
         alm_rho = seg_alm_k[seg]
@@ -310,7 +337,13 @@ def _tendon_span_tension(
             sigmoid_transition_strain,
             sigmoid_transition_width,
         )
-    return wp.max(material_tension + seg_active_damping[seg] * length_rate, 0.0)
+    return wp.max(
+        material_tension
+        + tendon_damping_tension(
+            length - rest_length, seg_active_damping[seg] * length_rate, seg_active_damping[seg], dt
+        ),
+        0.0,
+    )
 
 
 @wp.func
@@ -1169,7 +1202,13 @@ def _direct_tendon_span_tension(
             sigmoid_transition_strain,
             sigmoid_transition_width,
         )
-    return wp.max(material_tension + seg_active_damping[seg] * length_rate, 0.0)
+    return wp.max(
+        material_tension
+        + tendon_damping_tension(
+            length - rest_length, seg_active_damping[seg] * length_rate, seg_active_damping[seg], dt
+        ),
+        0.0,
+    )
 
 
 @wp.func
@@ -1408,7 +1447,8 @@ def evaluate_tendon_force_hessians(
 
             stiffness = 1.0 / compliance
             damping = seg_active_damping[seg]
-            tension = stiffness * (length - rest_length) + damping * length_rate
+            damped = tendon_damping_tension(length - rest_length, damping * length_rate, damping, dt)
+            tension = stiffness * (length - rest_length) + damped
             if sigmoid_ea_low > 0.0:
                 stiffness = tendon_material_tangent(
                     length,
@@ -1429,7 +1469,7 @@ def evaluate_tendon_force_hessians(
                         sigmoid_transition_strain,
                         sigmoid_transition_width,
                     )
-                    + damping * length_rate
+                    + damped
                 )
             tension = wp.max(tension, 0.0)
             effective_stiffness = stiffness + damping / dt

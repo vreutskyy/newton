@@ -58,7 +58,7 @@ class Example:
         # Inner edge at x=0 aligns with P2 center; y=+r matches P2 tangent offset
         self.q_p1_init = np.array([-s, 0.0, 0.0, c])
         q_p1_wp = wp.quat(*self.q_p1_init.tolist())
-        p1 = builder.add_body(
+        p1 = builder.add_link(
             xform=wp.transform(p=self.p1_pos, q=q_p1_wp),
             mass=0.5,
         )
@@ -68,7 +68,7 @@ class Example:
         # P2 at (0, 0), axis X — wraps in YZ plane
         self.q_p2_init = np.array([0.0, s, 0.0, c])
         q_p2_wp = wp.quat(*self.q_p2_init.tolist())
-        p2 = builder.add_body(
+        p2 = builder.add_link(
             xform=wp.transform(p=self.p2_pos, q=q_p2_wp),
             mass=0.5,
         )
@@ -79,7 +79,7 @@ class Example:
         # Inner edge at x=0 aligns with P2 center; y=-r matches P2 tangent offset
         self.q_p3_init = np.array([-s, 0.0, 0.0, c])
         q_p3_wp = wp.quat(*self.q_p3_init.tolist())
-        p3 = builder.add_body(
+        p3 = builder.add_link(
             xform=wp.transform(p=self.p3_pos, q=q_p3_wp),
             mass=0.5,
         )

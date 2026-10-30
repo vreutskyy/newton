@@ -9,6 +9,7 @@ acceptance criteria.  Test expectation changes in this file should follow
 """
 
 import math
+import sys
 import unittest
 import warnings
 from itertools import pairwise
@@ -27,7 +28,8 @@ from newton.examples.cable.example_tendon_capstan_friction import Example as Dyn
 from newton.examples.cable.example_tendon_mujoco_switch import Example as MujocoSwitchExample
 from newton.examples.cable.example_tendon_mujoco_switch_matrix import Example as MujocoSwitchMatrixExample
 from newton.examples.cable.example_tendon_mujoco_wrap import Example as MujocoWrapExample
-from newton.tests.unittest_utils import StdOutCapture, sanitize_identifier
+from newton.tests.test_tendon_equilibrium import assert_supported_atwood_wrap
+from newton.tests.unittest_utils import StdOutCapture, capture_native_stdout_in_subprocess, sanitize_identifier
 
 SIGMOID_TENDON_MATERIAL = {
     "tendon_sigmoid_ea_low": 2000.0,
@@ -83,6 +85,24 @@ def _box_on_planar_joint(builder, pos, mass, half_extent):
         child=body,
         linear_axes=[dof(axis=Axis.X), dof(axis=Axis.Z)],
         angular_axes=[dof(axis=Axis.Y)],
+        parent_xform=wp.transform(p=pos),
+        child_xform=wp.transform(),
+    )
+    builder.add_articulation([joint])
+    return body
+
+
+def _box_on_vertical_joint(builder, pos, mass, half_extent):
+    """Keep an Atwood weight below the pulley and prevent sideways pendulum motion."""
+    body = builder.add_link(xform=wp.transform(p=pos), mass=0.0)
+    cfg = newton.ModelBuilder.ShapeConfig(density=mass / (2.0 * half_extent) ** 3)
+    builder.add_shape_box(body, hx=half_extent, hy=half_extent, hz=half_extent, cfg=cfg)
+    joint = builder.add_joint_prismatic(
+        parent=-1,
+        child=body,
+        axis=Axis.Z,
+        limit_lower=-1.0,
+        limit_upper=1.0,
         parent_xform=wp.transform(p=pos),
         child_xform=wp.transform(),
     )
@@ -387,13 +407,19 @@ def build_dynamic_pulley_atwood(
     pulley_mass=5.0,
     pulley_radius=0.15,
     compliance=1.0e-5,
+    vertical_tangents=False,
+    *,
+    pulley_inertia_y=None,
 ):
+    """Build a guided Atwood machine, optionally with constant vertical tangent directions."""
     builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=(0.0, 0.0, -9.81))
 
     pulley_pos = wp.vec3(0.0, 0.0, 3.5)
     pulley_half_height = 0.04
-    inertia_y = 0.5 * pulley_mass * pulley_radius * pulley_radius
-    inertia_xz = (1.0 / 12.0) * pulley_mass * (3.0 * pulley_radius * pulley_radius + (2.0 * pulley_half_height) ** 2)
+    inertia_y = 0.5 * pulley_mass * pulley_radius * pulley_radius if pulley_inertia_y is None else pulley_inertia_y
+    # A flywheel override must also preserve the principal-inertia triangle
+    # inequalities, not rely on the builder silently correcting the tensor.
+    inertia_xz = 0.5 * inertia_y + pulley_mass * (2.0 * pulley_half_height) ** 2 / 12.0
     inertia = wp.mat33(
         inertia_xz,
         0.0,
@@ -405,7 +431,7 @@ def build_dynamic_pulley_atwood(
         0.0,
         inertia_xz,
     )
-    pulley = builder.add_body(
+    pulley = builder.add_link(
         xform=wp.transform(p=pulley_pos),
         mass=pulley_mass,
         inertia=inertia,
@@ -428,8 +454,9 @@ def build_dynamic_pulley_atwood(
     )
     builder.add_articulation([j_pulley])
 
-    left = _box_on_planar_joint(builder, wp.vec3(-0.4, 0.0, 2.0), mass_left, 0.06)
-    right = _box_on_planar_joint(builder, wp.vec3(0.4, 0.0, 2.0), mass_right, 0.06)
+    half_width = pulley_radius if vertical_tangents else 0.4
+    left = _box_on_vertical_joint(builder, wp.vec3(-half_width, 0.0, 2.0), mass_left, 0.06)
+    right = _box_on_vertical_joint(builder, wp.vec3(half_width, 0.0, 2.0), mass_right, 0.06)
 
     axis = (0.0, 1.0, 0.0)
     builder.add_tendon()
@@ -483,8 +510,8 @@ def build_kinematic_pulley_atwood(mu=0.0, mass_left=1.0, mass_right=3.0, pulley_
         cfg=newton.ModelBuilder.ShapeConfig(density=0.0),
     )
 
-    left = _box_on_planar_joint(builder, wp.vec3(-0.4, 0.0, 2.0), mass_left, 0.06)
-    right = _box_on_planar_joint(builder, wp.vec3(0.4, 0.0, 2.0), mass_right, 0.06)
+    left = _box_on_vertical_joint(builder, wp.vec3(-0.4, 0.0, 2.0), mass_left, 0.06)
+    right = _box_on_vertical_joint(builder, wp.vec3(0.4, 0.0, 2.0), mass_right, 0.06)
 
     axis = (0.0, 1.0, 0.0)
     builder.add_tendon()
@@ -848,7 +875,7 @@ def build_kinematic_rolling_transport(mu=10.0, *, pre_stretch=0.0):
     return builder.finalize(), pulley
 
 
-def run_model(model, num_frames=80, substeps=12, fps=60, return_solver=False):
+def run_model(model, num_frames=80, substeps=12, fps=60, return_solver=False, *, check_atwood_wrap=False):
     dt = 1.0 / fps / substeps
     solver = newton.solvers.SolverXPBD(model, iterations=8, joint_linear_relaxation=0.8)
     state_0 = model.state()
@@ -862,6 +889,9 @@ def run_model(model, num_frames=80, substeps=12, fps=60, return_solver=False):
             model.collide(state_0, contacts)
             solver.step(state_0, state_1, control, contacts, dt)
             state_0, state_1 = state_1, state_0
+
+        if check_atwood_wrap:
+            assert_supported_atwood_wrap(solver)
 
     if return_solver:
         return state_0, solver
@@ -1467,6 +1497,7 @@ def _dynamic_capstan_metrics(device, mu, num_frames=40):
             solver.step(state_0, state_1, control, contacts, dt)
             state_0, state_1 = state_1, state_0
         body_q = state_0.body_q.numpy()
+        assert_supported_atwood_wrap(solver)
         angle = _hinge_y_angle(body_q, pulley_idx)
         theta += float((angle - last_angle + np.pi) % (2.0 * np.pi) - np.pi)
         last_angle = angle
@@ -1485,7 +1516,7 @@ def _dynamic_capstan_example_theta(device, num_frames=40):
     for _ in range(num_frames):
         example.step()
     theta = np.array(example._pulley_rotation_history[-1], dtype=np.float64)
-    return tuple(example.mus), theta
+    return tuple(example.mus), theta, example._reference_sticking_rotation(num_frames)
 
 
 def _kinematic_capstan_metrics(device, mu, num_frames=100, substeps=12, fps=60):
@@ -1504,6 +1535,7 @@ def _kinematic_capstan_metrics(device, mu, num_frames=100, substeps=12, fps=60):
             model.collide(state_0, contacts)
             solver.step(state_0, state_1, control, contacts, dt)
             state_0, state_1 = state_1, state_0
+        assert_supported_atwood_wrap(solver)
         peak_travel = max(peak_travel, 2.0 - float(state_0.body_q.numpy()[right_idx][2]))
     body_q = state_0.body_q.numpy()
     theta = _hinge_y_angle(body_q, pulley_idx)
@@ -1973,7 +2005,7 @@ def test_dynamic_route_holds_state_when_neighbors_interpenetrate(test, device):
         solver._update_tendon_link_active(model, model.body_q)
         held = bool(solver.tendon_link_active.numpy()[candidate_link])
         test.assertTrue(held, "The candidate should be active while the neighbors are apart")
-        solver._prepare_tendon_route(model, model.body_q)
+        solver._prepare_tendon_route(model)
         route_rest = solver.tendon_seg_route_rest_length.numpy().copy()
 
         # Sink the upper neighbor until the two 0.3 m wrap circles overlap by 0.45 m.
@@ -1984,7 +2016,7 @@ def test_dynamic_route_holds_state_when_neighbors_interpenetrate(test, device):
         for step in range(8):
             solver._snapshot_tendon_step_state()
             solver._update_tendon_link_active(model, model.body_q)
-            solver._prepare_tendon_route(model, model.body_q)
+            solver._prepare_tendon_route(model)
             test.assertEqual(
                 bool(solver.tendon_link_active.numpy()[candidate_link]),
                 held,
@@ -2539,41 +2571,49 @@ def test_initial_negative_wrap_warns_and_books_oriented_arc(test, device):
         )
 
 
-def test_negative_wrap_report_separates_graze_from_static_roller(test, device):
-    """The report must drop the dynamic-routing advice for a link that is already dynamic."""
+def _emit_negative_wrap_report(device, dynamic):
+    """Run one unsupported-wrap fixture without intercepting its native output."""
     with wp.ScopedDevice(device):
         dt = 1.0 / 1200.0
-        model, solver, state_0, state_1, candidate, _candidate_link, radius = _settle_graze_candidate(device, dt)
-        capture = StdOutCapture()
-        capture.begin()
-        try:
+        if dynamic:
+            model, solver, state_0, state_1, candidate, _candidate_link, radius = _settle_graze_candidate(device, dt)
             _step_candidate_to(solver, model, state_0, state_1, candidate, radius + 1.0e-4, dt)
-            wp.synchronize()
-        finally:
-            graze_output = capture.end()
+        else:
+            model, body, _link = build_oriented_dynamic_route(1, device, dynamic=False)
+            solver = newton.solvers.SolverXPBD(model, iterations=1)
+            state_0, state_1 = model.state(), model.state()
+            body_q = state_0.body_q.numpy()
+            body_q[body, 0] = 0.25
+            state_0.body_q.assign(body_q)
+            solver.step(state_0, state_1, model.control(), None, dt)
+        wp.synchronize()
 
-        test.assertIn("WARNING", graze_output)
-        test.assertIn("grazed a negative oriented wrap", graze_output)
-        test.assertIn("dynamic activation boundary", graze_output)
-        test.assertNotIn("use dynamic routing", graze_output)
 
-        static_model, static_body, _static_link = build_oriented_dynamic_route(1, device, dynamic=False)
-        static_solver = newton.solvers.SolverXPBD(static_model, iterations=1)
-        static_0, static_1 = static_model.state(), static_model.state()
-        body_q = static_0.body_q.numpy()
-        body_q[static_body, 0] = 0.25
-        static_0.body_q.assign(body_q)
-        capture = StdOutCapture()
-        capture.begin()
-        try:
-            static_solver.step(static_0, static_1, static_model.control(), None, dt)
-            wp.synchronize()
-        finally:
-            static_output = capture.end()
-
-        test.assertIn("ERROR", static_output)
-        test.assertIn("crossed the supported wrap range", static_output)
-        test.assertIn("use dynamic routing", static_output)
+def test_negative_wrap_report_separates_graze_from_static_roller(test, device):
+    """The report must drop the dynamic-routing advice for a link that is already dynamic."""
+    device = wp.get_device(device)
+    outputs = []
+    for dynamic in (True, False):
+        if sys.platform == "win32" and device.is_cpu:
+            output = capture_native_stdout_in_subprocess(
+                "newton.tests.test_tendon_capstan", "_emit_negative_wrap_report", device=device.alias, dynamic=dynamic
+            )
+        else:
+            capture = StdOutCapture()
+            capture.begin()
+            try:
+                _emit_negative_wrap_report(device, dynamic)
+            finally:
+                output = capture.end()
+        outputs.append(output)
+    graze_output, static_output = outputs
+    test.assertIn("WARNING", graze_output)
+    test.assertIn("grazed a negative oriented wrap", graze_output)
+    test.assertIn("dynamic activation boundary", graze_output)
+    test.assertNotIn("use dynamic routing", graze_output)
+    test.assertIn("ERROR", static_output)
+    test.assertIn("crossed the supported wrap range", static_output)
+    test.assertIn("use dynamic routing", static_output)
 
 
 def test_dynamic_route_deactivates_when_wrap_angle_crosses_zero(test, device):
@@ -2890,7 +2930,7 @@ def test_dynamic_pulley_uses_angular_jacobian(test, device):
     """High friction recovers the no-slip angular Jacobian baseline."""
     with wp.ScopedDevice(device):
         model, left_idx, right_idx, pulley_idx = build_dynamic_pulley_atwood(mu=10.0, compliance=3.0e-8)
-        state = run_model(model, num_frames=80)
+        state = run_model(model, num_frames=80, check_atwood_wrap=True)
         body_q = state.body_q.numpy()
         test.assertTrue(np.isfinite(body_q).all(), "Non-finite dynamic pulley Atwood state")
 
@@ -2905,30 +2945,52 @@ def test_dynamic_pulley_uses_angular_jacobian(test, device):
 
 
 def test_pulley_inertia_limit_locks_cable_travel(test, device):
-    """As pulley inertia tends to infinity, no-slip cable travel tends to zero."""
+    """Check finite-inertia Atwood motion approaching the locked limit, without suppressing slow motion."""
     with wp.ScopedDevice(device):
         radius = 0.15
-        model, _, _, pulley_idx = build_dynamic_pulley_atwood(
-            mu=10.0,
-            mass_left=1.0,
-            mass_right=3.0,
-            pulley_mass=5000.0,
-            pulley_radius=radius,
-            compliance=3.0e-8,
-        )
-        state = run_model(model, num_frames=80)
-        body_q = state.body_q.numpy()
-        test.assertTrue(np.isfinite(body_q).all(), "Non-finite high-inertia pulley state")
+        travel = []
+        for pulley_mass in (5000.0, 20000.0):
+            with test.subTest(pulley_mass=pulley_mass):
+                model, left, right, pulley_idx = build_dynamic_pulley_atwood(
+                    mu=10.0,
+                    mass_left=1.0,
+                    mass_right=3.0,
+                    pulley_mass=pulley_mass,
+                    pulley_radius=radius,
+                    compliance=3.0e-8,
+                    vertical_tangents=True,
+                )
+                initial = model.body_q.numpy()
+                capture = StdOutCapture()
+                capture.begin()
+                try:
+                    state = run_model(model, num_frames=80, check_atwood_wrap=True)
+                    wp.synchronize()
+                finally:
+                    diagnostics = capture.end()
+                test.assertNotIn("crossed the supported wrap range", diagnostics)
+                body_q = state.body_q.numpy()
+                test.assertTrue(np.isfinite(body_q).all(), "Non-finite high-inertia pulley state")
 
-        q = body_q[pulley_idx]
-        theta = abs(2.0 * np.arctan2(float(q[4]), float(q[6])))
-        rim_travel = theta * radius
-
-        test.assertLess(
-            rim_travel,
-            5.0e-3,
-            f"High-inertia no-slip pulley should lock cable travel: R*theta={rim_travel:.6f}, theta={theta:.6f}",
-        )
+                q = body_q[pulley_idx]
+                theta = abs(2.0 * np.arctan2(float(q[4]), float(q[6])))
+                rim_travel = theta * radius
+                travel.append(rim_travel)
+                masses = model.body_mass.numpy()
+                inertia = float(model.body_inertia.numpy()[pulley_idx, 1, 1])
+                acceleration = (
+                    (masses[right] - masses[left]) * 9.81 / (masses[left] + masses[right] + inertia / radius**2)
+                )
+                # Backward-Euler displacement for constant acceleration. The
+                # old 5 mm cutoff rejected the correct ~6.96 mm motion of the
+                # lighter pulley and passed only with XPBD's velocity cutoff.
+                steps = 80 * 12
+                expected = 0.5 * acceleration * (1.0 / 720.0) ** 2 * steps * (steps + 1)
+                test.assertAlmostEqual(rim_travel, expected, delta=2.0e-5)
+                test.assertAlmostEqual(float(body_q[left, 2] - initial[left, 2]), expected, delta=2.0e-5)
+                test.assertAlmostEqual(float(initial[right, 2] - body_q[right, 2]), expected, delta=2.0e-5)
+        test.assertEqual(len(travel), 2)
+        test.assertLess(travel[1], travel[0] / 3.5)
 
 
 def test_dynamic_capstan_mu_controls_pulley_rotation(test, device):
@@ -2974,14 +3036,14 @@ def test_dynamic_capstan_mu_controls_pulley_rotation(test, device):
 def test_dynamic_capstan_example_sticking_plateau(test, device):
     """Increasing friction beyond that needed for sticking must not slow rolling."""
     with wp.ScopedDevice(device):
-        mus, theta = _dynamic_capstan_example_theta(device)
+        mus, theta, reference = _dynamic_capstan_example_theta(device)
         test.assertEqual(mus[0], 0.0, f"Dynamic capstan example should keep the zero-friction case first: {mus}")
         test.assertGreater(mus[1], 0.0, f"Dynamic capstan example mid friction should be finite: {mus}")
         test.assertGreaterEqual(mus[2], 10.0, f"Dynamic capstan example high friction should be no-slip-like: {mus}")
 
         theta_low, theta_mid, theta_high = theta
         test.assertLess(abs(theta_low), 0.08, f"Example zero-mu pulley should not rotate: theta={theta_low:.5f}")
-        test.assertGreater(theta_mid, 0.25, f"Example mid-mu pulley should rotate in cable direction: {theta_mid:.5f}")
+        np.testing.assert_allclose(theta[1:], reference, rtol=0.10, atol=0.003)
         np.testing.assert_allclose(theta_mid, theta_high, rtol=0.03, atol=0.003)
 
 
@@ -3311,7 +3373,10 @@ def test_frictionless_pinhole_equalizes_damped_tension(test, device):
                     solver.step(state_0, state_1, model.control(), None, dt)
 
                     tension = -solver.tendon_seg_lambda.numpy() / dt
-                    expected_tension = initial_tension + 0.5 * damping * length_rate
+                    # Kinematic poses are held fixed in this test. At zero
+                    # extension, a supplied velocity alone must not engage
+                    # damping; already taut spans retain ordinary damping.
+                    expected_tension = initial_tension + (0.5 * damping * length_rate if initial_tension > 0.0 else 0.0)
                     test.assertAlmostEqual(
                         float(tension[0]),
                         float(tension[1]),
@@ -4353,6 +4418,8 @@ def _material_transfer_delta_kernel(
         ea_ratio,
         transition_strain,
         transition_width,
+        1000.0,
+        1000.0,
     )
 
 
@@ -4437,8 +4504,16 @@ def test_material_transfer_delta_reaches_capstan_bound(test, device):
         xf = x.astype(np.float64)
 
         def imbalance(d, xf=xf, m=m):
-            t_high = np.maximum(_junction_tension_np(xf[:, 0], xf[:, 0] - xf[:, 1] + d, xf[:, 2], m) + xf[:, 3], 0.0)
-            t_low = np.maximum(_junction_tension_np(xf[:, 4], xf[:, 4] - xf[:, 5] - d, xf[:, 6], m) + xf[:, 7], 0.0)
+            t_high = np.maximum(
+                _junction_tension_np(xf[:, 0], xf[:, 0] - xf[:, 1] + d, xf[:, 2], m)
+                + np.minimum(xf[:, 3], 1000.0 * np.maximum(xf[:, 1] - d, 0.0)),
+                0.0,
+            )
+            t_low = np.maximum(
+                _junction_tension_np(xf[:, 4], xf[:, 4] - xf[:, 5] - d, xf[:, 6], m)
+                + np.minimum(xf[:, 7], 1000.0 * np.maximum(xf[:, 5] + d, 0.0)),
+                0.0,
+            )
             return t_high - xf[:, 8] * t_low, np.maximum(t_high, t_low)
 
         max_delta = np.minimum(np.maximum(xf[:, 1], 0.0), np.maximum(xf[:, 4] - xf[:, 5] - xf[:, 9], 0.0))
@@ -4566,8 +4641,16 @@ def test_material_transfer_short_stiff_span_reaches_capstan_bound(test, device):
     test.assertTrue(np.all(delta <= max_delta))
     rest_high = inputs[:, 0] - inputs[:, 1] + delta
     rest_low = inputs[:, 4] - inputs[:, 5] - delta
-    tension_high = np.maximum(sigmoid_tendon_tension(inputs[:, 0], rest_high, material) + inputs[:, 3], 0.0)
-    tension_low = np.maximum(sigmoid_tendon_tension(inputs[:, 4], rest_low, material) + inputs[:, 7], 0.0)
+    tension_high = np.maximum(
+        sigmoid_tendon_tension(inputs[:, 0], rest_high, material)
+        + np.minimum(inputs[:, 3], 1000.0 * np.maximum(inputs[:, 1] - delta, 0.0)),
+        0.0,
+    )
+    tension_low = np.maximum(
+        sigmoid_tendon_tension(inputs[:, 4], rest_low, material)
+        + np.minimum(inputs[:, 7], 1000.0 * np.maximum(inputs[:, 5] + delta, 0.0)),
+        0.0,
+    )
     residual = tension_high - inputs[:, 8] * tension_low
     # dT/drest = -(length/rest) * dT/dlength. The root may lie between float32 rest lengths.
     resolution_high = (
@@ -4583,13 +4666,14 @@ def test_material_transfer_short_stiff_span_reaches_capstan_bound(test, device):
 
 
 def test_material_transfer_respects_available_rest_length(test, device):
-    """An unreachable capstan boundary must not move more material than is available."""
+    """Stop at the first capstan solution or the available-material bound."""
     inputs = np.array(
         [
             [1.0, 0.0, 1.0e-3, 100.0, 1.0, 0.0, 1.0e-3, 0.0, 2.0, 1.0e-6],
             [1.0, 0.1, 1.0e-3, 100.0, 1.0e-6, 0.0, 1.0e-3, 0.0, 2.0, 1.0e-6],
             [1.0, 0.1, 1.0e-3, 100.0, 1.0, 0.0, 1.0e-3, 0.0, 2.0, 1.0e-6],
             [1.0, 0.1, 1.0e-3, 1000.0, 2.0e-6, 0.0, 1.0e-3, 0.0, 2.0, 1.0e-6],
+            [1.0, 0.5, 1.0e-3, 1000.0, 2.0e-6, 0.0, 1.0e-3, 0.0, 2.0, 1.0e-6],
         ],
         dtype=np.float32,
     )
@@ -4605,7 +4689,24 @@ def test_material_transfer_respects_available_rest_length(test, device):
     max_delta = np.minimum(inputs[:, 1], inputs[:, 4] - inputs[:, 5] - inputs[:, 9])
     test.assertTrue(np.all(delta >= 0.0))
     test.assertTrue(np.all(delta <= max_delta))
-    np.testing.assert_allclose(delta, max_delta, rtol=1.0e-6, atol=0.0)
+    data = inputs.astype(np.float64)
+    lo = np.zeros(len(inputs))
+    hi = max_delta.astype(np.float64)
+    for _ in range(80):
+        mid = (lo + hi) * 0.5
+        eh = data[:, 1] - mid
+        el = data[:, 5] + mid
+        th = np.maximum(
+            100.0 * np.maximum(eh, 0.0) / (data[:, 0] - eh) + np.minimum(data[:, 3], 1000.0 * np.maximum(eh, 0.0)), 0.0
+        )
+        tl = np.maximum(
+            100.0 * np.maximum(el, 0.0) / (data[:, 4] - el) + np.minimum(data[:, 7], 1000.0 * np.maximum(el, 0.0)), 0.0
+        )
+        positive = th > data[:, 8] * tl
+        lo = np.where(positive, mid, lo)
+        hi = np.where(positive, hi, mid)
+    np.testing.assert_allclose(delta, hi, rtol=1.0e-4, atol=1.0e-10)
+    np.testing.assert_allclose(delta[[0, 1, 4]], max_delta[[0, 1, 4]], rtol=1.0e-6, atol=0.0)
 
 
 devices = ["cpu"]

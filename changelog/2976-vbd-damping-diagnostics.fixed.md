@@ -1,0 +1,1 @@
+Report native VBD tendon forces from the accepted material state, preserving spinning-roller damping and elastic extensions smaller than float32 length resolution. Compliant-ALM rows keep their existing reporting semantics.

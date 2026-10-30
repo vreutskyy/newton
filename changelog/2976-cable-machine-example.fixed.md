@@ -1,0 +1,1 @@
+Correct the cable-machine example's weight masses, capsule orientation, and redundant pulley joints. Bound the weights' travel below the fixed pulleys and validate the route and intended direction of motion.

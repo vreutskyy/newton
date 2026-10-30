@@ -9,6 +9,8 @@
 # descends under gravity, pulling the capsule upward through the pulley
 # chain.  All three pulleys rotate through the frictional rolling
 # constraints.
+# Vertical guides and travel stops keep both cable attachments below the
+# fixed pulleys throughout the demonstration.
 #
 # Demonstrates complex multi-pulley routing with diverse body shapes
 # (capsules, boxes, cylinders).
@@ -49,6 +51,13 @@ class Example:
         pulley_mass = 40.0
         pulley_shape_cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.7, margin=0.01, gap=0.02)
         weight_shape_cfg = newton.ModelBuilder.ShapeConfig(mu=0.7, margin=0.01, gap=0.02)
+        capsule_radius, capsule_half_height = 0.14, 0.18
+        capsule_cfg = weight_shape_cfg.copy()
+        capsule_cfg.density = 1.0 / (
+            np.pi * capsule_radius**2 * (2.0 * capsule_half_height + 4.0 * capsule_radius / 3.0)
+        )
+        box_cfg = weight_shape_cfg.copy()
+        box_cfg.density = 2.0 / (8.0 * 0.12 * 0.15 * 0.10)
 
         def cylinder_inertia(mass, radius, half_height):
             inertia_y = 0.5 * mass * radius * radius
@@ -65,7 +74,7 @@ class Example:
                 inertia_xz,
             )
 
-        p1 = builder.add_body(
+        p1 = builder.add_link(
             xform=wp.transform(p=self.p1_pos, q=wp.quat_identity()),
             mass=pulley_mass,
             inertia=cylinder_inertia(pulley_mass, self.r1, 0.05),
@@ -81,7 +90,7 @@ class Example:
         )
         self.p1_idx = p1
 
-        p2 = builder.add_body(
+        p2 = builder.add_link(
             xform=wp.transform(p=self.p2_pos, q=wp.quat_identity()),
             mass=pulley_mass,
             inertia=cylinder_inertia(pulley_mass, self.r2, 0.04),
@@ -96,7 +105,7 @@ class Example:
         )
         self.p2_idx = p2
 
-        p3 = builder.add_body(
+        p3 = builder.add_link(
             xform=wp.transform(p=self.p3_pos, q=wp.quat_identity()),
             mass=pulley_mass,
             inertia=cylinder_inertia(pulley_mass, self.r3, 0.05),
@@ -111,7 +120,6 @@ class Example:
         )
         self.p3_idx = p3
 
-        Dof = newton.ModelBuilder.JointDofConfig
         j_p1 = builder.add_joint_revolute(
             parent=-1,
             child=p1,
@@ -137,29 +145,25 @@ class Example:
             label="pulley_3_y",
         )
 
-        planar_lin = [Dof(axis=Axis.X), Dof(axis=Axis.Z)]
-        planar_ang = []
-
-        capsule_pos = wp.vec3(-0.9, 0.0, 3.25)
-        q_vert = wp.quat(np.sin(np.pi / 4.0), 0.0, 0.0, np.cos(np.pi / 4.0))
+        capsule_pos = wp.vec3(-0.9, 0.0, 2.0)
         left = builder.add_link(
             xform=wp.transform(p=capsule_pos, q=wp.quat_identity()),
-            mass=1.0,
+            mass=0.0,
         )
         builder.add_shape_capsule(
             left,
-            xform=wp.transform(q=q_vert),
-            radius=0.14,
-            half_height=0.18,
-            cfg=weight_shape_cfg,
+            radius=capsule_radius,
+            half_height=capsule_half_height,
+            cfg=capsule_cfg,
             color=(0.86, 0.72, 0.22),
         )
         self.left_idx = left
-        j1 = builder.add_joint_d6(
+        j1 = builder.add_joint_prismatic(
             parent=-1,
             child=left,
-            linear_axes=planar_lin,
-            angular_axes=planar_ang,
+            axis=Axis.Z,
+            limit_lower=-0.5,
+            limit_upper=1.0,
             parent_xform=wp.transform(p=capsule_pos, q=wp.quat_identity()),
             child_xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.0), q=wp.quat_identity()),
         )
@@ -167,15 +171,16 @@ class Example:
         box_pos = wp.vec3(1.8, 0.0, 2.7)
         right = builder.add_link(
             xform=wp.transform(p=box_pos, q=wp.quat_identity()),
-            mass=2.0,
+            mass=0.0,
         )
-        builder.add_shape_box(right, hx=0.12, hy=0.15, hz=0.10, cfg=weight_shape_cfg)
+        builder.add_shape_box(right, hx=0.12, hy=0.15, hz=0.10, cfg=box_cfg)
         self.right_idx = right
-        j2 = builder.add_joint_d6(
+        j2 = builder.add_joint_prismatic(
             parent=-1,
             child=right,
-            linear_axes=planar_lin,
-            angular_axes=planar_ang,
+            axis=Axis.Z,
+            limit_lower=-1.0,
+            limit_upper=0.5,
             parent_xform=wp.transform(p=box_pos, q=wp.quat_identity()),
             child_xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.0), q=wp.quat_identity()),
         )
@@ -333,8 +338,8 @@ class Example:
 
     def _assert_capsule_attachment_stays_below_p1(self, attachment, body_q):
         p1_center = body_q[self.p1_idx][:3]
-        crown_limit = float(p1_center[2] + self.r1 + 0.04)
-        side_limit = float(p1_center[0] + self.r1)
+        crown_limit = float(p1_center[2] - self.r1)
+        side_limit = float(p1_center[0] - self.r1)
         assert float(attachment[2]) <= crown_limit, (
             f"Cable machine light-side cable attachment should not crest over P1: "
             f"attachment_z={attachment[2]:.4f}, crown_limit={crown_limit:.4f}"
@@ -344,7 +349,19 @@ class Example:
             f"attachment_x={attachment[0]:.4f}, side_limit={side_limit:.4f}"
         )
 
+    def _assert_supported_wraps(self):
+        centers = self.model.tendon_link_offset.numpy()[1:-1]
+        axes = self.model.tendon_link_axis.numpy()[1:-1]
+        arrival = self.solver.tendon_seg_attachment_r_local.numpy()[:-1] - centers
+        departure = self.solver.tendon_seg_attachment_l_local.numpy()[1:] - centers
+        angles = np.arctan2(np.sum(np.cross(arrival, departure) * axes, axis=1), np.sum(arrival * departure, axis=1))
+        angles = np.where(angles < -np.pi + 1.0e-5, angles + 2.0 * np.pi, angles)
+        assert np.isfinite(angles).all() and np.all((angles >= -1.0e-5) & (angles <= np.pi + 1.0e-5)), (
+            f"Cable machine left the supported half-wrap range: {np.degrees(angles)}"
+        )
+
     def test_post_step(self):
+        self._assert_supported_wraps()
         assert_tendon_total_length(self, rel_tol=0.30)
         body_q = self.state_0.body_q.numpy()
         assert np.isfinite(body_q).all(), "Cable machine produced non-finite body state"
@@ -378,6 +395,8 @@ class Example:
         assert abs(box_z - self._initial_box_z) > 0.1 or abs(capsule_z - self._initial_capsule_z) > 0.1, (
             f"Cable machine bodies should move: capsule_z={capsule_z}, box_z={box_z}"
         )
+        assert max(self._capsule_z_history) > self._initial_capsule_z + 0.05, "The light capsule should rise"
+        assert min(self._box_z_history) < self._initial_box_z - 0.05, "The heavy box should descend"
 
         rotations = np.array(self._pulley_rotation_history, dtype=np.float64)
         assert np.isfinite(rotations).all(), "Non-finite cable machine pulley rotation history"

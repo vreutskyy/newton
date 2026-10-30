@@ -42,7 +42,7 @@ from newton.tests.test_tendon_capstan import (
     sigmoid_tendon_tangent,
     sigmoid_tendon_tension,
 )
-from newton.tests.test_tendon_equilibrium import build_atwood_equal_weights
+from newton.tests.test_tendon_equilibrium import assert_supported_atwood_wrap, build_atwood_equal_weights
 from newton.tests.unittest_utils import find_nan_members, sanitize_identifier
 
 TENDON_VBD_SOLVER_KWARGS = {
@@ -111,6 +111,8 @@ def _install_vbd_example_solver(example, solver_overrides=None):
         example.model.joint_target_kd[example.p2_dof_start : example.p2_dof_start + 1].fill_(200.0)
         example.model.joint_target_kd[example.p6_dof_start : example.p6_dof_start + 1].fill_(200.0)
         solver_kwargs["iterations"] = 30
+        # Compliant ALM does not use the legacy k_start as material stiffness.
+        solver_kwargs.update(STIFF_REVOLUTE_ANCHOR_OVERRIDES)
 
     if solver_overrides is not None:
         solver_kwargs.update(solver_overrides)
@@ -131,6 +133,11 @@ def _run_vbd_example_assertions(test, device, example_cls, num_frames, solver_ov
     with wp.ScopedDevice(device):
         example = example_cls(None, _make_example_args(num_frames))
         _install_vbd_example_solver(example, solver_overrides)
+
+        if example.solver.rigid_articulation_solve == "block_sparse_joints":
+            sparse_bodies = example.solver.rigid_articulation_sparse_layout.articulation_bodies.numpy()
+            dynamic_bodies = np.flatnonzero(example.model.body_inv_mass.numpy() > 0.0)
+            test.assertTrue(set(dynamic_bodies).issubset(set(sparse_bodies)))
 
         has_post_step = hasattr(example, "test_post_step")
         has_final = hasattr(example, "test_final")
@@ -277,7 +284,7 @@ def build_dynamic_rolling_route():
     return builder.finalize(), candidate, candidate_link, lower, upper
 
 
-def run_vbd_model(model, num_frames=80, substeps=12, fps=60):
+def run_vbd_model(model, num_frames=80, substeps=12, fps=60, *, check_atwood_wrap=False):
     _set_serial_body_coloring(model)
     dt = 1.0 / fps / substeps
     solver = _make_tendon_vbd_solver(model)
@@ -293,6 +300,9 @@ def run_vbd_model(model, num_frames=80, substeps=12, fps=60):
             model.collide(state_0, contacts)
             solver.step(state_0, state_1, control, contacts, dt)
             state_0, state_1 = state_1, state_0
+
+        if check_atwood_wrap:
+            assert_supported_atwood_wrap(solver)
 
     return state_0, solver
 
@@ -341,6 +351,7 @@ def _run_dynamic_pulley(mu, device, num_frames=40):
             solver.step(state_0, state_1, control, contacts, dt)
             state_0, state_1 = state_1, state_0
 
+        assert_supported_atwood_wrap(solver)
         angle = _hinge_y_angle(state_0.body_q.numpy(), pulley_idx)
         theta += float((angle - last_angle + np.pi) % (2.0 * np.pi) - np.pi)
         last_angle = angle
@@ -372,6 +383,7 @@ def _dynamic_capstan_metrics(device, mu, num_frames=40):
             solver.step(state_0, state_1, control, contacts, dt)
             state_0, state_1 = state_1, state_0
         body_q = state_0.body_q.numpy()
+        assert_supported_atwood_wrap(solver)
         angle = _hinge_y_angle(body_q, pulley_idx)
         theta += float((angle - last_angle + np.pi) % (2.0 * np.pi) - np.pi)
         last_angle = angle
@@ -397,7 +409,7 @@ def _dynamic_capstan_example_metrics(device, num_frames=40):
     cable_travel = 0.5 * ((left_z - 2.0) + (2.0 - right_z))
     rim_travel = theta * example.pulley_radius
     slip = np.abs(cable_travel - rim_travel)
-    return tuple(example.mus), theta, cable_travel, rim_travel, slip
+    return tuple(example.mus), theta, cable_travel, rim_travel, slip, example._reference_sticking_rotation(num_frames)
 
 
 def _dynamic_capstan_example_history(device, num_frames=100):
@@ -415,7 +427,7 @@ def _dynamic_capstan_example_history(device, num_frames=100):
 
 def _kinematic_capstan_metrics(device, mu, num_frames=40):
     model, left_idx, right_idx, pulley_idx = build_kinematic_pulley_atwood(mu=mu)
-    state, _ = run_vbd_model(model, num_frames=num_frames)
+    state, _ = run_vbd_model(model, num_frames=num_frames, check_atwood_wrap=True)
     body_q = state.body_q.numpy()
     left_travel = float(body_q[left_idx][2]) - 2.0
     right_travel = 2.0 - float(body_q[right_idx][2])
@@ -974,8 +986,8 @@ def test_vbd_nonrolling_rotation_uses_discrete_length_rate(test, device):
         )
 
 
-def test_vbd_rolling_spin_does_not_add_damping_tension(test, device):
-    """Pure roller-axis spin should transport material without stretching the free spans."""
+def test_vbd_rolling_spin_reports_contact_damping(test, device):
+    """Report native damping from the motion of the accepted material contacts."""
     with wp.ScopedDevice(device):
         model, pulley = build_kinematic_rolling_transport(mu=10.0, pre_stretch=0.08)
         model.tendon_seg_damping.fill_(100.0)
@@ -987,6 +999,7 @@ def test_vbd_rolling_spin_does_not_add_damping_tension(test, device):
         solver.step(state_0, state_1, model.control(), None, 1.0 / 60.0)
         state_0, state_1 = state_1, state_0
         initial_rest = solver.tendon_seg_rest_length.numpy().copy()
+        initial_body_q = state_0.body_q.numpy().copy()
 
         body_q = state_0.body_q.numpy()
         angle = 0.4
@@ -1002,12 +1015,22 @@ def test_vbd_rolling_spin_does_not_add_damping_tension(test, device):
             1.0e-4,
             f"Prescribed rolling spin should still transport material: delta={rest_delta}",
         )
-        np.testing.assert_allclose(
-            damping_tension,
-            0.0,
-            atol=1.0e-4,
-            err_msg="Roller-axis spin must not change free-span length or create damping tension",
-        )
+        # All bodies start with identity orientation. Follow today's material
+        # contacts back to that pose; a stationary geometric tangent does not
+        # mean the cable material at that tangent has zero velocity.
+        np.testing.assert_array_equal(initial_body_q[:, 3:], np.tile([0.0, 0.0, 0.0, 1.0], (model.body_count, 1)))
+        link_body = model.tendon_link_body.numpy()
+        body_l = link_body[solver.tendon_seg_active_link_l.numpy()]
+        body_r = link_body[solver.tendon_seg_active_link_r.numpy()]
+        previous_l = initial_body_q[body_l, :3] + solver.tendon_seg_attachment_l_local.numpy()
+        previous_r = initial_body_q[body_r, :3] + solver.tendon_seg_attachment_r_local.numpy()
+        previous_length = np.linalg.norm(previous_r - previous_l, axis=1)
+        length = np.linalg.norm(solver.tendon_seg_attachment_r.numpy() - solver.tendon_seg_attachment_l.numpy(), axis=1)
+        stretch = length - solver.tendon_seg_rest_length.numpy()
+        damping = solver.tendon_seg_active_damping.numpy()
+        expected = damping * np.minimum((length - previous_length) * 60.0, np.maximum(stretch, 0.0) * 60.0)
+        test.assertGreater(float(np.max(np.abs(expected))), 0.1)
+        np.testing.assert_allclose(damping_tension, expected, atol=1.0e-3, rtol=0)
 
 
 def test_vbd_frictionless_off_center_roller_retains_body_torque(test, device):
@@ -1262,7 +1285,7 @@ def test_vbd_dynamic_pulley_uses_angular_jacobian(test, device):
     """High friction recovers the no-slip angular Jacobian baseline."""
     with wp.ScopedDevice(device):
         model, left_idx, right_idx, pulley_idx = build_dynamic_pulley_atwood(mu=10.0)
-        state, _ = run_vbd_model(model, num_frames=60)
+        state, _ = run_vbd_model(model, num_frames=60, check_atwood_wrap=True)
         body_q = state.body_q.numpy()
         test.assertTrue(np.isfinite(body_q).all(), "Non-finite VBD dynamic pulley Atwood state")
 
@@ -1276,17 +1299,19 @@ def test_vbd_dynamic_pulley_uses_angular_jacobian(test, device):
 
 
 def test_vbd_pulley_inertia_limit_locks_cable_travel(test, device):
-    """As pulley inertia tends to infinity, no-slip cable travel tends to zero."""
+    """Limit cable travel with high angular inertia, without overloading the compliant hinge."""
     with wp.ScopedDevice(device):
         radius = 0.15
         model, _, _, pulley_idx = build_dynamic_pulley_atwood(
             mu=10.0,
             mass_left=1.0,
             mass_right=3.0,
-            pulley_mass=20000.0,
+            pulley_mass=5.0,
             pulley_radius=radius,
+            pulley_inertia_y=0.5 * 20000.0 * radius**2,
+            vertical_tangents=True,
         )
-        state, _ = run_vbd_model(model, num_frames=60)
+        state, _ = run_vbd_model(model, num_frames=60, check_atwood_wrap=True)
         body_q = state.body_q.numpy()
         test.assertTrue(np.isfinite(body_q).all(), "Non-finite VBD high-inertia pulley state")
 
@@ -1343,7 +1368,7 @@ def test_vbd_dynamic_capstan_mu_controls_pulley_rotation(test, device):
 def test_vbd_dynamic_capstan_example_friction_modes(test, device):
     """Distinguish frictionless slip from the example's two sticking cases."""
     with wp.ScopedDevice(device):
-        mus, theta, _cable_travel, rim_travel, slip = _dynamic_capstan_example_metrics(device)
+        mus, theta, _cable_travel, rim_travel, slip, reference = _dynamic_capstan_example_metrics(device)
         test.assertEqual(mus[0], 0.0, f"VBD dynamic capstan example should keep zero friction first: {mus}")
         test.assertGreater(mus[1], 0.0, f"VBD dynamic capstan example mid friction should be finite: {mus}")
         test.assertGreaterEqual(
@@ -1355,9 +1380,7 @@ def test_vbd_dynamic_capstan_example_friction_modes(test, device):
         slip_mid = slip[1]
         slip_high = slip[2]
         test.assertLess(abs(theta_low), 0.08, f"VBD example zero-mu pulley should not rotate: theta={theta_low:.5f}")
-        test.assertGreater(
-            theta_mid, 0.25, f"VBD example mid-mu pulley should rotate in cable direction: {theta_mid:.5f}"
-        )
+        np.testing.assert_allclose(theta[1:], reference, rtol=0.10, atol=0.003)
         # Both finite coefficients support sticking in this setup. Friction
         # sets a limit, not a multiplier on the transported cable length.
         np.testing.assert_allclose(theta_mid, theta_high, rtol=0.03, atol=0.003)
@@ -1644,6 +1667,7 @@ def test_vbd_equal_weight_atwood(test, device):
                 model.collide(state_0, contacts)
                 solver.step(state_0, state_1, control, contacts, dt)
                 state_0, state_1 = state_1, state_0
+            assert_supported_atwood_wrap(solver)
 
         bq = state_0.body_q.numpy()
         y_left = float(bq[left_idx][2])
@@ -1746,6 +1770,9 @@ def test_vbd_xy_table_tracks_reference_prefix(test, device):
         solver_kwargs = dict(TENDON_VBD_SOLVER_KWARGS)
         solver_kwargs["iterations"] = 30
         solver_kwargs["rigid_tendon_relaxation"] = 0.6
+        # Preserve this reference mechanism's intended joint stiffness under
+        # compliant ALM; the legacy k_start entry no longer sets that stiffness.
+        solver_kwargs.update(STIFF_REVOLUTE_ANCHOR_OVERRIDES)
         example.solver = newton.solvers.SolverVBD(example.model, **solver_kwargs)
         example._apply_cable_pretension(0.99995)
 
@@ -1778,9 +1805,7 @@ def test_vbd_xy_table_tracks_reference_prefix(test, device):
 VBD_EXAMPLE_ASSERTION_CASES = (
     ("vbd_tendon_pulley_example_assertions", PulleyExample, 100, True, set()),
     ("vbd_tendon_pinhole_example_assertions", PinholeExample, 100, True, set()),
-    # Known failure, inherited and shared with XPBD (test_examples runs the same 180 frames): the light
-    # weight reaches the pulley crown at frame ~154. Recorded explicitly rather than shortening the run.
-    ("vbd_tendon_rolling_pulley_example_assertions", RollingPulleyExample, 180, True, {"cuda:0"}),
+    ("vbd_tendon_rolling_pulley_example_assertions", RollingPulleyExample, 180, True, set()),
     ("vbd_tendon_equilibrium_example_assertions", EquilibriumExample, 100, True, set()),
     ("vbd_tendon_gear_pulley_example_assertions", GearPulleyExample, 180, True, set()),
     ("vbd_tendon_cable_machine_example_assertions", CableMachineExample, 100, True, set()),
@@ -2081,13 +2106,16 @@ def test_vbd_tendon_alm_multiplier_shared_across_frictional_roller(test, device)
                 state_0, state_1 = state_1, state_0
 
         lam = solver.tendon_seg_alm_lambda.numpy()
-        length = np.linalg.norm(solver.tendon_seg_attachment_r.numpy() - solver.tendon_seg_attachment_l.numpy(), axis=1)
         compliance = solver.tendon_seg_active_compliance.numpy()
-        stretch = length - solver.tendon_seg_rest_length.numpy()
+        # Read the projected stretch directly. At this friction ratio the
+        # low-tension span's extension is smaller than a float32 length ULP;
+        # reconstructing length - rest rounds it to zero.
+        stretch = solver.tendon_seg_stretch.numpy()
         material = np.maximum(stretch, 0.0) / compliance
         cap_ratio = float(solver.tendon_link_cap_ratio.numpy()[1])
 
         test.assertGreater(cap_ratio, 1.0, "the pulley must be a live frictional link")
+        test.assertGreater(float(material.min()), 0.0, f"both material rows must carry tension: {material}")
         test.assertGreater(
             float(material.max()) / float(material.min()), 1.2, f"material row must be banded: {material}"
         )
@@ -2200,10 +2228,6 @@ add_test(
     devices,
     test_vbd_sigmoid_stretch_uses_material_tangent,
 )
-# Contract conflict, pending the circular-port owner: the condensed VBD row uses the signed Kelvin-Voigt law
-# (see test_tendon_circular_damping), so a fast-extending slack span transmits damping tension. A force-free
-# slack span needs a complementarity treatment at the taut boundary; record the conflict explicitly.
-test_vbd_slack_damped_tendon_remains_force_free.__unittest_expecting_failure__ = True
 add_test(
     TestTendonVBD,
     "vbd_slack_damped_tendon_remains_force_free",
@@ -2230,9 +2254,9 @@ add_test(
 )
 add_test(
     TestTendonVBD,
-    "vbd_rolling_spin_does_not_add_damping_tension",
+    "vbd_rolling_spin_reports_contact_damping",
     devices,
-    test_vbd_rolling_spin_does_not_add_damping_tension,
+    test_vbd_rolling_spin_reports_contact_damping,
 )
 add_test(
     TestTendonVBD,
@@ -2342,6 +2366,24 @@ for name, example_cls, num_frames, skip_cpu, expected_failure_devices in VBD_EXA
     test_fn = _make_vbd_example_assertion_test(example_cls, num_frames, skip_cpu=skip_cpu, solver_overrides=overrides)
     test_fn.__unittest_expected_failure_devices__ = expected_failure_devices
     add_test(TestTendonVBD, name, devices, test_fn)
+
+
+for name, example_cls, num_frames in (
+    ("vbd_sparse_tendon_pulley_example_assertions", PulleyExample, 100),
+    ("vbd_sparse_tendon_capstan_example_assertions", DynamicCapstanExample, 100),
+    ("vbd_sparse_tendon_3d_routing_example_assertions", Routing3DExample, 70),
+):
+    add_test(
+        TestTendonVBD,
+        name,
+        devices,
+        _make_vbd_example_assertion_test(
+            example_cls,
+            num_frames,
+            skip_cpu=True,
+            solver_overrides={"rigid_articulation_solve": "block_sparse_joints"},
+        ),
+    )
 
 
 if __name__ == "__main__":

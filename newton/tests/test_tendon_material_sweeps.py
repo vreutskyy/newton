@@ -8,11 +8,14 @@ import unittest
 import numpy as np
 import warp as wp
 
+import newton
 from newton._src.sim.tendon import TendonLinkType
-from newton._src.solvers.tendon_kernels import solve_tendon_material
+from newton._src.solvers.tendon_kernels import _material_sweep_contact_error, solve_tendon_material
+from newton._src.solvers.tendon_material_slack import TendonSlackBlock
 from newton._src.solvers.tendon_material_state import TendonMaterialState
 from newton._src.solvers.vbd.tendon_kernels import _rolling_spin_axis_component
 from newton._src.solvers.xpbd.tendon_kernels import solve_tendon_slip
+from newton.tests.test_tendon_material_integration import _chain_model
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
@@ -82,6 +85,19 @@ def material_rest(length, tension):
     return (lo + hi) * 0.5
 
 
+def damped_material_rest(length, tension, raw_damping, damping_rate):
+    """Invert the full engaged force independently of the production projection."""
+    lo, hi = length * 0.5, length
+    for _ in range(70):
+        mid = (lo + hi) * 0.5
+        force = max(material_tension(length, mid) + min(raw_damping, damping_rate * (length - mid)), 0.0)
+        if force > tension:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) * 0.5
+
+
 def solve_material_case(
     device,
     tensions,
@@ -90,13 +106,17 @@ def solve_material_case(
     rolling_right=None,
     sweeps=256,
     tol=1.0e-6,
+    atol=1.0e-6,
     nonlinear=False,
     damping_tensions=None,
+    segment_compliance=0.01,
+    direct=False,
+    capture=False,
 ):
     """Hold geometry fixed and exercise the production material-transfer kernel."""
     count = len(tensions)
     length = np.ones(count, dtype=np.float32)
-    compliance = np.full(count, 0.01, dtype=np.float32)
+    compliance = np.full(count, segment_compliance, dtype=np.float32)
     rest = length - compliance * np.asarray(tensions, dtype=np.float32)
     damping_values = (
         np.zeros(count, dtype=np.float32)
@@ -111,6 +131,8 @@ def solve_material_case(
         rest += compliance * damping_values
     active = wp.ones(count, dtype=int, device=device)
     length_gpu = wp.array(length, device=device)
+    compliance_gpu = wp.array(compliance, device=device)
+    damping_coefficient = wp.ones(count, device=device)
     rest_gpu = wp.array(rest, device=device)
     stretch = wp.zeros(count, device=device)
     damping = wp.zeros(count, device=device)
@@ -148,8 +170,8 @@ def solve_material_case(
         active,
         wp.array(np.arange(count), dtype=int, device=device),
         wp.array(np.arange(1, count + 1), dtype=int, device=device),
-        wp.array(compliance, device=device),
-        wp.ones(count, device=device),
+        compliance_gpu,
+        damping_coefficient,
         link_active,
         link_active,
         wp.zeros(count + 1, device=device),
@@ -171,6 +193,7 @@ def solve_material_case(
         1,
         sweeps,
         tol,
+        atol,
         2000.0 if nonlinear else 0.0,
         16.0,
         0.005,
@@ -178,8 +201,37 @@ def solve_material_case(
         wp.zeros(count + 1, device=device),
     ]
     inputs.insert(8, wp.ones(count + 1, dtype=int, device=device))
-    inputs[-1:-1] = [TendonMaterialState(), 0]
-    wp.launch(solve_tendon_material, dim=1, inputs=inputs, device=device)
+    workspace = TendonMaterialState()
+    workspace.slack_enabled = True
+    workspace.slack = wp.zeros(count, dtype=int, device=device)
+    workspace.slack_blocks = wp.zeros(count, dtype=TendonSlackBlock, device=device)
+    kernel, lanes, block_dim = solve_tendon_material, 1, 256
+    if direct:
+        model = _chain_model(device, span_count=count)
+        solver = newton.solvers.SolverXPBD(
+            model,
+            tendon_material_direct=True,
+            tendon_sigmoid_ea_low=2000.0 if nonlinear else 0.0,
+            tendon_sigmoid_ea_ratio=16.0,
+            tendon_sigmoid_transition_strain=0.005,
+            tendon_sigmoid_transition_width=0.0008,
+        )
+        workspace = solver._tendon_material_state
+        workspace.alm.length = length_gpu
+        workspace.alm.physical_compliance = compliance_gpu
+        workspace.alm.damping = damping_coefficient
+        workspace.alm.damping_force = damping
+        kernel = solver._tendon_material_kernel
+        lanes = solver._tendon_material_lanes
+        block_dim = solver._tendon_material_block_dim
+    inputs[-1:-1] = [workspace, 0]
+    wp.launch(kernel, dim=lanes, inputs=inputs, device=device, block_dim=block_dim)
+    if capture:
+        with wp.ScopedCapture(device=device) as graph:
+            wp.launch(kernel, dim=lanes, inputs=inputs, device=device, block_dim=block_dim)
+        wp.capture_launch(graph.graph)
+    if direct:
+        solver.check_tendon_material()
     stretch_np = stretch.numpy()
     result = np.maximum(stretch_np / compliance + damping.numpy(), 0.0)
     if nonlinear:
@@ -189,6 +241,219 @@ def solve_material_case(
             0.0,
         )
     return result, rest_gpu.numpy(), rest, int(sweep_count.numpy()[0])
+
+
+def test_adaptive_sweeps_check_final_force_scale(test, device):
+    """Resolve small final tensions after a much larger transient material load."""
+    for reverse in (False, True):
+        initial = [-40.0, 40.0, 0.03]
+        ratios = [1.2, 1.4]
+        if reverse:
+            initial = initial[::-1]
+            ratios = ratios[::-1]
+        with test.subTest(reverse=reverse):
+            tension, rest, initial_rest, count = solve_material_case(device, initial, ratios, tol=1.0e-3)
+            full, _, _, _ = solve_material_case(device, initial, ratios, tol=0.0)
+            for left, right, rho in zip(tension[:-1], tension[1:], ratios, strict=True):
+                error = max(left - rho * right, right - rho * left, 0.0)
+                test.assertLessEqual(error, 1.0e-6 + 1.0e-3 * max(left, right))
+            np.testing.assert_allclose(tension, full, atol=3.0e-6, rtol=5.0e-3)
+            np.testing.assert_allclose(rest.sum(), initial_rest.sum(), atol=3.0e-7, rtol=0)
+            test.assertLess(count, 256, "Converged material should stop before exhausting its budget")
+
+
+def test_adaptive_sweeps_preserve_small_corrections(test, device):
+    """Resolve small force corrections after transferring much more material."""
+    for reverse in (False, True):
+        initial = [-1.0e5, 1.0e5, 100.0]
+        ratios = [1.2, 1.4]
+        if reverse:
+            initial = initial[::-1]
+            ratios = ratios[::-1]
+        with test.subTest(reverse=reverse):
+            tension, rest, initial_rest, count = solve_material_case(
+                device, initial, ratios, tol=1.0e-6, segment_compliance=1.0e-8
+            )
+            for left, right, rho in zip(tension[:-1], tension[1:], ratios, strict=True):
+                error = max(left - rho * right, right - rho * left, 0.0)
+                test.assertLessEqual(error, 1.0e-6 + 1.0e-6 * max(left, right))
+            test.assertLess(count, 256)
+            np.testing.assert_allclose(rest.sum(), initial_rest.sum(), atol=3.0e-7, rtol=0)
+
+
+def test_adaptive_sweeps_stop_at_satisfied_projection(test, device):
+    """Stop once the final friction law is satisfied, even after a large update."""
+    for reverse in (False, True):
+        initial = [30.0, 0.0] if not reverse else [0.0, 30.0]
+        expected = [20.0, 10.0] if not reverse else [10.0, 20.0]
+        with test.subTest(reverse=reverse):
+            tension, rest, initial_rest, count = solve_material_case(device, initial, [2.0], tol=1.0e-3)
+            np.testing.assert_allclose(tension, expected, atol=1.0e-5, rtol=0)
+            np.testing.assert_allclose(rest.sum(), initial_rest.sum(), atol=3.0e-7, rtol=0)
+            test.assertEqual(count, 1, "A satisfied two-span projection needs no further sweep")
+
+
+def test_adaptive_sweeps_absolute_tolerance(test, device):
+    """Stop an unloading cable without chasing a shrinking relative force scale."""
+    tension, rest, initial, count = solve_material_case(
+        device, [-40.0, 40.0, -0.01], [1.2, 1.4], tol=1.0e-3, atol=1.0e-6
+    )
+    test.assertLessEqual(float(tension.max()), 2.0e-6)
+    test.assertLess(count, 128)
+    np.testing.assert_allclose(rest.sum(), initial.sum(), atol=3.0e-7, rtol=0)
+    _, _, _, full_count = solve_material_case(device, [0, 0, 0], [1.2, 1.4], sweeps=16, tol=0.0)
+    test.assertEqual(full_count, 16, "Zero relative tolerance retains the explicit full-budget policy")
+
+
+def test_adaptive_sweeps_honor_large_budget(test, device):
+    """Resolve a long finite-friction chain beyond the former 256-sweep cap."""
+    span_count = 32
+    rho = 1.01
+    initial = [10.0] + [0.0] * (span_count - 1)
+    ratios = [rho] * (span_count - 1)
+    for capture in (False, True) if device.is_cuda else (False,):
+        with test.subTest(capture=capture):
+            tension, rest, initial_rest, count = solve_material_case(
+                device, initial, ratios, sweeps=4096, tol=1.0e-5, atol=1.0e-7, capture=capture
+            )
+            # Material moves right across every junction, so T_i = T_0 / rho**i.
+            # Conservation fixes T_0 independently of either material solver.
+            scale = np.power(rho, -np.arange(span_count))
+            extension = np.sum(1.0 - initial_rest.astype(np.float64))
+            expected = scale * extension / (0.01 * scale.sum())
+            test.assertGreater(count, 256)
+            test.assertLess(count, 4096, "The larger budget should permit adaptive convergence")
+            np.testing.assert_allclose(tension, expected, atol=2.0e-4, rtol=0.0)
+            np.testing.assert_allclose(rest.sum(), initial_rest.sum(), atol=4.0e-6, rtol=0.0)
+
+    _, _, _, count = solve_material_case(device, [1.0, 1.0], [rho], sweeps=512, tol=0.0)
+    test.assertEqual(count, 512, "Disabling early-out must execute the requested budget")
+
+
+def test_solver_entry_points_honor_large_sweep_budget(test, device):
+    """Accept and execute a large material budget through both public solvers."""
+    model = _chain_model(device)
+    budget = 1024
+    for solver_type in (newton.solvers.SolverXPBD, newton.solvers.SolverVBD):
+        with test.subTest(solver=solver_type.__name__):
+            solver = solver_type(model, iterations=1, tendon_max_sweeps=budget, tendon_settle_tol=0.0)
+            state, result, control = model.state(), model.state(), model.control()
+            solver.step(state, result, control, None, 1.0 / 240.0)
+            np.testing.assert_array_equal(solver.tendon_cone_sweep_count.numpy(), [budget])
+            if wp.get_device(device).is_cuda:
+                with wp.ScopedCapture(device=device) as captured:
+                    solver.step(state, result, control, None, 1.0 / 240.0)
+                wp.capture_launch(captured.graph)
+                np.testing.assert_array_equal(solver.tendon_cone_sweep_count.numpy(), [budget])
+
+
+def test_slack_component_has_exact_zero_force(test, device):
+    """Release fully slack finite-friction components without fictitious stiffness."""
+    for solver_type in (newton.solvers.SolverXPBD, newton.solvers.SolverVBD):
+        for reverse in (False, True):
+            with test.subTest(solver=solver_type.__name__, reverse=reverse):
+                builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+                body = builder.add_body(mass=0.0, is_kinematic=True)
+                builder.add_tendon()
+                rests = [1.4, 0.6, 1.01]
+                if reverse:
+                    rests.reverse()
+                for index, point in enumerate(((0, 0, 0), (1, 0, 0), (1, 1, 0), (2, 1, 0))):
+                    builder.add_tendon_link(
+                        body,
+                        offset=point,
+                        link_type=TendonLinkType.PINHOLE if index in (1, 2) else TendonLinkType.ATTACHMENT,
+                        mu=0.2,
+                        compliance=0.01,
+                        rest_length=1.0 if index == 0 else rests[index - 1],
+                    )
+                builder.color()
+                model = builder.finalize(device=device)
+                solver = solver_type(model, iterations=1)
+                initial = solver.tendon_seg_rest_length.numpy().astype(np.float64)
+                state, next_state = model.state(), model.state()
+                solver.step(state, next_state, model.control(), None, 1.0 / 240.0)
+                test.assertTrue(np.all(solver.tendon_link_cap_ratio.numpy()[1:3] > 1.0))
+                test.assertTrue(np.all(solver.tendon_seg_stretch.numpy() <= 0.0))
+                np.testing.assert_allclose(solver.tendon_seg_rest_length.numpy().sum(), initial.sum(), atol=3.0e-7)
+                if solver_type is newton.solvers.SolverVBD:
+                    np.testing.assert_array_equal(solver.tendon_material_modes.numpy()["tension"], 0.0)
+                    np.testing.assert_array_equal(solver.tendon_material_modes.numpy()["stiffness"], 0.0)
+
+
+def test_slack_projection_stops_at_anchor(test, device):
+    """Keep a loaded component isolated from slack across an interior anchor."""
+    for solver_type in (newton.solvers.SolverXPBD, newton.solvers.SolverVBD):
+        with test.subTest(solver=solver_type.__name__):
+            builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+            body = builder.add_body(mass=0.0, is_kinematic=True)
+            builder.add_tendon()
+            rests = [1.01, 0.6, 1.4, 0.9, 0.8]
+            points = ((0, 0, 0), (1, 0, 0), (1, 1, 0), (2, 1, 0), (2, 2, 0), (3, 2, 0))
+            for index, point in enumerate(points):
+                builder.add_tendon_link(
+                    body,
+                    offset=point,
+                    link_type=TendonLinkType.ATTACHMENT if index in (0, 3, 5) else TendonLinkType.PINHOLE,
+                    mu=0.2,
+                    compliance=0.01,
+                    rest_length=1.0 if index == 0 else rests[index - 1],
+                )
+            builder.color()
+            model = builder.finalize(device=device)
+            solver = solver_type(model, iterations=1)
+            initial = solver.tendon_seg_rest_length.numpy().astype(np.float64)
+            solver.step(model.state(), model.state(), model.control(), None, 1.0 / 240.0)
+            np.testing.assert_array_equal(solver._tendon_material_state.slack.numpy(), [1, 1, 1, 0, 0])
+            test.assertTrue(np.all(solver.tendon_seg_stretch.numpy()[:3] <= 0.0))
+            test.assertTrue(np.all(solver.tendon_seg_stretch.numpy()[3:] > 0.0))
+            final = solver.tendon_seg_rest_length.numpy().astype(np.float64)
+            for region in (slice(0, 3), slice(3, 5)):
+                np.testing.assert_allclose(final[region].sum(), initial[region].sum(), atol=3e-7, rtol=0)
+
+
+@wp.kernel
+def _evaluate_contact_error(values: wp.array2d[float], result: wp.array[float]):
+    """Evaluate force residuals for independently specified contact states."""
+    i = wp.tid()
+    result[i] = _material_sweep_contact_error(values[i, 0], values[i, 1], values[i, 2], values[i, 3])
+
+
+def test_material_convergence_requires_slip_boundary(test, device):
+    """Reject excess net slip even when the resulting tension lies inside the band."""
+    rows = [
+        [1.5, 1.0, 2.0, 0.0],
+        [1.5, 1.0, 2.0, 0.1],
+        [1.0, 1.5, 2.0, -0.1],
+        [2.0, 1.0, 2.0, 0.1],
+        [1.0, 2.0, 2.0, -0.1],
+        [3.0, 1.0, 2.0, 0.0],
+        [0.0, 0.0, 2.0, 0.1],
+    ]
+    errors = wp.empty(len(rows), dtype=float, device=device)
+    wp.launch(
+        _evaluate_contact_error,
+        dim=len(rows),
+        inputs=[wp.array(rows, dtype=float, device=device)],
+        outputs=[errors],
+        device=device,
+    )
+    np.testing.assert_allclose(errors.numpy(), [0.0, 0.5, 0.5, 0.0, 0.0, 1.0, 0.0], atol=1e-7, rtol=0)
+
+
+def test_material_sweep_tolerances_are_validated(test, device):
+    """Reject invalid tolerances and sweep budgets consistently in both solvers."""
+    model = newton.ModelBuilder().finalize(device=device)
+    for solver_type in (newton.solvers.SolverXPBD, newton.solvers.SolverVBD):
+        for budget in (0, -1, 2**31, 1.5, float("nan"), float("inf")):
+            with test.subTest(solver=solver_type.__name__, budget=budget):
+                with test.assertRaisesRegex(ValueError, "tendon_max_sweeps"):
+                    solver_type(model, tendon_max_sweeps=budget)
+        for name in ("tendon_settle_tol", "tendon_settle_atol"):
+            for value in (-1.0, float("nan"), float("inf")):
+                with test.subTest(solver=solver_type.__name__, parameter=name, value=value):
+                    with test.assertRaisesRegex(ValueError, name):
+                        solver_type(model, **{name: value})
 
 
 def test_net_slip_reaches_capstan_boundary(test, device):
@@ -238,7 +503,7 @@ def test_damped_nonlinear_net_slip(test, device):
                     for _ in range(70):
                         mid = (lo + hi) * 0.5
                         total = sum(
-                            material_rest(1.0, t - d)
+                            damped_material_rest(1.0, t, d, 60.0)
                             for t, d in zip([rho[0] * mid, mid, rho[1] * mid], damping, strict=True)
                         )
                         if total > initial.astype(float).sum():
@@ -251,6 +516,44 @@ def test_damped_nonlinear_net_slip(test, device):
                     middle = initial_tension.sum() / (1 + rho[0] + rho[1])
                 np.testing.assert_allclose(tension, [rho[0] * middle, middle, rho[1] * middle], atol=0.002, rtol=3.0e-4)
                 np.testing.assert_allclose(rest.sum(), initial.sum(), atol=3.0e-7, rtol=0)
+
+
+def test_damping_engagement_material_projection(test, device):
+    """Match direct and sweep transfer to the full finite-friction force law."""
+    for nonlinear in (False, True):
+        for direct in (False, True):
+            for raw in ([0.5, -0.2, 0.3], [20.0, 0.0, 50.0], [-2.0, 40.0, 0.5]):
+                with test.subTest(nonlinear=nonlinear, direct=direct, damping=raw):
+                    ratios = np.array([1.4, 1.2])
+                    tension, rest, initial, _ = solve_material_case(
+                        device,
+                        [9, 1, 9],
+                        ratios,
+                        nonlinear=nonlinear,
+                        damping_tensions=raw,
+                        direct=direct,
+                        capture=device.is_cuda,
+                    )
+                    extension = 1.0 - rest.astype(float)
+
+                    # The initial allocation is generated from nominal tensions;
+                    # the reference uses the actual resulting rest lengths.
+                    elastic = extension / float(np.float32(0.01))
+                    if nonlinear:
+                        elastic = np.array([material_tension(1.0, 1.0 - x) for x in extension])
+                    actual = np.maximum(elastic + np.minimum(raw, 60.0 * np.maximum(extension, 0.0)), 0.0)
+                    np.testing.assert_allclose(tension, actual, atol=0.002, rtol=3.0e-4)
+                    np.testing.assert_allclose(rest.sum(), initial.sum(), atol=3.0e-7, rtol=0)
+                    flow = np.cumsum(rest.astype(float) - initial.astype(float))
+                    for i, ratio in enumerate(ratios):
+                        left, right = actual[i : i + 2]
+                        tolerance = 0.003 + 4.0e-4 * max(left, right)
+                        test.assertLessEqual(left - ratio * right, tolerance)
+                        test.assertLessEqual(right - ratio * left, tolerance)
+                        if flow[i] > 1.0e-6:
+                            test.assertLessEqual(abs(left - ratio * right), tolerance)
+                        elif flow[i] < -1.0e-6:
+                            test.assertLessEqual(abs(right - ratio * left), tolerance)
 
 
 def test_slack_span_and_sticking_contact(test, device):
@@ -387,6 +690,66 @@ def test_vbd_spin_reaction_matches_capstan_projection(test, device):
 
 devices = get_test_devices()
 add_function_test(
+    TestTendonMaterialSweeps,
+    "test_adaptive_sweeps_stop_at_satisfied_projection",
+    test_adaptive_sweeps_stop_at_satisfied_projection,
+    devices=devices,
+)
+add_function_test(
+    TestTendonMaterialSweeps,
+    "test_adaptive_sweeps_absolute_tolerance",
+    test_adaptive_sweeps_absolute_tolerance,
+    devices=devices,
+)
+add_function_test(
+    TestTendonMaterialSweeps,
+    "test_material_convergence_requires_slip_boundary",
+    test_material_convergence_requires_slip_boundary,
+    devices=devices,
+)
+add_function_test(
+    TestTendonMaterialSweeps,
+    "test_material_sweep_tolerances_are_validated",
+    test_material_sweep_tolerances_are_validated,
+    devices=devices,
+)
+add_function_test(
+    TestTendonMaterialSweeps,
+    "test_adaptive_sweeps_check_final_force_scale",
+    test_adaptive_sweeps_check_final_force_scale,
+    devices=devices,
+)
+add_function_test(
+    TestTendonMaterialSweeps,
+    "test_adaptive_sweeps_honor_large_budget",
+    test_adaptive_sweeps_honor_large_budget,
+    devices=devices,
+)
+add_function_test(
+    TestTendonMaterialSweeps,
+    "test_solver_entry_points_honor_large_sweep_budget",
+    test_solver_entry_points_honor_large_sweep_budget,
+    devices=devices,
+)
+add_function_test(
+    TestTendonMaterialSweeps,
+    "test_slack_component_has_exact_zero_force",
+    test_slack_component_has_exact_zero_force,
+    devices=devices,
+)
+add_function_test(
+    TestTendonMaterialSweeps,
+    "test_slack_projection_stops_at_anchor",
+    test_slack_projection_stops_at_anchor,
+    devices=devices,
+)
+add_function_test(
+    TestTendonMaterialSweeps,
+    "test_adaptive_sweeps_preserve_small_corrections",
+    test_adaptive_sweeps_preserve_small_corrections,
+    devices=devices,
+)
+add_function_test(
     TestTendonMaterialSweeps, "test_rolling_grip_requires_tension", test_rolling_grip_requires_tension, devices=devices
 )
 add_function_test(
@@ -409,6 +772,12 @@ add_function_test(
 )
 add_function_test(
     TestTendonMaterialSweeps, "test_damped_nonlinear_net_slip", test_damped_nonlinear_net_slip, devices=devices
+)
+add_function_test(
+    TestTendonMaterialSweeps,
+    "test_damping_engagement_material_projection",
+    test_damping_engagement_material_projection,
+    devices=devices,
 )
 add_function_test(
     TestTendonMaterialSweeps,

@@ -617,14 +617,15 @@ class TestTendonMaterialVBD(unittest.TestCase):
 
         solver = _make_solver(model, iterations=8)
         state = model.state()
-        solver.tendon_seg_route_rest_length.assign(np.full(model.tendon_segment_count, 0.5, dtype=np.float32))
-        held = solver.tendon_seg_rest_length.numpy().copy()
-        stretch = solver.tendon_seg_stretch.numpy().copy()
+        held = np.array([0.5, 0.6], dtype=np.float32)
+        solver.tendon_seg_route_rest_length.assign(held)
 
         solver._update_tendon_routing(state, 0.001, False, skip_material=True)
-        np.testing.assert_array_equal(solver.tendon_seg_rest_length.numpy(), 0.5)
-        np.testing.assert_array_equal(solver.tendon_seg_stretch.numpy(), stretch)
-        # The route geometry itself is still refreshed for the body solve.
+        np.testing.assert_array_equal(solver.tendon_seg_rest_length.numpy(), held)
+        # The hold freezes material allocation, not the extension/force used
+        # by the body solve at the current pose.
+        np.testing.assert_array_equal(solver.tendon_seg_stretch.numpy(), solver.tendon_seg_length.numpy() - held)
+        np.testing.assert_array_equal(solver._tendon_link_material_transfer.numpy(), 0.0)
         self.assertTrue(np.all(solver.tendon_seg_length.numpy() > 0.0))
 
         solver._update_tendon_routing(state, 0.001, False)
@@ -735,7 +736,7 @@ def _hold_iteration_tension(solver, model, state, dt):
     """Run the step-start route update and one settle-hold routing update, as ``step`` does."""
     solver._snapshot_tendon_step_state()
     solver._update_tendon_link_active(model, state.body_q)
-    solver._prepare_tendon_route(model, state.body_q, 1.0e-8)
+    solver._prepare_tendon_route(model, 1.0e-8)
     solver._update_tendon_routing(state, dt, False, skip_material=True)
     return _span_tension(solver)
 

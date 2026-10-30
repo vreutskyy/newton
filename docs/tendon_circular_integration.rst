@@ -28,12 +28,28 @@ Current-main adaptation
 -----------------------
 
 This forward port preserves current-main joint ALM, observables, restitution,
-angular winding, mimic support, and the tendon-free sparse articulation solver.
-Tendons currently require local VBD with VBD-owned rigid integration. Combining
-tendons with ``block_sparse_joints`` or an external rigid solver is rejected.
+angular winding, mimic support, and the sparse articulation solver.
+Spring-damper tendons support local VBD, ``block_sparse_joints``, and
+``block_sparse_levels`` with VBD-owned rigid integration. The sparse path assembles cross-body tendon
+stiffness and merges articulations connected by a tendon. Sliding interfaces
+use positive friction secants without changing the projected material forces.
+Tendon ALM still requires local VBD; tendon models with an external rigid
+solver are rejected. Sparse tendon coupling is limited to rigid articulations:
+a tendon touching an articulation containing reduced elastic bodies is
+rejected. Independent elastic articulations remain supported, using the
+selected coupled or Schur backend. Tendon merging preserves the rigid prefix
+of that layout; it does not change elastic-body assembly.
+
+These are runtime solver options, not new authorable model properties, so
+this change does not add a USD schema or importer extension.
 The separate legacy ``rigid_joint_limit_alm=True`` experiment has not been
 ported over current-main joint ALM; the compatibility argument accepts False.
-This restriction does not disable tendon ALM.
+This restriction does not disable tendon ALM in local VBD.
+
+Material convergence is separate from the number of body iterations. Long
+routes with stiff, short spans can require a larger ``tendon_max_sweeps`` and
+tighter ``tendon_settle_tol``, or the optional direct material solve. Sparse
+coupling does not make an underconverged material projection accurate.
 
 Tendon links require an existing body. Use an explicit zero-mass body for a
 fixed world anchor. Builder copies and replication remap tendon body and link

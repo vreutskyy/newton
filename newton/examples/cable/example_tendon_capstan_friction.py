@@ -19,9 +19,8 @@
 # The XPBD constraint solver couples the pulley's rotational inertia
 # I/R^2 to the system through the shared body.  The capstan bound
 # activates only when the required tension ratio exceeds exp(mu*theta).
-# The pulleys use explicit high inertia and the planar weights keep a
-# fixed orientation so contact with the pulley does not tumble the
-# light body over the rim.
+# The pulleys use explicit high inertia. Vertical guides and travel stops
+# keep the weights below the pulleys and within the supported wrap range.
 # Friction above the sticking threshold should not further change the motion.
 # The red tab on each pulley marks rim rotation; the frictionless pulley
 # should translate the cable without spinning.
@@ -35,8 +34,7 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton._src.sim.builder import Axis
-from newton._src.sim.tendon import TendonLinkType
+from newton import Axis, TendonLinkType
 from newton.examples.cable.cable import (
     assert_tendon_total_length,
     get_tendon_attachment_worlds,
@@ -61,6 +59,7 @@ class Example:
 
         self.pulley_radius = 0.22
         self.pulley_z = 4.1
+        self.weight_travel = 1.2
         pulley_mass = 40.0
         pulley_inertia_y = 0.90
         pulley_inertia = wp.mat33(
@@ -80,12 +79,12 @@ class Example:
         mass_light = 1.0
         mass_heavy = 1.2
         contact_cfg = newton.ModelBuilder.ShapeConfig(mu=0.7, margin=0.01, gap=0.02)
+        left_cfg = contact_cfg.copy()
+        left_cfg.density = mass_light / (8.0 * 0.06**3)
+        right_cfg = contact_cfg.copy()
+        right_cfg.density = mass_heavy / (8.0 * 0.09**3)
 
         q_cyl = wp.quat(np.sin(np.pi / 4.0), 0.0, 0.0, np.cos(np.pi / 4.0))
-
-        Dof = newton.ModelBuilder.JointDofConfig
-        planar_lin = [Dof(axis=Axis.X), Dof(axis=Axis.Z)]
-        planar_ang = []
 
         self.pulley_indices = []
         self.left_indices = []
@@ -101,7 +100,7 @@ class Example:
 
         for mu, x_off in zip(self.mus, self.x_offsets, strict=True):
             pulley_pos = wp.vec3(x_off, 0.0, self.pulley_z)
-            pulley = builder.add_body(
+            pulley = builder.add_link(
                 xform=wp.transform(p=pulley_pos, q=wp.quat_identity()),
                 mass=pulley_mass,
                 inertia=pulley_inertia,
@@ -141,14 +140,15 @@ class Example:
             left_pos = wp.vec3(x_off - 0.4, 0.0, 2.0)
             left = builder.add_link(
                 xform=wp.transform(p=left_pos, q=wp.quat_identity()),
-                mass=mass_light,
+                mass=0.0,
             )
-            builder.add_shape_box(left, hx=0.06, hy=0.06, hz=0.06, cfg=contact_cfg)
-            j1 = builder.add_joint_d6(
+            builder.add_shape_box(left, hx=0.06, hy=0.06, hz=0.06, cfg=left_cfg)
+            j1 = builder.add_joint_prismatic(
                 parent=-1,
                 child=left,
-                linear_axes=planar_lin,
-                angular_axes=planar_ang,
+                axis=Axis.Z,
+                limit_lower=-self.weight_travel,
+                limit_upper=self.weight_travel,
                 parent_xform=wp.transform(p=left_pos),
                 child_xform=wp.transform(),
             )
@@ -158,14 +158,15 @@ class Example:
             right_pos = wp.vec3(x_off + 0.4, 0.0, 2.0)
             right = builder.add_link(
                 xform=wp.transform(p=right_pos, q=wp.quat_identity()),
-                mass=mass_heavy,
+                mass=0.0,
             )
-            builder.add_shape_box(right, hx=0.09, hy=0.09, hz=0.09, cfg=contact_cfg)
-            j2 = builder.add_joint_d6(
+            builder.add_shape_box(right, hx=0.09, hy=0.09, hz=0.09, cfg=right_cfg)
+            j2 = builder.add_joint_prismatic(
                 parent=-1,
                 child=right,
-                linear_axes=planar_lin,
-                angular_axes=planar_ang,
+                axis=Axis.Z,
+                limit_lower=-self.weight_travel,
+                limit_upper=self.weight_travel,
                 parent_xform=wp.transform(p=right_pos),
                 child_xform=wp.transform(),
             )
@@ -217,6 +218,16 @@ class Example:
         self.control = self.model.control()
         self.contacts = self.model.contacts()
 
+        # Small-travel no-slip reference, linearized at the initial geometry.
+        # A vertical weight moves R/cos(angle) per radian of pulley rotation.
+        a, b = get_tendon_attachment_worlds(self.solver, self.model, self.state_0)
+        direction = b[:2] - a[:2]
+        cosines = np.abs(direction[:, 2]) / np.linalg.norm(direction, axis=1)
+        moment_arms = self.pulley_radius / cosines
+        gravity_torque = 9.81 * (mass_heavy * moment_arms[1] - mass_light * moment_arms[0])
+        inertia = pulley_inertia_y + mass_light * moment_arms[0] ** 2 + mass_heavy * moment_arms[1] ** 2
+        self._initial_sticking_acceleration = gravity_torque / inertia
+
         if self.viewer is not None:
             self.viewer.set_model(self.model)
             self.viewer.set_camera(pos=wp.vec3(0.0, -6.0, 3.0), pitch=5.0, yaw=90.0)
@@ -262,17 +273,37 @@ class Example:
         self._left_position_history.append(np.array([body_q[idx][:3] for idx in self.left_indices], dtype=np.float64))
         self._right_position_history.append(np.array([body_q[idx][:3] for idx in self.right_indices], dtype=np.float64))
 
+    def _reference_sticking_rotation(self, num_frames):
+        """Estimate short-prefix rotation using the authored masses and initial geometry."""
+        steps = num_frames * self.sim_substeps
+        first = self.sim_substeps
+        # Rotation history starts after the first frame, not at t=0.
+        return 0.5 * self._initial_sticking_acceleration * self.sim_dt**2 * (steps * (steps + 1) - first * (first + 1))
+
     def _assert_light_attachments_stay_below_pulleys(self, attachments, body_q, label="Dynamic capstan"):
         for i, attachment in enumerate(attachments):
             pulley_center = body_q[self.pulley_indices[i]][:3]
-            side_limit = float(pulley_center[0] + self.pulley_radius)
-            assert float(attachment[0]) <= side_limit, (
-                f"{label} case {i} light weight should stay on the near side of the pulley: "
-                f"attachment_x={attachment[0]:.4f}, side_limit={side_limit:.4f}"
+            height_limit = float(pulley_center[2] - self.pulley_radius)
+            assert float(attachment[2]) < height_limit, (
+                f"{label} case {i} light attachment should stay below the pulley: "
+                f"attachment_z={attachment[2]:.4f}, height_limit={height_limit:.4f}"
             )
 
+    def _assert_supported_wraps(self):
+        # Both contacts are stored in the pulley's local frame. Comparing
+        # them there avoids mixing cached world contacts with a newer pose.
+        arrival = self.solver.tendon_seg_attachment_r_local.numpy()[::2]
+        departure = self.solver.tendon_seg_attachment_l_local.numpy()[1::2]
+        centers = self.model.tendon_link_offset.numpy()[1::3]
+        u, v = arrival - centers, departure - centers
+        angles = np.arctan2(np.cross(u, v)[:, 1], np.sum(u * v, axis=1))
+        assert np.all(np.isfinite(angles)) and np.all(angles >= -1.0e-5), (
+            f"Dynamic capstan left the supported half-wrap range: {np.degrees(angles)} degrees"
+        )
+
     def test_post_step(self):
-        assert_tendon_total_length(self, rel_tol=0.60)
+        self._assert_supported_wraps()
+        assert_tendon_total_length(self, rel_tol=0.005, allow_slack=True)
         body_q = self.state_0.body_q.numpy()
         assert np.isfinite(body_q).all(), "Dynamic capstan produced non-finite body state"
         if self._left_attachment_history:
@@ -291,7 +322,8 @@ class Example:
                 )
 
     def test_final(self):
-        assert_tendon_total_length(self, rel_tol=0.60)
+        self._assert_supported_wraps()
+        assert_tendon_total_length(self, rel_tol=0.005, allow_slack=True)
         body_q = self.state_0.body_q.numpy()
         assert np.isfinite(body_q).all(), "Non-finite values in body positions"
         if not self._pulley_rotation_history:
@@ -319,10 +351,8 @@ class Example:
             f"Dynamic capstan zero-friction pulley should not rotate before payload contact: "
             f"theta={capstan_theta[0]:.4f}, all={capstan_theta}"
         )
-        assert capstan_theta[1] > 0.25, (
-            f"Dynamic capstan middle finite-friction pulley should rotate with heavy-side cable travel before contact: "
-            f"theta={capstan_theta[1]:.4f}, all={capstan_theta}"
-        )
+        reference = self._reference_sticking_rotation(capstan_idx + 1)
+        np.testing.assert_allclose(capstan_theta[1:], reference, rtol=0.10, atol=0.003)
         assert np.isclose(capstan_theta[2], capstan_theta[1], rtol=0.03, atol=0.003), (
             f"Dynamic capstan sticking cases should have the same rotation before contact: "
             f"mid={capstan_theta[1]:.4f}, high={capstan_theta[2]:.4f}, all={capstan_theta}"

@@ -7,11 +7,13 @@ import ctypes.util
 import dataclasses
 import importlib.util
 import io
+import json
 import linecache
 import os
 import platform
 import re
 import shlex
+import subprocess
 import sys
 import tempfile
 import time
@@ -314,6 +316,44 @@ class StdErrCapture(StreamCapture):
 class StdOutCapture(StreamCapture):
     def __init__(self):
         super().__init__("stdout")
+
+
+def capture_native_stdout_in_subprocess(module: str, function: str, *, device: str, **arguments: Any) -> str:
+    """Capture an importable test fixture's native output through process exit.
+
+    Windows CPU kernels can use a separate C runtime whose stdout buffer is
+    neither redirected nor flushed by Python's runtime. An OS-level subprocess
+    pipe captures that output without weakening the diagnostic assertions.
+    Arguments must be JSON-serializable, and the fixture must accept device.
+    """
+    script = (
+        "import importlib, json, sys; sys.path[:] = json.loads(sys.argv[5]); import warp as wp; "
+        "wp.config.enable_cuda = sys.argv[3] != 'cpu'; "
+        "fixture = getattr(importlib.import_module(sys.argv[1]), sys.argv[2]); "
+        "fixture(device=sys.argv[3], **json.loads(sys.argv[4])); wp.synchronize()"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            *get_strict_warning_args(),
+            "-c",
+            script,
+            module,
+            function,
+            device,
+            json.dumps(arguments),
+            # Preserve the checkout selected by the parent test runner, even
+            # when its working directory contains another Newton checkout.
+            json.dumps(sys.path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(f"Native-output fixture failed ({result.returncode}):\n{result.stdout}\n{result.stderr}")
+    return result.stdout
 
 
 class CheckOutput:

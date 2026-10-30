@@ -42,10 +42,12 @@ def _apply_test_body_delta(
     position_residual=None,
     orientation_residual=None,
     orientation_residual_reference=None,
+    qd_in=None,
 ):
     """Apply one unconstrained body delta while preserving optional residual buffers."""
     identity_inertia = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-    qd_in = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+    if qd_in is None:
+        qd_in = wp.zeros(1, dtype=wp.spatial_vector, device=device)
     body_inertia = wp.array([identity_inertia], dtype=wp.mat33, device=device)
     body_inv_mass = wp.ones(1, dtype=float, device=device)
     body_inv_inertia = wp.array([identity_inertia], dtype=wp.mat33, device=device)
@@ -79,6 +81,66 @@ def _apply_test_body_delta(
         device=device,
     )
     return q_out, qd_out, position_residual, orientation_residual, orientation_residual_reference
+
+
+def test_xpbd_body_delta_preserves_small_velocities(test, device):
+    """Preserve small physical velocities and impulses without a hidden sleep threshold."""
+    pose = wp.array([wp.transform_identity()], dtype=wp.transform, device=device)
+    com = wp.zeros(1, dtype=wp.vec3, device=device)
+    direction = np.array([1.0, -0.5, 0.25, -0.25, 1.0, 0.5], dtype=np.float32)
+    for scale in (1.0e-8, 5.0e-5, 2.0e-4):
+        for existing in (False, True):
+            with test.subTest(scale=scale, existing=existing):
+                expected = direction * scale
+                velocity = expected if existing else np.zeros(6, dtype=np.float32)
+                impulse = np.zeros(6, dtype=np.float32) if existing else expected
+                _, result, _, _, _ = _apply_test_body_delta(
+                    device,
+                    pose,
+                    com,
+                    wp.array([impulse], dtype=wp.spatial_vector, device=device),
+                    qd_in=wp.array([velocity], dtype=wp.spatial_vector, device=device),
+                )
+                np.testing.assert_allclose(result.numpy()[0], expected, rtol=1.0e-6, atol=1.0e-12)
+
+
+def test_xpbd_small_torque_accumulates_on_revolute_body(test, device):
+    """Accelerate a hinged body even when each torque increment is below 1e-4 rad/s."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)), lock_inertia=True)
+    joint = builder.add_joint_revolute(parent=-1, child=body, axis=newton.Axis.Z)
+    builder.add_articulation([joint])
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverXPBD(model, iterations=4, angular_damping=0.0)
+    state, output = model.state(), model.state()
+    dt = 5.0e-4
+    torque = 0.01
+    steps = 40
+    for _ in range(steps):
+        state.body_f.assign([[0.0, 0.0, 0.0, 0.0, 0.0, torque]])
+        solver.step(state, output, None, None, dt)
+        state, output = output, state
+    test.assertAlmostEqual(float(state.body_qd.numpy()[body, 5]), steps * torque * dt, delta=1.0e-8)
+    q = state.body_q.numpy()[body]
+    expected_angle = torque * dt * dt * steps * (steps + 1) / 2
+    test.assertAlmostEqual(float(2 * np.arctan2(q[5], q[6])), expected_angle, delta=1.0e-9)
+
+
+def test_xpbd_small_velocity_gradients(test, device):
+    """Keep finite identity velocity gradients through a zero body correction."""
+    for speed in (0.0, 1.0e-8, 5.0e-5):
+        with test.subTest(speed=speed):
+            velocity = wp.array(
+                [[speed, 0, 0, 0, 0, speed]], dtype=wp.spatial_vector, device=device, requires_grad=True
+            )
+            pose = wp.array([wp.transform_identity()], dtype=wp.transform, device=device)
+            com = wp.zeros(1, dtype=wp.vec3, device=device)
+            impulse = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+            with wp.Tape() as tape:
+                _, result, _, _, _ = _apply_test_body_delta(device, pose, com, impulse, qd_in=velocity)
+            seed = wp.array([np.ones(6)], dtype=wp.spatial_vector, device=device)
+            tape.backward(grads={result: seed})
+            np.testing.assert_allclose(velocity.grad.numpy(), np.ones((1, 6)), atol=1.0e-6)
 
 
 def test_particle_particle_friction_uses_relative_velocity(test, device):
@@ -1502,7 +1564,7 @@ def test_articulation_contact_drift(test, device):
 
     Setup:
     - Load a quadruped URDF on its side on the ground plane.
-    - Let it settle for 2 seconds, then simulate for 3 more seconds.
+    - Let it settle for 5 seconds, then simulate for 3 more seconds.
     - Check that the root body hasn't drifted laterally.
     """
     builder = newton.ModelBuilder()
@@ -1548,8 +1610,9 @@ def test_articulation_contact_drift(test, device):
     sim_substeps = 10
     sim_dt = frame_dt / sim_substeps
 
-    # Let the quadruped settle after drop (2 seconds)
-    for _ in range(200):
+    # Joint relaxation continues beyond the initial drop: measuring after only
+    # two seconds includes settling rather than just steady contact drift.
+    for _ in range(500):
         for _ in range(sim_substeps):
             state_0.clear_forces()
             collision_pipeline.collide(state_0, contacts)
@@ -1576,10 +1639,10 @@ def test_articulation_contact_drift(test, device):
     drift_y = abs(final_y - initial_y)
     drift_xy = float(np.hypot(drift_x, drift_y))
 
-    # The root body should not drift more than 1 cm laterally over 3 seconds
+    # The settled root should not drift more than 1 mm laterally over 3 seconds
     # (Z is up, so X and Y are the lateral axes)
-    # Without the fix, Y drifts ~5.9 mm/s → ~1.8 cm over 3 seconds.
-    max_drift = 0.01
+    # Reversing the joint/contact solve order still violates this tighter bound.
+    max_drift = 0.001
     test.assertLess(
         drift_xy,
         max_drift,
@@ -2727,6 +2790,37 @@ def test_xpbd_joint_reaction_f_stable_after_convergence(test, device):
         rtol=0.0,
         atol=1.0e-6,
         err_msg="Joint reaction should not accumulate sub-resolution corrections after convergence",
+    )
+
+
+def test_xpbd_joint_small_offset_away_from_origin(test, device):
+    """Resolve small anchor errors in a translated, rotated joint frame."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    orientation = wp.quat_from_axis_angle(wp.normalize(wp.vec3(1.0, 2.0, 3.0)), 1.0)
+    pose = wp.transform(wp.vec3(10.0, 10.0, 10.0), orientation)
+    inertia = wp.mat33(np.eye(3))
+    parent = builder.add_link(xform=pose, mass=100.0, inertia=inertia)
+    child_pose = wp.transform(wp.vec3(10.001, 9.998, 10.003), orientation)
+    child = builder.add_link(xform=child_pose, mass=1.0, inertia=inertia)
+    free = builder.add_joint_free(parent)
+    ball = builder.add_joint_ball(parent, child)
+    builder.add_articulation([free, ball])
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverXPBD(model, iterations=1, joint_linear_relaxation=1.0, angular_damping=0.0)
+    state, result = model.state(), model.state()
+    initial_positions = state.body_q.numpy()[:, :3].astype(np.float64)
+    dt = 1.0e-3
+    solver.step(state, result, model.control(), None, dt)
+
+    # With both anchors at the COM, the three locked translations reduce to
+    # projecting the two masses onto their common mass-weighted position.
+    separation = initial_positions[child] - initial_positions[parent]
+    expected_velocity = np.zeros((2, 6))
+    expected_velocity[parent, :3] = separation / (101.0 * dt)
+    expected_velocity[child, :3] = -100.0 * expected_velocity[parent, :3]
+    np.testing.assert_allclose(result.body_qd.numpy(), expected_velocity, rtol=2.0e-6, atol=1.0e-7)
+    np.testing.assert_allclose(
+        solver.joint_reaction_f.numpy()[ball], expected_velocity[child] / dt, rtol=2.0e-6, atol=1.0e-4
     )
 
 
@@ -4108,6 +4202,27 @@ add_function_test(
 
 add_function_test(
     TestSolverXPBD,
+    "test_xpbd_body_delta_preserves_small_velocities",
+    test_xpbd_body_delta_preserves_small_velocities,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_small_torque_accumulates_on_revolute_body",
+    test_xpbd_small_torque_accumulates_on_revolute_body,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_small_velocity_gradients",
+    test_xpbd_small_velocity_gradients,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverXPBD,
     "test_xpbd_compensated_delta_matches_stored_com",
     test_xpbd_compensated_delta_matches_stored_com,
     devices=devices,
@@ -4134,6 +4249,14 @@ add_function_test(
     TestSolverXPBD,
     "test_xpbd_joint_reaction_f_stable_after_convergence",
     test_xpbd_joint_reaction_f_stable_after_convergence,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_joint_small_offset_away_from_origin",
+    test_xpbd_joint_small_offset_away_from_origin,
     devices=devices,
     check_output=False,
 )

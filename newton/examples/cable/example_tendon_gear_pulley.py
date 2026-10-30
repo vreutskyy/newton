@@ -58,7 +58,7 @@ class Example:
         weight_shape_cfg = newton.ModelBuilder.ShapeConfig(
             density=0.0,
             has_shape_collision=True,
-            collision_group=2,
+            collision_group=1,
             mu=0.7,
             margin=0.01,
             gap=0.02,
@@ -98,7 +98,7 @@ class Example:
         q_cyl = wp.quat(np.sin(np.pi / 4.0), 0.0, 0.0, np.cos(np.pi / 4.0))
 
         def add_pulley_body(pos, radius, label):
-            body = builder.add_body(
+            body = builder.add_link(
                 xform=wp.transform(p=pos, q=wp.quat_identity()),
                 mass=pulley_mass,
                 inertia=cylinder_inertia(pulley_mass, radius, pulley_half_height),
@@ -115,9 +115,11 @@ class Example:
             )
             return body
 
-        self.fixed_anchor_pos = wp.vec3(-0.70, 0.0, 4.36)
+        # Open the turns around both moving pulleys; the original nearly
+        # vertical layout required more than a half-wrap at these rollers.
+        self.fixed_anchor_pos = wp.vec3(0.0, 0.0, 4.36)
         self.upper_large_pos = wp.vec3(-0.66, 0.0, 4.18)
-        self.upper_small_pos = wp.vec3(-0.48, 0.0, 3.64)
+        self.upper_small_pos = wp.vec3(-0.85, 0.0, 3.64)
         self.redirect_pos = wp.vec3(0.92, 0.0, 4.02)
         self.lower_block_pos = wp.vec3(-0.58, 0.0, 1.46)
         self.moving_large_local = wp.vec3(-0.08, 0.0, 0.40)
@@ -374,7 +376,19 @@ class Example:
         fixed_error = np.linalg.norm(fixed_positions - self._fixed_pulley_positions, axis=1)
         self._axis_error_history.append(np.concatenate([moving_error, fixed_error]))
 
+    def _assert_supported_wraps(self):
+        centers = self.model.tendon_link_offset.numpy()[1:-1]
+        axes = self.model.tendon_link_axis.numpy()[1:-1]
+        arrival = self.solver.tendon_seg_attachment_r_local.numpy()[:-1] - centers
+        departure = self.solver.tendon_seg_attachment_l_local.numpy()[1:] - centers
+        angles = np.arctan2(np.sum(np.cross(arrival, departure) * axes, axis=1), np.sum(arrival * departure, axis=1))
+        angles = np.where(angles < -np.pi + 1.0e-5, angles + 2.0 * np.pi, angles)
+        assert np.isfinite(angles).all() and np.all((angles >= -1.0e-5) & (angles <= np.pi + 1.0e-5)), (
+            f"Gear pulley left the supported half-wrap range: {dict(zip(self._pulley_names, np.degrees(angles), strict=True))}"
+        )
+
     def test_post_step(self):
+        self._assert_supported_wraps()
         body_q = self.state_0.body_q.numpy()
         assert np.isfinite(body_q).all(), "Gear pulley produced non-finite body state"
         assert float(np.max(np.abs(body_q[:, :3]))) < 20.0, "Gear pulley body state became unbounded"
@@ -391,6 +405,7 @@ class Example:
 
         lower = body_q[self.lower_idx]
         right = body_q[self.right_idx]
+        assert float(right[2]) >= -0.05, f"Gear counterweight fell through the ground: z={float(right[2]):.4f}"
         assert abs(float(lower[1])) < 1.0e-4 and abs(float(right[1])) < 1.0e-4, (
             f"Gear weights should remain in the cable plane: lower_y={float(lower[1]):.5f}, "
             f"right_y={float(right[1]):.5f}"
@@ -435,7 +450,8 @@ class Example:
         )
 
         early_sample = min(len(rotations) - 1, 45)
-        early_rim_travel = np.abs(rotations[early_sample] * self._pulley_radii)
+        # Startup reversals can cancel the net angle at the sampled frame.
+        early_rim_travel = np.sum(np.abs(np.diff(rotations[: early_sample + 1], axis=0)), axis=0) * self._pulley_radii
         final_rim_travel = np.abs(rotations[sample] * self._pulley_radii)
         max_frame_rotation = float(np.max(np.abs(np.diff(rotations, axis=0))))
         inactive_early = [self._pulley_names[i] for i, travel in enumerate(early_rim_travel) if float(travel) <= 0.003]

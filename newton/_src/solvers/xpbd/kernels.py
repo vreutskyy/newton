@@ -996,12 +996,6 @@ def apply_body_deltas(
     v1 = v0 + dp
     w1 = w0 + dw1
 
-    # XXX this improves gradient stability
-    if wp.length(v1) < 1e-4:
-        v1 = wp.vec3(0.0)
-    if wp.length(w1) < 1e-4:
-        w1 = wp.vec3(0.0)
-
     qd_out[tid] = wp.spatial_vector(v1, w1)
     if position_delta_residual_out:
         position_delta_residual_out[tid] = linear_residual
@@ -1730,12 +1724,11 @@ def solve_body_joints(
         drive_lambda_linear = wp.spatial_top(drive_lambda)
         drive_lambda_angular = wp.spatial_bottom(drive_lambda)
 
-    rel_pose = wp.transform_inverse(X_wp) * X_wc
-    rel_p = wp.transform_get_translation(rel_pose)
-
     # joint connection points
     x_p = wp.transform_get_translation(X_wp)
     x_c = wp.transform_get_translation(X_wc)
+    # Subtract before rotating to avoid cancellation between large world positions.
+    rel_p = wp.quat_rotate_inv(wp.transform_get_rotation(X_wp), x_c - x_p)
 
     linear_compliance = joint_linear_compliance
     angular_compliance = joint_angular_compliance

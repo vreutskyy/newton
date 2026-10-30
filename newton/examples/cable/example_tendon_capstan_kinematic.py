@@ -5,11 +5,11 @@
 # Example Tendon Capstan Kinematic
 #
 # Three side-by-side asymmetric Atwood machines with
-# kinematic (fixed) pulleys and different placeholder capstan friction
+# kinematic (fixed) pulleys and different capstan friction
 # coefficients:
 #
 #   Left:   mu = 0.0
-#   Center: mu = 0.05
+#   Center: mu = 0.03
 #   Right:  mu = 10.0
 #
 # The unified capstan projection uses the same path for all three cases:
@@ -45,17 +45,13 @@ class Example:
         self.pulley_radius = 0.15
         self.pulley_z = 3.5
         self.weight_x = 0.3
-        self.mus = [0.0, 0.08, 10.0]
+        self.mus = [0.0, 0.03, 10.0]
         self.x_offsets = [-1.5, 0.0, 1.5]
 
         mass_light = 1.0
-        mass_heavy = 1.02
+        mass_heavy = 1.2
 
         q_cyl = wp.quat(np.sin(np.pi / 4.0), 0.0, 0.0, np.cos(np.pi / 4.0))
-
-        Dof = newton.ModelBuilder.JointDofConfig
-        planar_lin = [Dof(axis=Axis.X), Dof(axis=Axis.Z)]
-        planar_ang = []
 
         self.pulley_indices = []
         self.left_indices = []
@@ -81,14 +77,25 @@ class Example:
             left_pos = wp.vec3(x_off - self.weight_x, 0.0, 1.85)
             left = builder.add_link(
                 xform=wp.transform(p=left_pos, q=wp.quat_identity()),
-                mass=mass_light,
+                mass=0.0,
             )
-            builder.add_shape_box(left, hx=0.06, hy=0.06, hz=0.06)
-            j1 = builder.add_joint_d6(
+            # Let the shape supply the specified mass and its matching inertia,
+            # rather than adding a default-density shape to an existing mass.
+            builder.add_shape_box(
+                left,
+                hx=0.06,
+                hy=0.06,
+                hz=0.06,
+                cfg=builder.ShapeConfig(density=mass_light / (8.0 * 0.06**3)),
+            )
+            # Vertical guides prevent pendulum motion from increasing the wrap
+            # beyond the circular route's supported half turn.
+            j1 = builder.add_joint_prismatic(
                 parent=-1,
                 child=left,
-                linear_axes=planar_lin,
-                angular_axes=planar_ang,
+                axis=Axis.Z,
+                limit_lower=-1.2,
+                limit_upper=1.2,
                 parent_xform=wp.transform(p=left_pos),
                 child_xform=wp.transform(),
             )
@@ -98,14 +105,21 @@ class Example:
             right_pos = wp.vec3(x_off + self.weight_x, 0.0, 1.85)
             right = builder.add_link(
                 xform=wp.transform(p=right_pos, q=wp.quat_identity()),
-                mass=mass_heavy,
+                mass=0.0,
             )
-            builder.add_shape_box(right, hx=0.09, hy=0.09, hz=0.09)
-            j2 = builder.add_joint_d6(
+            builder.add_shape_box(
+                right,
+                hx=0.09,
+                hy=0.09,
+                hz=0.09,
+                cfg=builder.ShapeConfig(density=mass_heavy / (8.0 * 0.09**3)),
+            )
+            j2 = builder.add_joint_prismatic(
                 parent=-1,
                 child=right,
-                linear_axes=planar_lin,
-                angular_axes=planar_ang,
+                axis=Axis.Z,
+                limit_lower=-1.2,
+                limit_upper=1.2,
                 parent_xform=wp.transform(p=right_pos),
                 child_xform=wp.transform(),
             )
@@ -129,7 +143,7 @@ class Example:
                 offset=(0.0, 0.0, 0.0),
                 axis=axis,
                 compliance=2.0e-5,
-                damping=80.0,
+                damping=5.0,
                 rest_length=-1.0,
             )
             builder.add_tendon_link(
@@ -138,7 +152,7 @@ class Example:
                 offset=(0.0, 0.0, 0.06),
                 axis=axis,
                 compliance=2.0e-5,
-                damping=80.0,
+                damping=5.0,
                 rest_length=-1.0,
             )
 
@@ -211,8 +225,11 @@ class Example:
         right_z = np.array(self._right_z_history)
         assert np.isfinite(left_z).all() and np.isfinite(right_z).all(), "Non-finite capstan trajectory"
 
-        left_disp = left_z[-1] - self._initial_left_z
-        right_disp = self._initial_right_z - right_z[-1]
+        # Compare friction during free travel, before the sliders reach their
+        # end stops. Longer runs should remain valid after those stops engage.
+        comparison_frames = min(len(left_z), round(1.5 * self.fps))
+        left_disp = left_z[comparison_frames - 1] - self._initial_left_z
+        right_disp = self._initial_right_z - right_z[comparison_frames - 1]
 
         assert np.max(left_z[:, :2]) < self.pulley_z - self.pulley_radius - 0.05, (
             f"Low/mid kinematic capstan weights should stay below the pulley: max_z={np.max(left_z[:, :2], axis=0)}"
@@ -229,6 +246,8 @@ class Example:
             f"High-friction kinematic capstan should lock more than mid friction: dz={right_disp}"
         )
         assert right_disp[2] < 0.08, f"High-friction kinematic capstan should lock cable motion: dz={right_disp}"
+        left_z = left_z[:comparison_frames]
+        right_z = right_z[:comparison_frames]
         if len(left_z) > 2:
             left_step = np.max(np.abs(np.diff(left_z[:, :2], axis=0)), axis=0)
             right_step = np.max(np.abs(np.diff(right_z[:, :2], axis=0)), axis=0)

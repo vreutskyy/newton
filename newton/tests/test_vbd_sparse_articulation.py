@@ -15,6 +15,7 @@ from newton._src.solvers.vbd.rigid_sparse_articulation import build_rigid_articu
 from newton._src.solvers.vbd.rigid_sparse_articulation_kernels import _joint_projectors
 from newton.examples.cable import example_cable_cross_slide_table
 from newton.tests.unittest_utils import add_function_test, get_test_devices
+from newton.tests.vbd import test_tendon_sparse
 
 devices = get_test_devices()
 
@@ -1963,6 +1964,31 @@ for _test in (
         _test,
         devices=devices,
         mode="block_sparse_levels",
+    )
+for tendon_test in (
+    test_tendon_sparse.test_sparse_tendon_implicit_step,
+    test_tendon_sparse.test_sparse_tendon_merges_articulations,
+    test_tendon_sparse.test_sparse_tendon_world_isolation,
+    test_tendon_sparse.test_sparse_tendon_nonadjacent_coupling,
+    test_tendon_sparse.test_sparse_tendon_fixed_body,
+    test_tendon_sparse.test_sparse_tendon_closed_loop,
+    test_tendon_sparse.test_sparse_tendon_loaded_closed_loop,
+    test_tendon_sparse.test_sparse_tendon_frictional_balance,
+    test_tendon_sparse.test_sparse_tendon_nonlinear_damped_step,
+    test_tendon_sparse.test_sparse_tendon_offset_anchor_torque,
+    test_tendon_sparse.test_sparse_tendon_capture,
+    test_tendon_sparse.test_sparse_tendon_pulley_reference,
+    test_tendon_sparse.test_sparse_articulated_dynamic_roller,
+    test_tendon_sparse.test_sparse_tendon_alm_rejected,
+    test_tendon_sparse.test_sparse_tendon_elastic_scope,
+):
+    add_function_test(TestVBDSparseArticulationDevices, tendon_test.__name__, tendon_test, devices=devices)
+    add_function_test(
+        TestVBDSparseArticulationDevices,
+        tendon_test.__name__.replace("test_sparse_", "test_sparse_levels_"),
+        tendon_test,
+        devices=devices,
+        sparse_mode="block_sparse_levels",
     )
 
 

@@ -14,9 +14,9 @@ from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
 def test_damped_row_uses_signed_total_tension(test, device):
-    """Use the same signed Kelvin-Voigt tension for capstan classification and the XPBD residual."""
-    stretch = np.array([0.0006, -0.001, -0.0001, 0.0, -0.001, 0.0006, 0.0006])
-    damping_force = np.array([0.0, 80.0, 80.0, 80.0, 20.0, -40.0, -20.0])
+    """Match engagement, ordinary damping, and unloading in classification and residuals."""
+    stretch = np.array([0.0006, -0.001, -0.0001, 0.0, -0.001, 0.0006, 0.0006, 0.0006, 0.0006])
+    damping_force = np.array([0.0, 80.0, 80.0, 80.0, 20.0, -40.0, -20.0, 80.0, 20.0])
     count = len(stretch)
     velocity = np.zeros((count + 1, 6))
     velocity[1:, 1] = np.cumsum(damping_force / 80.0)
@@ -53,10 +53,14 @@ def test_damped_row_uses_signed_total_tension(test, device):
         device=device,
     )
     result = rows.numpy()
-    expected = np.maximum(stretch / 2.0e-5 + damping_force, 0.0)
+    engaged_damping = np.minimum(damping_force, 80.0 * np.maximum(stretch, 0.0) / 0.001)
+    expected = np.maximum(stretch / 2.0e-5 + engaged_damping, 0.0)
     np.testing.assert_allclose(result["tension"], expected, atol=1.0e-5)
     np.testing.assert_allclose(np.maximum(result["residual"] / result["compliance"], 0.0), expected, atol=1.0e-5)
     np.testing.assert_allclose(material.numpy(), np.maximum(stretch, 0.0) / 2.0e-5, atol=1.0e-5)
+    limited = damping_force > 80.0 * np.maximum(stretch, 0.0) / 0.001
+    expected_compliance = np.where(limited, 1.0 / (1.0 / 2.0e-5 + 80.0 / 0.001), 2.0e-5)
+    np.testing.assert_allclose(result["compliance"], expected_compliance, rtol=2.0e-7)
 
 
 def test_reduced_impulse_reference(test, device):
@@ -270,12 +274,25 @@ def _check_sliding_atwood_acceleration(test, device, solver_name, damping):
                 dt = 0.01
                 solver.step(a, b, None, None, dt)
                 ratio = np.exp(mu * np.pi)
-                # T_right = ratio*T_left; the two masses have equal opposite
-                # acceleration in the inextensible limit. Include the small
-                # compliance term for the implicit first-step reference.
-                tension = (
-                    2 * 9.81 / (1 / masses[0] + ratio / masses[1] + 1e-6 * (1 + ratio) / (dt * (dt + 1e-6 * damping)))
-                )
+                # Solve independent backward-Euler force balance and material
+                # conservation. T_right=ratio*T_left. For positive tension,
+                # T=e/C+min(d*v,d*e/dt) inverts to the larger of the full-rate
+                # and engagement-limited extensions. Their sum must equal
+                # the geometric increase of the two initially taut spans.
+                lower = 0.0
+                upper = 2 * 9.81 / (1 / masses[0] + ratio / masses[1])
+                for _ in range(80):
+                    tension = (lower + upper) * 0.5
+                    forces = np.array([tension, ratio * tension])
+                    travel = dt * dt * (9.81 - forces / np.asarray(masses))
+                    full_rate_extension = 1.0e-6 * (forces - damping * travel / dt)
+                    engaged_extension = forces / (1.0e6 + damping / dt)
+                    extension = np.maximum(full_rate_extension, engaged_extension)
+                    if extension.sum() > travel.sum():
+                        upper = tension
+                    else:
+                        lower = tension
+                tension = (lower + upper) * 0.5
                 expected = np.array([tension / masses[0] - 9.81, 9.81 - ratio * tension / masses[1]])
                 actual = b.body_qd.numpy()[[left, right], 2] / dt * [1, -1]
                 np.testing.assert_allclose(actual, expected, atol=2e-3, rtol=1e-3)

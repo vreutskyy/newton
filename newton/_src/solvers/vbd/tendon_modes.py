@@ -5,6 +5,7 @@
 
 import warp as wp
 
+from ..tendon_damping import linear_damped_tension, tendon_damping_tension
 from ..tendon_kernels import tendon_material_tangent, tendon_material_tension
 
 _MIN_TENDON_COMPLIANCE = wp.constant(1.0e-8)
@@ -12,13 +13,15 @@ _MIN_TENDON_COMPLIANCE = wp.constant(1.0e-8)
 
 @wp.struct
 class TendonMaterialMode:
-    """A freely sliding material block and its current unilateral force."""
+    """A condensed material block with unilateral forces and per-guide secants."""
 
     first: int
     last: int
     next: int
     tension: float
     stiffness: float
+    transfer_weight: float
+    """Outgoing guide's friction stiffness divided by total transfer stiffness."""
 
 
 @wp.kernel
@@ -39,9 +42,15 @@ def prepare_tendon_material_modes(
     ea_ratio: float,
     transition: float,
     width: float,
+    material_transfer: wp.array[float],
+    sliding_curvature: int,
     modes: wp.array[TendonMaterialMode],
 ):
-    """Condense free material modes, retaining the sticking tangent at friction bounds."""
+    """Condense material modes, optionally using per-guide friction secants.
+
+    The sparse path uses friction secants as a positive solver metric, not the
+    exact derivative of the capstan projection. Projected tensions are unchanged.
+    """
     tendon = wp.tid()
     first = tendon_start[tendon] - tendon
     end = tendon_start[tendon + 1] - tendon - 1
@@ -57,10 +66,10 @@ def prepare_tendon_material_modes(
             if ea_low > 0.0:
                 material = tendon_material_tension(length[seg], rest[seg], comp, ea_low, ea_ratio, transition, width)
                 tangent = tendon_material_tangent(length[seg], rest[seg], comp, ea_low, ea_ratio, transition, width)
-            # Match the material projection's unilateral Kelvin-Voigt force.
-            # Damping can support positive tension at nonpositive elastic
-            # stretch; testing stretch alone would discard that force.
-            mode.tension = wp.max(material + damping_tension[seg], 0.0)
+            damped = tendon_damping_tension(stretch[seg], damping_tension[seg], damping[seg], dt)
+            mode.tension = wp.max(material + damped, 0.0)
+            if ea_low <= 0.0:
+                mode.tension = linear_damped_tension(stretch[seg], comp, damping_tension[seg], damping[seg] / dt)
             if mode.tension > 0.0:
                 mode.stiffness = tangent + damping[seg] / dt
         modes[seg] = mode
@@ -77,9 +86,25 @@ def prepare_tendon_material_modes(
         # A finite-friction cone boundary is nonsmooth: reverse motion can
         # stick. Keep that conservative tangent instead of extending a sliding
         # branch in both directions. A unit ratio has no sticking interval.
-        if cap_ratio[link] == 1.0:
+        join = cap_ratio[link] == 1.0
+        weight = float(0.0)
+        if sliding_curvature != 0 and cap_ratio[link] > 1.0:
+            slip = wp.abs(material_transfer[link])
+            if slip > 0.0:
+                # Positive friction secant: resistance / slip. It tends to the
+                # sticking curvature as slip vanishes, rather than abruptly
+                # releasing a material coordinate at the friction boundary.
+                rho = cap_ratio[link]
+                resistance = (rho - 1.0) / (rho + 1.0) * (modes[left].tension + modes[right].tension)
+                # Transfer stretches one span while relaxing the other: its
+                # elastic stiffness is k_left+k_right, not their series stiffness.
+                transfer_stiffness = modes[left].stiffness + modes[right].stiffness
+                weight = resistance / (resistance + slip * transfer_stiffness)
+                join = True
+        if join:
             l = modes[left]
             l.next = right
+            l.transfer_weight = weight
             modes[left] = l
 
     head = first
@@ -93,6 +118,131 @@ def prepare_tendon_material_modes(
             mode.last = last
             modes[seg] = mode
         head = last + 1
+
+
+@wp.func
+def tendon_segment_body_gradient(
+    body: int,
+    world_com: wp.vec3,
+    seg: int,
+    tendon_link_body: wp.array[int],
+    seg_attachment_l: wp.array[wp.vec3],
+    seg_attachment_r: wp.array[wp.vec3],
+    seg_active_link_l: wp.array[int],
+    seg_active_link_r: wp.array[int],
+):
+    """Return the negative straight-span length gradient on one body."""
+    linear = wp.vec3(0.0)
+    angular = wp.vec3(0.0)
+    body_l = tendon_link_body[seg_active_link_l[seg]]
+    body_r = tendon_link_body[seg_active_link_r[seg]]
+    left = seg_attachment_l[seg]
+    right = seg_attachment_r[seg]
+    length = wp.length(right - left)
+    # A span internal to one body has exactly zero length derivative.
+    if body_l != body_r and length > 1.0e-8:
+        direction = (right - left) / length
+        if body_l == body:
+            linear = direction
+            angular = wp.cross(left - world_com, direction)
+        elif body_r == body:
+            linear = -direction
+            angular = -wp.cross(right - world_com, direction)
+    return linear, angular
+
+
+@wp.func
+def tendon_mode_body_pair_hessians(
+    row: int,
+    col: int,
+    com_row: wp.vec3,
+    com_col: wp.vec3,
+    first: int,
+    modes: wp.array[TendonMaterialMode],
+    tendon_link_body: wp.array[int],
+    seg_attachment_l: wp.array[wp.vec3],
+    seg_attachment_r: wp.array[wp.vec3],
+    seg_active_link_l: wp.array[int],
+    seg_active_link_r: wp.array[int],
+):
+    """Eliminate individual transfer secants in linear time and constant storage.
+
+    Each elimination contributes a positive weighted gradient outer product.
+    This is the Schur complement of a quadratic friction-secant metric, not
+    the exact derivative of the nonsymmetric capstan projection.
+    """
+    ll = wp.mat33(0.0)
+    la = wp.mat33(0.0)
+    al = wp.mat33(0.0)
+    aa = wp.mat33(0.0)
+    seg = first
+    stiffness = modes[seg].stiffness
+    if stiffness > 0.0:
+        lin_row, ang_row = tendon_segment_body_gradient(
+            row,
+            com_row,
+            seg,
+            tendon_link_body,
+            seg_attachment_l,
+            seg_attachment_r,
+            seg_active_link_l,
+            seg_active_link_r,
+        )
+        lin_col, ang_col = tendon_segment_body_gradient(
+            col,
+            com_col,
+            seg,
+            tendon_link_body,
+            seg_attachment_l,
+            seg_attachment_r,
+            seg_active_link_l,
+            seg_active_link_r,
+        )
+        while modes[seg].next >= 0:
+            next_seg = modes[seg].next
+            next_k = modes[next_seg].stiffness
+            weight = modes[seg].transfer_weight
+            # weight = f/(f + k_seg + k_next). Recover K/(K+f)
+            # without dividing by a possibly tiny material displacement.
+            free = stiffness * (1.0 - weight)
+            resistance = weight * (modes[seg].stiffness + next_k)
+            carry = free / (free + resistance)
+            kept_k = stiffness * (1.0 - carry)
+            ll += kept_k * wp.outer(lin_row, lin_col)
+            la += kept_k * wp.outer(lin_row, ang_col)
+            al += kept_k * wp.outer(ang_row, lin_col)
+            aa += kept_k * wp.outer(ang_row, ang_col)
+            next_lin_row, next_ang_row = tendon_segment_body_gradient(
+                row,
+                com_row,
+                next_seg,
+                tendon_link_body,
+                seg_attachment_l,
+                seg_attachment_r,
+                seg_active_link_l,
+                seg_active_link_r,
+            )
+            next_lin_col, next_ang_col = tendon_segment_body_gradient(
+                col,
+                com_col,
+                next_seg,
+                tendon_link_body,
+                seg_attachment_l,
+                seg_attachment_r,
+                seg_active_link_l,
+                seg_active_link_r,
+            )
+            lin_row = carry * lin_row + next_lin_row
+            ang_row = carry * ang_row + next_ang_row
+            lin_col = carry * lin_col + next_lin_col
+            ang_col = carry * ang_col + next_ang_col
+            stiffness = next_k / (1.0 + carry * next_k / stiffness)
+            seg = next_seg
+        ll += stiffness * wp.outer(lin_row, lin_col)
+        la += stiffness * wp.outer(lin_row, ang_col)
+        al += stiffness * wp.outer(ang_row, lin_col)
+        aa += stiffness * wp.outer(ang_row, ang_col)
+    return ll, la, al, aa
 
 
 @wp.func
@@ -162,12 +312,7 @@ def evaluate_condensed_tendon_force_hessians(
         force = force + body_force
         torque = torque + body_torque
 
-    # Eliminate freely sliding material coordinates before assembling the
-    # Gauss-Newton curvature: series compliance is sum(1/k_i), and the path
-    # gradient is sum(J_i). This preserves cancellation between adjacent
-    # spans (including a circle's spin nullspace) without inspecting profiles.
-    # Finite-friction interfaces retain their sticking-side tangent; the
-    # capstan projection still determines all forces above.
+    # Use the same per-interface elimination for diagonal and cross-body terms.
     previous = int(-1)
     world_com = wp.transform_point(body_q[body], body_com[body])
     for adjacent_index in range(adjacent_start, adjacent_end):
@@ -178,29 +323,21 @@ def evaluate_condensed_tendon_force_hessians(
         if mode.first == previous:
             continue
         previous = mode.first
-        linear = wp.vec3(0.0)
-        angular = wp.vec3(0.0)
-        mode_compliance = float(0.0)
-        for seg in range(mode.first, mode.last + 1):
-            if seg_active[seg] == 0 or modes[seg].stiffness <= 0.0:
-                continue
-            left = seg_attachment_l[seg]
-            right = seg_attachment_r[seg]
-            length = wp.length(right - left)
-            if length <= 1.0e-8:
-                continue
-            stiffness = modes[seg].stiffness
-            mode_compliance += 1.0 / stiffness
-            direction = (right - left) / length
-            if tendon_link_body[seg_active_link_l[seg]] == body:
-                linear += direction
-                angular += wp.cross(left - world_com, direction)
-            if tendon_link_body[seg_active_link_r[seg]] == body:
-                linear -= direction
-                angular -= wp.cross(right - world_com, direction)
-        if mode_compliance > 0.0:
-            h_ll += wp.outer(linear, linear) / mode_compliance
-            h_al += wp.outer(angular, linear) / mode_compliance
-            h_aa += wp.outer(angular, angular) / mode_compliance
+        ll, _la, al, aa = tendon_mode_body_pair_hessians(
+            body,
+            body,
+            world_com,
+            world_com,
+            mode.first,
+            modes,
+            tendon_link_body,
+            seg_attachment_l,
+            seg_attachment_r,
+            seg_active_link_l,
+            seg_active_link_r,
+        )
+        h_ll += ll
+        h_al += al
+        h_aa += aa
 
     return force, torque, h_ll, h_al, h_aa

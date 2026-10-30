@@ -18,8 +18,7 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton._src.sim.builder import Axis
-from newton._src.sim.tendon import TendonLinkType
+from newton import Axis, TendonLinkType
 from newton.examples.cable.cable import assert_tendon_total_length
 
 
@@ -43,11 +42,12 @@ class Example:
         )
         builder.add_shape_sphere(anchor, radius=0.05)
 
-        weight = builder.add_body(
+        weight = builder.add_link(
             xform=wp.transform(p=wp.vec3(0.5, 0.0, 1.5), q=wp.quat_identity()),
-            mass=2.0,
+            mass=0.0,
         )
-        builder.add_shape_box(weight, hx=0.10, hy=0.10, hz=0.10)
+        weight_cfg = newton.ModelBuilder.ShapeConfig(density=2.0 / (8.0 * 0.10**3))
+        builder.add_shape_box(weight, hx=0.10, hy=0.10, hz=0.10, cfg=weight_cfg)
 
         Dof = newton.ModelBuilder.JointDofConfig
         free_lin = [Dof(axis=Axis.X), Dof(axis=Axis.Y), Dof(axis=Axis.Z)]

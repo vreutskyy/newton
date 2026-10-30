@@ -1,0 +1,1 @@
+Prevent positive damping from pulling geometrically slack tendons in XPBD and condensed VBD. Use continuous slack-to-taut engagement consistently in body forces, direct and sweep material transfer, and damping diagnostics, for linear and sigmoid stiffness.

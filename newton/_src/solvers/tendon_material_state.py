@@ -9,10 +9,16 @@ from ..sim.tendon import TendonLinkType
 from .tendon_alm_material import TendonALMMaterialState, project_alm_material
 from .tendon_material import solve_tendon_material_component
 from .tendon_material_nonlinear import TendonMaterialNonlinearState, solve_tendon_material_nonlinear_component
+from .tendon_material_slack import TendonSlackBlock
 
 
 @wp.struct
 class TendonMaterialState:
+    engagement: bool
+    engagement_rows: wp.array[int]
+    slack_enabled: bool
+    slack: wp.array[int]
+    slack_blocks: wp.array[TendonSlackBlock]
     enabled: bool
     segment_alm: bool
     legacy_alm_damping: bool
@@ -123,6 +129,61 @@ def record_tendon_material_failure_span(
 
 
 @wp.func
+def needs_engagement_projection(state: TendonMaterialState, row: int, count: int) -> bool:
+    """Keep the fast constant-damping projection when its result stays on that branch."""
+    if not state.engagement:
+        return False
+    for slot in range(count):
+        i = row + slot
+        seg = state.ids[i]
+        raw = state.alm.damping_force[seg]
+        if raw <= 0.0:
+            continue
+        if state.status[row] < 0:
+            return True
+        extension = state.output[i]
+        if not state.nonlinear_enabled:
+            extension -= state.alm.physical_compliance[seg] * raw
+        if raw > state.alm.damping[seg] * wp.max(extension, 0.0) / state.alm.dt:
+            return True
+    return False
+
+
+@wp.func
+def finish_penalty_projection(state: TendonMaterialState, row: int, count: int, tendon: int, latch: int) -> bool:
+    """Resolve any engagement branch crossed by the fast direct candidate."""
+    if state.engagement:
+        state.engagement_rows[row] = 0
+    if needs_engagement_projection(state, row, count):
+        state.engagement_rows[row] = 1
+        project_alm_material(
+            state.alm,
+            state.ids,
+            state.initial,
+            state.compliance,
+            state.cap,
+            state.upper,
+            state.output,
+            state.status,
+            state.faces,
+            state.valid,
+            state.pieces,
+            row,
+            count,
+            state.ea_low,
+            state.ea_ratio,
+            state.transition_strain,
+            state.transition_width,
+        )
+    if state.status[row] < 0:
+        code = state.status[row]
+        if state.nonlinear_enabled and (not state.engagement or state.engagement_rows[row] == 0):
+            code -= 200
+        return reject_tendon_material(state, code, tendon, row, latch)
+    return True
+
+
+@wp.func
 def project_tendon_component(state: TendonMaterialState, row: int, count: int, tendon: int, latch: int) -> bool:
     if state.count[row] != count:
         state.valid[row] = 0
@@ -165,9 +226,7 @@ def project_tendon_component(state: TendonMaterialState, row: int, count: int, t
             64,
             1.0e-5,
         )
-        if state.status[row] < 0:
-            return reject_tendon_material(state, state.status[row] - 200, tendon, row, latch)
-        return True
+        return finish_penalty_projection(state, row, count, tendon, latch)
     # Each component packs into its original segment interval; inactive route slots
     # need no padding. Storage remains O(total segments), not 32 slots per segment.
     solve_tendon_material_component(
@@ -186,9 +245,59 @@ def project_tendon_component(state: TendonMaterialState, row: int, count: int, t
         1,
         1,
     )
-    if state.status[row] < 0:
-        return reject_tendon_material(state, state.status[row], tendon, row, latch)
-    return True
+    return finish_penalty_projection(state, row, count, tendon, latch)
+
+
+@wp.func
+def publish_tendon_material(
+    state: TendonMaterialState,
+    seg_offset: int,
+    num_segs: int,
+    seg_active: wp.array[int],
+    seg_compliance: wp.array[float],
+    seg_damping: wp.array[float],
+    seg_stretch: wp.array[float],
+    link_material_transfer: wp.array[float],
+):
+    """Publish certified stretch and net slip relative to the full-rolling trial."""
+    row = int(-1)
+    count = int(0)
+    previous = int(-1)
+    transfer = float(0.0)
+    for s in range(num_segs):
+        seg = seg_offset + s
+        if seg_active[seg] == 0:
+            continue
+        new_component = previous < 0
+        if previous >= 0:
+            new_component = state.next_link[previous] < 0
+        if new_component:
+            row = seg
+            count = 0
+            transfer = 0.0
+        trial_stretch = seg_stretch[seg]
+        if state.nonlinear_enabled or state.segment_alm or (state.engagement and state.engagement_rows[row] != 0):
+            seg_stretch[seg] = state.output[row + count]
+            if state.segment_alm and state.alm.force[row + count] == 0.0:
+                # Rest-length rounding must not leave a positive multiplier
+                # decaying indefinitely after a certified zero-force result.
+                state.alm.multiplier[seg] = 0.0
+        else:
+            offset = seg_compliance[seg] * seg_damping[seg]
+            seg_stretch[seg] = state.output[row + count] - offset
+        # Conservation gives outgoing slip = incoming slip + rest-length gain.
+        # Use stretch differences, avoiding another subtraction of large lengths.
+        transfer += trial_stretch - seg_stretch[seg]
+        link = state.next_link[seg]
+        if link >= 0:
+            if state.valid[row] != 0 and state.faces[row + count] == 0:
+                # A certified sticking boundary carries no slip. Rounded stretch
+                # differences must not create slip or propagate it downstream.
+                # Slack projections have no valid face cache and can redistribute.
+                transfer = 0.0
+            link_material_transfer[link] = transfer
+        count += 1
+        previous = seg
 
 
 @wp.func
@@ -215,6 +324,7 @@ def transfer_tendon_material_direct(
     apply_pinhole_slip: int,
     min_rest: float,
     latch_failure: int,
+    link_material_transfer: wp.array[float],
 ) -> bool:
     for s in range(num_segs):
         seg = seg_offset + s
@@ -282,7 +392,7 @@ def transfer_tendon_material_direct(
         if state.ids[index] != seg:
             state.valid[row] = 0
         state.ids[index] = seg
-        if state.segment_alm:
+        if state.segment_alm or state.engagement:
             state.alm.reference[index] = seg_stretch[seg]
         compliance = seg_compliance[seg]
         offset = compliance * seg_damping[seg]
@@ -307,30 +417,7 @@ def transfer_tendon_material_direct(
             return False
 
     # Publish only after every component on this tendon has passed its certificate.
-    row = int(-1)
-    count = int(0)
-    previous = int(-1)
-    for s in range(num_segs):
-        seg = seg_offset + s
-        if seg_active[seg] == 0:
-            continue
-        if previous < 0:
-            row = seg
-            count = 0
-        elif state.next_link[previous] < 0:
-            row = seg
-            count = 0
-        if state.nonlinear_enabled or state.segment_alm:
-            seg_stretch[seg] = state.output[row + count]
-            if state.segment_alm and state.alm.force[row + count] == 0.0:
-                # Release a certified zero-force row exactly. Reconstructing a
-                # float rest length can erase its tiny negative extension; using
-                # that rounded extension for dual ascent would otherwise leave
-                # a positive multiplier decaying indefinitely towards underflow.
-                state.alm.multiplier[seg] = 0.0
-        else:
-            offset = seg_compliance[seg] * seg_damping[seg]
-            seg_stretch[seg] = state.output[row + count] - offset
-        count += 1
-        previous = seg
+    publish_tendon_material(
+        state, seg_offset, num_segs, seg_active, seg_compliance, seg_damping, seg_stretch, link_material_transfer
+    )
     return True

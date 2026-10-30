@@ -68,7 +68,8 @@ def test_unsupported_modes_preserve_input_state(test, device):
     """Reject unsupported solver combinations and leave a rejected reset untouched."""
     model = source_builder().finalize(device=device)
     for kwargs in (
-        {"rigid_articulation_solve": "block_sparse_joints"},
+        {"rigid_articulation_solve": "block_sparse_joints", "tendon_alm": True},
+        {"rigid_articulation_solve": "block_sparse_joints", "tendon_alm_per_segment": True},
         {"integrate_with_external_rigid_solver": True},
         {"rigid_joint_limit_alm": True},
     ):

@@ -84,7 +84,7 @@ class Example:
                 (1.0 / 12.0) * mass * (sx * sx + sy * sy),
             )
 
-        p1 = builder.add_body(
+        p1 = builder.add_link(
             xform=wp.transform(p=self.p1_pos, q=wp.quat_identity()),
             mass=pulley_mass,
             inertia=cylinder_inertia(pulley_mass, self.r1, pulley_half_height),
@@ -110,7 +110,7 @@ class Example:
         self._direction_validation_frames = 60
         self._axis_validation_frames = 60
 
-        p2 = builder.add_body(
+        p2 = builder.add_link(
             xform=wp.transform(p=self.p2_pos, q=wp.quat_identity()),
             mass=pulley_mass,
             inertia=cylinder_inertia(pulley_mass, self.r2, pulley_half_height),

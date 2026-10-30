@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import warnings
+from math import isfinite
 
 import warp as wp
 
@@ -120,7 +121,8 @@ class SolverXPBD(TendonStateMixin, SolverBase, CouplingInterface):
     uses the scalar exact-block implementation. Geometry-dependent cap ratios
     and numerical feasibility are checked at runtime. Differentiable simulation
     is not supported in this mode. See ``docs/direct_tendon_material.md``.
-    ``tendon_max_sweeps`` and ``tendon_settle_tol`` do not control direct solves.
+    ``tendon_max_sweeps``, ``tendon_settle_tol``, and ``tendon_settle_atol``
+    do not control direct solves.
     Select the mode at construction; reconstruct the solver to change it.
 
     Call :meth:`check_tendon_material` after each step or graph replay, outside
@@ -168,6 +170,7 @@ class SolverXPBD(TendonStateMixin, SolverBase, CouplingInterface):
         deterministic: wp.DeterministicMode | None = None,
         tendon_max_sweeps: int = 256,
         tendon_settle_tol: float = 1.0e-3,
+        tendon_settle_atol: float = 1.0e-6,
         tendon_activation_tol: float = 2.0e-3,
         tendon_route_hysteresis: float = 1.0e-4,
         tendon_route_min_span_ratio: float = 2.0,
@@ -209,6 +212,10 @@ class SolverXPBD(TendonStateMixin, SolverBase, CouplingInterface):
                 kernel module. Pass a :class:`warp.DeterministicMode`, or
                 ``None`` (default) to inherit the current
                 ``wp.config.deterministic`` mode.
+            tendon_settle_tol: Relative capstan-complementarity tolerance
+                for adaptive tendon sweeps. Zero disables early-out. Ignored by direct solves.
+            tendon_settle_atol: Experimental absolute force tolerance [N] for adaptive tendon sweeps,
+                allowing slack cables to settle. Ignored by direct solves.
         """
         if model._has_rod_joints and JointType.ROD in model.joint_type.numpy():  # pyright: ignore[reportPrivateUsage]
             raise ValueError("SolverXPBD does not support JointType.ROD joints.")
@@ -224,12 +231,14 @@ class SolverXPBD(TendonStateMixin, SolverBase, CouplingInterface):
 
         self.iterations = iterations
         self.tendon_material_direct = tendon_material_direct
-        # Routed-cable capstan cone relaxation: up to tendon_max_sweeps Gauss-Seidel passes, stopping
-        # early once the relaxation has settled -- the max per-sweep tension change relative to the
-        # first sweep's peak tension falls below tendon_settle_tol. Already-converged cables stop almost
-        # immediately; stiff/transient ones run up to the cap.
+        # Adaptive capstan sweeps check current-force accuracy, including unloaded cables.
+        if not isfinite(tendon_settle_tol) or tendon_settle_tol < 0.0:
+            raise ValueError("tendon_settle_tol must be finite and non-negative")
+        if not isfinite(tendon_settle_atol) or tendon_settle_atol < 0.0:
+            raise ValueError("tendon_settle_atol must be finite and non-negative")
         self.tendon_max_sweeps = tendon_max_sweeps
         self.tendon_settle_tol = tendon_settle_tol
+        self.tendon_settle_atol = tendon_settle_atol
         # Dynamic routing hysteresis: inactive rollers activate only after entering the larger
         # of this fraction of their radius and tendon_route_hysteresis [m]; active rollers still
         # deactivate at their surface. Candidates whose bypass span is shorter than
@@ -779,7 +788,7 @@ class SolverXPBD(TendonStateMixin, SolverBase, CouplingInterface):
                 # state_out.body_q, which integrate_bodies has already filled with
                 # the inertial predictor. state_in.body_q is left untouched there.
                 self._update_tendon_link_active(model, state_in.body_q)
-                self._prepare_tendon_route(model, state_in.body_q)
+                self._prepare_tendon_route(model)
                 self.tendon_seg_lambda.zero_()
                 self._tendon_link_spin_impulse.zero_()
                 self.tendon_seg_material_tension.zero_()
@@ -1188,6 +1197,7 @@ class SolverXPBD(TendonStateMixin, SolverBase, CouplingInterface):
                                 1,
                                 self.tendon_max_sweeps,
                                 self.tendon_settle_tol,
+                                self.tendon_settle_atol,
                                 self.tendon_sigmoid_ea_low,
                                 self.tendon_sigmoid_ea_ratio,
                                 self.tendon_sigmoid_transition_strain,
