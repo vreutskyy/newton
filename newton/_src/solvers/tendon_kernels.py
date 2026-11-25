@@ -18,6 +18,12 @@ from .tendon_material_state import TendonMaterialState, transfer_tendon_material
 
 
 @wp.func
+def _sigmoid_tension(strain: float, ea_low: float, ratio: float, knee: float, width: float) -> float:
+    transition = wp.tanh((strain - knee) / width)
+    return ea_low * (1.0 + (ratio - 1.0) * 0.5 * (1.0 + transition)) * strain
+
+
+@wp.func
 def tendon_material_tension(
     length: float,
     rest_length: float,
@@ -33,9 +39,9 @@ def tendon_material_tension(
         return stretch / wp.max(compliance, 1.0e-30)
 
     strain = stretch / wp.max(rest_length, 1.0e-8)
-    transition = wp.tanh((strain - sigmoid_transition_strain) / sigmoid_transition_width)
-    ea = sigmoid_ea_low * (1.0 + (sigmoid_ea_ratio - 1.0) * 0.5 * (1.0 + transition))
-    return ea * strain
+    return _sigmoid_tension(
+        strain, sigmoid_ea_low, sigmoid_ea_ratio, sigmoid_transition_strain, sigmoid_transition_width
+    )
 
 
 @wp.func
@@ -73,15 +79,13 @@ def _material_sweep_tension(
     width: float,
     damping_rate: float,
 ) -> float:
-    """Evaluate the sweep's unilateral force without cancelling linear stretch."""
-    material = stretch / wp.max(compliance, 1.0e-30)
-    damping = damping_tension if compliance > 0.0 else 0.0
+    """Evaluate force from the stored extension without subtracting nearly equal lengths."""
     if ea_low <= 0.0:
+        damping = damping_tension if compliance > 0.0 else 0.0
         return linear_damped_tension(stretch, compliance, damping, damping_rate)
-    if ea_low > 0.0:
-        material = tendon_material_tension(length, length - stretch, compliance, ea_low, ea_ratio, transition, width)
-        damping = damping_tension
-    return wp.max(material + wp.min(damping, damping_rate * wp.max(stretch, 0.0)), 0.0)
+    strain = wp.max(stretch, 0.0) / wp.max(length - stretch, 1.0e-8)
+    material = _sigmoid_tension(strain, ea_low, ea_ratio, transition, width)
+    return wp.max(material + wp.min(damping_tension, damping_rate * wp.max(stretch, 0.0)), 0.0)
 
 
 @wp.func
@@ -120,6 +124,24 @@ def _next_sliding_weight(weight: wp.float64, rho: float, slip: float):
 
 
 @wp.func
+def _block_segment_law(
+    length: float, d: float, compliance: float, ea_low: float, ratio: float, knee: float, width: float
+):
+    """Linearize extension as offset + c * elastic_force, with geometry held fixed."""
+    if ea_low <= 0.0:
+        return wp.float64(compliance), wp.float64(0.0)
+    ref = wp.float64(wp.max(d, 0.0))
+    size = wp.float64(length)
+    rest = wp.max(size - ref, wp.float64(1.0e-8))
+    strain = ref / rest
+    tanh = wp.tanh((strain - wp.float64(knee)) / wp.float64(width))
+    amplitude = wp.float64(0.5) * wp.float64(ea_low) * wp.float64(ratio - 1.0)
+    ea = wp.float64(ea_low) + amplitude * (wp.float64(1.0) + tanh)
+    c = (rest / size) * rest / (ea + strain * amplitude * (wp.float64(1.0) - tanh * tanh) / wp.float64(width))
+    return c, ref - c * ea * strain
+
+
+@wp.func
 def _balance_sliding_run(
     first: int,
     last: int,
@@ -134,8 +156,12 @@ def _balance_sliding_run(
     ratio: wp.array[float],
     dt: float,
     min_rest: float,
+    ea_low: float,
+    ea_ratio: float,
+    knee: float,
+    width: float,
 ):
-    """Balance a taut linear run on its sliding capstan faces, conserving total stretch.
+    """Balance a taut run on its sliding capstan faces, conserving total stretch.
 
     Unit-ratio guides have equal tensions. At a sliding frictional guide the
     sign of net slip selects the tension ratio. Thus all tensions in this run
@@ -144,13 +170,12 @@ def _balance_sliding_run(
     inventory = wp.float64(0.0)
     for s in range(first, last + 1):
         if active[s] != 0:
-            if compliance[s] <= 0.0:
+            if (ea_low <= 0.0 and compliance[s] <= 0.0) or (ea_low > 0.0 and length[s] <= min_rest):
                 return
             inventory += wp.float64(stretch[s])
 
-    # Invert the damped law at a common positive tension T. Its stretch is
-    # max(c*(T-b), c*T/(1+c*d/dt)). The sum is convex and piecewise affine;
-    # after the first tangent update, each iteration crosses a kink or finishes.
+    # For this local linearization the two damping branches give a piecewise
+    # affine extension. Find the common force that preserves their total.
     tension = wp.float64(0.0)
     for iteration in range(last - first + 3):
         used = wp.float64(0.0)
@@ -158,10 +183,10 @@ def _balance_sliding_run(
         weight = wp.float64(1.0)
         for s in range(first, last + 1):
             if active[s] != 0:
-                c = wp.float64(compliance[s])
+                c, offset = _block_segment_law(length[s], stretch[s], compliance[s], ea_low, ea_ratio, knee, width)
                 limited = c / (wp.float64(1.0) + c * wp.float64(damping[s] / dt))
-                full_stretch = c * (weight * tension - wp.float64(raw_damping[s]))
-                limited_stretch = limited * weight * tension
+                full_stretch = offset + c * (weight * tension - wp.float64(raw_damping[s]))
+                limited_stretch = (limited / c) * offset + limited * weight * tension
                 used += wp.max(full_stretch, limited_stretch)
                 slope += weight * (c if full_stretch >= limited_stretch else limited)
                 if s != last:
@@ -179,16 +204,47 @@ def _balance_sliding_run(
 
     # At a rest floor, the capstan equality need not hold. Leave these cases to
     # the bounded pair projections instead of moving unavailable material.
+    old_error = wp.float64(0.0)
+    new_error = wp.float64(0.0)
     for phase in range(2):
+        if phase == 1 and ea_low > 0.0 and new_error >= old_error:
+            return  # A tangent step across the sigmoid knee can overshoot.
         flow = wp.float64(0.0)
         weight = wp.float64(1.0)
         for s in range(first, last + 1):
             if active[s] != 0:
-                c = wp.float64(compliance[s])
+                c, offset = _block_segment_law(length[s], stretch[s], compliance[s], ea_low, ea_ratio, knee, width)
                 d = wp.max(
-                    c * (weight * tension - wp.float64(raw_damping[s])),
-                    c * weight * tension / (wp.float64(1.0) + c * wp.float64(damping[s] / dt)),
+                    offset + c * (weight * tension - wp.float64(raw_damping[s])),
+                    (offset + c * weight * tension) / (wp.float64(1.0) + c * wp.float64(damping[s] / dt)),
                 )
+                if ea_low > 0.0 and phase == 0:
+                    if d <= wp.float64(0.0):
+                        return
+                    before = _material_sweep_tension(
+                        length[s],
+                        stretch[s],
+                        compliance[s],
+                        raw_damping[s],
+                        ea_low,
+                        ea_ratio,
+                        knee,
+                        width,
+                        damping[s] / dt,
+                    )
+                    after = _material_sweep_tension(
+                        length[s],
+                        float(d),
+                        compliance[s],
+                        raw_damping[s],
+                        ea_low,
+                        ea_ratio,
+                        knee,
+                        width,
+                        damping[s] / dt,
+                    )
+                    old_error = wp.max(old_error, wp.abs(wp.float64(before) / weight - tension))
+                    new_error = wp.max(new_error, wp.abs(wp.float64(after) / weight - tension))
                 flow += wp.float64(stretch[s]) - d
                 if s != last:
                     link = right_link[s]
@@ -263,31 +319,27 @@ def tendon_material_transfer_delta(
     if max_delta <= 0.0:
         return 0.0
 
-    force_high0 = wp.max(
-        tendon_material_tension(
-            length_high,
-            length_high - stretch_high,
-            compliance_high,
-            sigmoid_ea_low,
-            sigmoid_ea_ratio,
-            sigmoid_transition_strain,
-            sigmoid_transition_width,
-        )
-        + wp.min(damping_tension_high, damping_rate_high * wp.max(stretch_high, 0.0)),
-        0.0,
+    force_high0 = _material_sweep_tension(
+        length_high,
+        stretch_high,
+        compliance_high,
+        damping_tension_high,
+        sigmoid_ea_low,
+        sigmoid_ea_ratio,
+        sigmoid_transition_strain,
+        sigmoid_transition_width,
+        damping_rate_high,
     )
-    force_low0 = wp.max(
-        tendon_material_tension(
-            length_low,
-            length_low - stretch_low,
-            compliance_low,
-            sigmoid_ea_low,
-            sigmoid_ea_ratio,
-            sigmoid_transition_strain,
-            sigmoid_transition_width,
-        )
-        + wp.min(damping_tension_low, damping_rate_low * wp.max(stretch_low, 0.0)),
-        0.0,
+    force_low0 = _material_sweep_tension(
+        length_low,
+        stretch_low,
+        compliance_low,
+        damping_tension_low,
+        sigmoid_ea_low,
+        sigmoid_ea_ratio,
+        sigmoid_transition_strain,
+        sigmoid_transition_width,
+        damping_rate_low,
     )
     # Frozen-secant compliances of both segments (rest / EA(strain)); a slack low segment
     # falls back to the low-strain plateau so the guess stays finite.
@@ -304,31 +356,27 @@ def tendon_material_transfer_delta(
     hi = max_delta
     trial = guess
     for _iteration in range(32):
-        trial_force_high = wp.max(
-            tendon_material_tension(
-                length_high,
-                length_high - stretch_high + trial,
-                compliance_high,
-                sigmoid_ea_low,
-                sigmoid_ea_ratio,
-                sigmoid_transition_strain,
-                sigmoid_transition_width,
-            )
-            + wp.min(damping_tension_high, damping_rate_high * wp.max(stretch_high - trial, 0.0)),
-            0.0,
+        trial_force_high = _material_sweep_tension(
+            length_high,
+            stretch_high - trial,
+            compliance_high,
+            damping_tension_high,
+            sigmoid_ea_low,
+            sigmoid_ea_ratio,
+            sigmoid_transition_strain,
+            sigmoid_transition_width,
+            damping_rate_high,
         )
-        trial_force_low = wp.max(
-            tendon_material_tension(
-                length_low,
-                length_low - stretch_low - trial,
-                compliance_low,
-                sigmoid_ea_low,
-                sigmoid_ea_ratio,
-                sigmoid_transition_strain,
-                sigmoid_transition_width,
-            )
-            + wp.min(damping_tension_low, damping_rate_low * wp.max(stretch_low + trial, 0.0)),
-            0.0,
+        trial_force_low = _material_sweep_tension(
+            length_low,
+            stretch_low + trial,
+            compliance_low,
+            damping_tension_low,
+            sigmoid_ea_low,
+            sigmoid_ea_ratio,
+            sigmoid_transition_strain,
+            sigmoid_transition_width,
+            damping_rate_low,
         )
         residual = trial_force_high - cap_ratio * trial_force_low
         # Entry tension can be much larger than the final tension on an unloading span.
@@ -1731,7 +1779,7 @@ def _make_solve_tendon_material(direct_enabled: bool):
                         seg_stretch[right] = seg_stretch[right] - seg_rolling_delta_l[right]
 
                 unit_guides = int(0)
-                if adaptive_cone_sweeps != 0 and sigmoid_ea_low <= 0.0:
+                if adaptive_cone_sweeps != 0:
                     for i in range(1, num_links - 1):
                         link = link_start + i
                         if tendon_link_cone_seg_l[link] >= 0 and tendon_link_cap_ratio[link] == 1.0:
@@ -1739,7 +1787,7 @@ def _make_solve_tendon_material(direct_enabled: bool):
                             if unit_guides == 2:
                                 break
                 has_slack = int(0)
-                if sigmoid_ea_low <= 0.0 and direct.slack_enabled:
+                if direct.slack_enabled and (sigmoid_ea_low <= 0.0 or unit_guides >= 2):
                     first = seg_offset
                     while first < seg_offset + num_segs:
                         if seg_active[first] == 0:
@@ -1775,6 +1823,9 @@ def _make_solve_tendon_material(direct_enabled: bool):
                             direct.slack,
                             direct.slack_blocks,
                             unit_guides >= 2,
+                            wp.vec4(
+                                sigmoid_ea_low, sigmoid_ea_ratio, sigmoid_transition_strain, sigmoid_transition_width
+                            ),
                         )
                         has_slack = wp.max(has_slack, direct.slack[first])
                         first = last + 1
@@ -2030,6 +2081,10 @@ def _make_solve_tendon_material(direct_enabled: bool):
                                         tendon_link_cap_ratio,
                                         dt,
                                         min_rest,
+                                        sigmoid_ea_low,
+                                        sigmoid_ea_ratio,
+                                        sigmoid_transition_strain,
+                                        sigmoid_transition_width,
                                     )
                             first_run = last_run + 1
 

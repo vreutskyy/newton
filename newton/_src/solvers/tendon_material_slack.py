@@ -1,9 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Exact zero-force allocation for linear, finite-friction material components."""
+"""Zero-force allocation for finite-friction material components."""
 
 import warp as wp
+
+from .tendon_material_nonlinear import _inverse_extension, _round_nonnegative_down
+
+_LINEAR_MATERIAL = wp.vec4(0.0)
 
 
 @wp.struct
@@ -44,8 +48,28 @@ def _mean(block: TendonSlackBlock):
 
 
 @wp.func
-def _limit(length: float, compliance: float, damping_tension: float) -> float:
-    return wp.min(-compliance * wp.min(damping_tension, 0.0), length - 1.0e-6)
+def _zero_force_extension(length: float, compliance: float, damping_tension: float, sigmoid: wp.vec4) -> float:
+    if damping_tension >= 0.0:
+        return 0.0
+    if sigmoid[0] <= 0.0:
+        return -compliance * damping_tension
+    # Negative damping is uncapped on the tensile branch: invert the elastic
+    # force it cancels, rather than using the segment's linear compliance.
+    return _round_nonnegative_down(
+        _inverse_extension(
+            wp.float64(-damping_tension),
+            wp.float64(length),
+            wp.float64(sigmoid[0]),
+            wp.float64(sigmoid[1]),
+            wp.float64(sigmoid[2]),
+            wp.float64(sigmoid[3]),
+        )
+    )
+
+
+@wp.func
+def _limit(length: float, compliance: float, damping_tension: float, sigmoid: wp.vec4) -> float:
+    return wp.min(_zero_force_extension(length, compliance, damping_tension, sigmoid), length - 1.0e-6)
 
 
 @wp.func
@@ -62,6 +86,7 @@ def project_slack_component(
     slack: wp.array[int],
     blocks: wp.array[TendonSlackBlock],
     advance_payout: bool = False,
+    sigmoid: wp.vec4 = _LINEAR_MATERIAL,
 ):
     """Project a slack component, or advance unavoidable payout in a taut one.
 
@@ -87,9 +112,10 @@ def project_slack_component(
     for seg in range(first, last + 1):
         if active[seg] == 0:
             continue
-        if compliance[seg] <= 0.0 or not wp.isfinite(compliance[seg]):
+        if sigmoid[0] <= 0.0 and (compliance[seg] <= 0.0 or not wp.isfinite(compliance[seg])):
             return
-        limit = _limit(length[seg], compliance[seg], damping[seg])
+        endpoint = _zero_force_extension(length[seg], compliance[seg], damping[seg], sigmoid)
+        limit = wp.min(endpoint, length[seg] - 1.0e-6)
         if not wp.isfinite(limit) or not wp.isfinite(stretch[seg]):
             return
         capacity, capacity_error = _add(capacity, capacity_error, wp.float64(limit))
@@ -97,7 +123,7 @@ def project_slack_component(
         unchanged = unchanged and stretch[seg] <= limit
         if advance_payout:
             has_spare = has_spare or stretch[seg] < limit
-            can_pull_taut = can_pull_taut and -compliance[seg] * wp.min(damping[seg], 0.0) < length[seg] - 1.0e-6
+            can_pull_taut = can_pull_taut and endpoint < length[seg] - 1.0e-6
             can_pull_taut = can_pull_taut and stretch[seg] <= length[seg] - 1.0e-6
     if capacity + capacity_error < wp.float64(0.0):
         if advance_payout and has_spare and can_pull_taut:
@@ -114,7 +140,7 @@ def project_slack_component(
             for seg in range(first, last + 1):
                 if active[seg] == 0:
                     continue
-                limit = _limit(length[seg], compliance[seg], damping[seg])
+                limit = _limit(length[seg], compliance[seg], damping[seg], sigmoid)
                 trial, error = _add(trial, error, wp.float64(stretch[seg]) - wp.float64(limit))
                 prefix = trial + error
                 corrected = wp.clamp(prefix, wp.float64(0.0), excess)
@@ -137,7 +163,7 @@ def project_slack_component(
     for seg in range(first, last):
         if active[seg] == 0:
             continue
-        limit = _limit(length[seg], compliance[seg], damping[seg])
+        limit = _limit(length[seg], compliance[seg], damping[seg], sigmoid)
         prefix, prefix_error = _add(prefix, prefix_error, wp.float64(stretch[seg]))
         prefix, prefix_error = _add(prefix, prefix_error, -wp.float64(limit))
         block = TendonSlackBlock()
@@ -175,7 +201,7 @@ def project_slack_component(
         for seg in range(begin, block.end + 1):
             if active[seg] == 0:
                 continue
-            limit = _limit(length[seg], compliance[seg], damping[seg])
+            limit = _limit(length[seg], compliance[seg], damping[seg], sigmoid)
             prefix, prefix_error = _add(prefix, prefix_error, wp.float64(stretch[seg]))
             prefix, prefix_error = _add(prefix, prefix_error, -wp.float64(limit))
             gap, gap_error = _add(fit, fit_error, -previous_fit)
@@ -189,5 +215,7 @@ def project_slack_component(
         begin = block.end + 1
     gap, gap_error = _add(capacity, capacity_error, -previous_fit)
     gap_error -= previous_error
-    stretch[last] = float(wp.float64(_limit(length[last], compliance[last], damping[last])) - (gap + gap_error))
+    stretch[last] = float(
+        wp.float64(_limit(length[last], compliance[last], damping[last], sigmoid)) - (gap + gap_error)
+    )
     slack[last] = 1

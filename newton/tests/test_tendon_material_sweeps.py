@@ -113,6 +113,8 @@ def solve_material_case(
     direct=False,
     capture=False,
     segment_lengths=None,
+    initial_rest=None,
+    guide_types=None,
 ):
     """Hold geometry fixed and exercise the production material-transfer kernel."""
     count = len(tensions)
@@ -126,7 +128,9 @@ def solve_material_case(
         if damping_tensions is None
         else np.asarray(damping_tensions, dtype=np.float32)
     )
-    if nonlinear:
+    if initial_rest is not None:
+        rest = np.asarray(initial_rest, dtype=np.float32)
+    elif nonlinear:
         rest = np.array(
             [material_rest(l, t - d) for l, t, d in zip(length, tensions, damping_values, strict=True)],
             dtype=np.float32,
@@ -159,7 +163,7 @@ def solve_material_case(
         wp.array(np.arange(count + 1), dtype=int, device=device),
         wp.array(
             [int(TendonLinkType.ATTACHMENT)]
-            + [int(TendonLinkType.ROLLING)] * (count - 1)
+            + ([int(TendonLinkType.ROLLING)] * (count - 1) if guide_types is None else list(guide_types))
             + [int(TendonLinkType.ATTACHMENT)],
             dtype=int,
             device=device,
@@ -313,6 +317,75 @@ def test_drum_payout_preserves_sticking_roller(test, device):
     expected = np.sum(lengths[:-1].astype(np.float64) - initial[:-1]) / np.sum(compliance[:-1], dtype=np.float64)
     np.testing.assert_allclose(force[:-1], expected, atol=0.002, rtol=1.0e-3)
     test.assertEqual(rest[-1], initial[-1])
+
+
+def test_sigmoid_drum_redistributes_payout(test, device):
+    """Balance a slack pocket across short pinhole segments and loaded frictional rollers."""
+    lengths = np.array([0.06, *[0.000644] * 9, 0.02, 0.016, 0.019, 0.027, 0.011])
+    ratios = np.array([1.0] * 10 + [1.1, 1.17, 1.05, 1.12])
+    expected = 12.0 * np.cumprod(np.r_[1.0, ratios])
+    guides = [TendonLinkType.PINHOLE] * 10 + [TendonLinkType.ROLLING] * 4
+    damping = np.resize([1.0, 0.0, -2.0], len(lengths))
+    rest = np.array([damped_material_rest(l, t, d, 60.0) for l, t, d in zip(lengths, expected, damping, strict=True)])
+    # The donor at the slider must pay out through every guide. Conservation
+    # and the selected sliding friction faces recover the original equilibrium.
+    rest[0] += 0.0015
+    rest[10:] -= 0.0015 * np.array([0.13, 0.13, 0.36, 0.29, 0.09])
+    for reverse in (False, True):
+        order = slice(None, None, -1 if reverse else 1)
+        with test.subTest(reverse=reverse):
+            force, final, initial, count = solve_material_case(
+                device,
+                expected[order],
+                ratios[order],
+                segment_lengths=lengths[order],
+                initial_rest=rest[order],
+                guide_types=guides[order],
+                damping_tensions=damping[order],
+                nonlinear=True,
+                tol=1.0e-3,
+                atol=0.002,
+                capture=device.is_cuda,
+            )
+            np.testing.assert_allclose(force, expected[order], atol=0.015, rtol=0.001)
+            np.testing.assert_allclose(final.sum(dtype=float), initial.sum(dtype=float), atol=1.0e-8, rtol=0)
+            test.assertLess(count, 256)
+
+
+def test_sigmoid_slack_keeps_damped_stretch(test, device):
+    """Keep a stretched segment's material when shortening damping already cancels its elastic force."""
+    lengths = np.array([0.08, 0.01, 0.04, 0.12])
+    rest = lengths.copy()
+    rest[0] += 0.001
+    rest[-1] = material_rest(lengths[-1], 16.0)
+    force, final, initial, _ = solve_material_case(
+        device,
+        [0.0] * 4,
+        [1.0, 1.0, 1.3],
+        segment_lengths=lengths,
+        initial_rest=rest,
+        damping_tensions=[0.0, 0.0, 0.0, -20.0],
+        nonlinear=True,
+    )
+    np.testing.assert_allclose(force, 0.0, atol=1.0e-5)
+    np.testing.assert_array_equal(final, initial)
+
+    # If the tip needs more material, it takes only enough to reach zero
+    # net force. Removing all of its elastic stretch would cause excess slip.
+    zero_rest = material_rest(lengths[-1], 20.0)
+    rest[-1] = zero_rest - 0.0002
+    force, final, initial, _ = solve_material_case(
+        device,
+        [0.0] * 4,
+        [1.0, 1.0, 1.3],
+        segment_lengths=lengths,
+        initial_rest=rest,
+        damping_tensions=[0.0, 0.0, 0.0, -20.0],
+        nonlinear=True,
+    )
+    np.testing.assert_allclose(force, 0.0, atol=0.002)
+    np.testing.assert_allclose(final[-1], zero_rest, atol=2.0e-8, rtol=0)
+    np.testing.assert_allclose(final.sum(dtype=float), initial.sum(dtype=float), atol=1.0e-8, rtol=0)
 
 
 def test_frictionless_run_with_damping(test, device):
@@ -857,6 +930,18 @@ def test_vbd_spin_reaction_matches_capstan_projection(test, device):
 
 
 devices = get_test_devices()
+add_function_test(
+    TestTendonMaterialSweeps,
+    "test_sigmoid_drum_redistributes_payout",
+    test_sigmoid_drum_redistributes_payout,
+    devices=devices,
+)
+add_function_test(
+    TestTendonMaterialSweeps,
+    "test_sigmoid_slack_keeps_damped_stretch",
+    test_sigmoid_slack_keeps_damped_stretch,
+    devices=devices,
+)
 add_function_test(
     TestTendonMaterialSweeps,
     "test_drum_payout_preserves_sticking_roller",
