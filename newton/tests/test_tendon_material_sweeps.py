@@ -248,6 +248,98 @@ def solve_material_case(
     return result, rest_gpu.numpy(), rest, int(sweep_count.numpy()[0])
 
 
+def test_frictionless_drum_transmits_tension(test, device):
+    """A row of short guides must transmit load without erasing a neighboring roller's friction."""
+    lengths = np.array([0.031, *[0.000644] * 9, 0.020, 0.016])
+    compliance = np.maximum(lengths / 1.0e5, 1.0e-8)
+    trials = np.array([100.0, *[0.0] * 11])
+    ratios = [1.0] * 10 + [1.5]
+    weights = np.array([1.0] * 11 + [1.0 / 1.5])
+    for reverse in (False, True):
+        order = slice(None, None, -1 if reverse else 1)
+        with test.subTest(reverse=reverse):
+            force, rest, initial, _ = solve_material_case(
+                device,
+                trials[order],
+                ratios[order],
+                segment_lengths=lengths[order],
+                segment_compliance=compliance[order],
+                sweeps=4,
+                tol=1.0e-3,
+            )
+            expected = weights * np.dot(compliance, trials) / np.dot(compliance, weights)
+            np.testing.assert_allclose(force, expected[order], rtol=1.0e-3, atol=0.01)
+            np.testing.assert_allclose(rest.sum(dtype=np.float64), initial.sum(dtype=np.float64), atol=5.0e-9, rtol=0)
+
+
+def test_drum_payout_through_sliding_rollers(test, device):
+    """Take up slack at the slider while the other end pulls through a pinhole drum."""
+    lengths = np.array([0.060, *[0.000644] * 9, 0.020, 0.016, 0.019, 0.027, 0.011], dtype=np.float32)
+    compliance = np.maximum(lengths / 1.0e5, 1.0e-8)
+    # 154.8 micrometres of spare cable face 155 micrometres of extension.
+    extension = 1.0e-6 * np.array([-154.8, *[0.0] * 9, 20.0, 20.0, 55.0, 45.0, 15.0], dtype=np.float32)
+    ratios = np.array([1.0] * 10 + [1.1, 1.17, 1.05, 1.12])
+    weights = np.cumprod(np.r_[1.0, ratios])
+    for reverse in (False, True):
+        order = slice(None, None, -1 if reverse else 1)
+        with test.subTest(reverse=reverse):
+            force, rest, initial, count = solve_material_case(
+                device,
+                (extension / compliance)[order],
+                ratios[order],
+                segment_lengths=lengths[order],
+                segment_compliance=compliance[order],
+                tol=1.0e-3,
+            )
+            # Every guide slips toward the pulled end; the force ratios and
+            # total extension therefore fix the positive tensions uniquely.
+            total = np.sum(lengths[order].astype(np.float64) - initial)
+            expected = weights[order] * total / np.dot(compliance, weights)
+            test.assertLess(count, 256)
+            np.testing.assert_allclose(force, expected, atol=2.0e-3, rtol=1.0e-3)
+            np.testing.assert_allclose(rest.sum(dtype=np.float64), initial.sum(dtype=np.float64), atol=1.0e-8, rtol=0)
+
+
+def test_drum_payout_preserves_sticking_roller(test, device):
+    """Slack can travel through the drum without slipping an adjacent loaded roller."""
+    lengths = np.array([0.06, *[0.000644] * 9, 0.02, 0.03], dtype=np.float32)
+    compliance = np.maximum(lengths / 1.0e5, 1.0e-8)
+    tensions = np.array([2.0] * 11 + [2.5])
+    tensions[0] -= 0.00015 / compliance[0]
+    tensions[10] += 0.00015 / compliance[10]
+    force, rest, initial, _ = solve_material_case(
+        device, tensions, [1.0] * 10 + [2.0], segment_lengths=lengths, segment_compliance=compliance, tol=1.0e-3
+    )
+    expected = np.sum(lengths[:-1].astype(np.float64) - initial[:-1]) / np.sum(compliance[:-1], dtype=np.float64)
+    np.testing.assert_allclose(force[:-1], expected, atol=0.002, rtol=1.0e-3)
+    test.assertEqual(rest[-1], initial[-1])
+
+
+def test_frictionless_run_with_damping(test, device):
+    """Equalize total tension even when different segments use different damping branches."""
+    damping = np.array([3.0, -1.0, 0.05, 0.25])
+    compliance = 0.01
+    force, rest, initial, _ = solve_material_case(
+        device,
+        [12.0, 3.0, 2.0, 4.0],
+        [1.0] * 3,
+        tol=1.0e-3,
+        damping_tensions=damping,
+        segment_compliance=compliance,
+    )
+    # Independent scalar equilibrium from the measured inventory and inverse segment law.
+    lo, hi = 0.0, 15.0
+    for _ in range(50):
+        tension = (lo + hi) * 0.5
+        stretch = np.maximum(compliance * (tension - damping), compliance * tension / (1.0 + 60.0 * compliance))
+        if stretch.sum() < (1.0 - initial).sum(dtype=np.float64):
+            lo = tension
+        else:
+            hi = tension
+    np.testing.assert_allclose(force, (lo + hi) * 0.5, atol=2.0e-5, rtol=0)
+    np.testing.assert_allclose(rest.sum(dtype=np.float64), initial.sum(dtype=np.float64), atol=2.0e-7, rtol=0)
+
+
 def test_adaptive_sweeps_check_final_force_scale(test, device):
     """Resolve small final tensions after a much larger transient material load."""
     for reverse in (False, True):
@@ -765,6 +857,27 @@ def test_vbd_spin_reaction_matches_capstan_projection(test, device):
 
 
 devices = get_test_devices()
+add_function_test(
+    TestTendonMaterialSweeps,
+    "test_drum_payout_preserves_sticking_roller",
+    test_drum_payout_preserves_sticking_roller,
+    devices=devices,
+)
+add_function_test(
+    TestTendonMaterialSweeps,
+    "test_drum_payout_through_sliding_rollers",
+    test_drum_payout_through_sliding_rollers,
+    devices=devices,
+)
+add_function_test(
+    TestTendonMaterialSweeps,
+    "test_frictionless_drum_transmits_tension",
+    test_frictionless_drum_transmits_tension,
+    devices=devices,
+)
+add_function_test(
+    TestTendonMaterialSweeps, "test_frictionless_run_with_damping", test_frictionless_run_with_damping, devices=devices
+)
 add_function_test(
     TestTendonMaterialSweeps,
     "test_adaptive_sweeps_replenished_donor",

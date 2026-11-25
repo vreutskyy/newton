@@ -85,6 +85,128 @@ def _material_sweep_tension(
 
 
 @wp.func
+def _next_transfer_segment(
+    current: int,
+    end: int,
+    active: wp.array[int],
+    right_link: wp.array[int],
+    link_type: wp.array[int],
+    link_active: wp.array[bool],
+    left_segment: wp.array[int],
+    right_segment: wp.array[int],
+    rolling: int,
+    pinholes: int,
+) -> int:
+    link = right_link[current]
+    if link < 0 or left_segment[link] != current:
+        return -1
+    kind = link_type[link]
+    enabled = (rolling != 0 and kind == int(TendonLinkType.ROLLING) and link_active[link]) or (
+        pinholes != 0 and kind == int(TendonLinkType.PINHOLE)
+    )
+    right = right_segment[link]
+    if not enabled or right <= current or right >= end:
+        return -1
+    if active[right] == 0:
+        return -1
+    return right
+
+
+@wp.func
+def _next_sliding_weight(weight: wp.float64, rho: float, slip: float):
+    if slip > 0.0:
+        return weight / wp.float64(rho)
+    return weight * wp.float64(rho)
+
+
+@wp.func
+def _balance_sliding_run(
+    first: int,
+    last: int,
+    active: wp.array[int],
+    length: wp.array[float],
+    compliance: wp.array[float],
+    raw_damping: wp.array[float],
+    damping: wp.array[float],
+    stretch: wp.array[float],
+    right_link: wp.array[int],
+    transfer: wp.array[float],
+    ratio: wp.array[float],
+    dt: float,
+    min_rest: float,
+):
+    """Balance a taut linear run on its sliding capstan faces, conserving total stretch.
+
+    Unit-ratio guides have equal tensions. At a sliding frictional guide the
+    sign of net slip selects the tension ratio. Thus all tensions in this run
+    are known multiples of the first; only its magnitude is unknown.
+    """
+    inventory = wp.float64(0.0)
+    for s in range(first, last + 1):
+        if active[s] != 0:
+            if compliance[s] <= 0.0:
+                return
+            inventory += wp.float64(stretch[s])
+
+    # Invert the damped law at a common positive tension T. Its stretch is
+    # max(c*(T-b), c*T/(1+c*d/dt)). The sum is convex and piecewise affine;
+    # after the first tangent update, each iteration crosses a kink or finishes.
+    tension = wp.float64(0.0)
+    for iteration in range(last - first + 3):
+        used = wp.float64(0.0)
+        slope = wp.float64(0.0)
+        weight = wp.float64(1.0)
+        for s in range(first, last + 1):
+            if active[s] != 0:
+                c = wp.float64(compliance[s])
+                limited = c / (wp.float64(1.0) + c * wp.float64(damping[s] / dt))
+                full_stretch = c * (weight * tension - wp.float64(raw_damping[s]))
+                limited_stretch = limited * weight * tension
+                used += wp.max(full_stretch, limited_stretch)
+                slope += weight * (c if full_stretch >= limited_stretch else limited)
+                if s != last:
+                    link = right_link[s]
+                    weight = _next_sliding_weight(weight, ratio[link], transfer[link])
+                    if weight > wp.float64(1.0e100) or weight < wp.float64(1.0e-100):
+                        return
+        if iteration == 0 and inventory <= used:
+            return  # No unique positive tension: preserve the existing slack allocation.
+        next_tension = tension + (inventory - used) / slope
+        if wp.abs(next_tension - tension) <= wp.float64(1.0e-12) * wp.abs(next_tension):
+            tension = next_tension
+            break
+        tension = next_tension
+
+    # At a rest floor, the capstan equality need not hold. Leave these cases to
+    # the bounded pair projections instead of moving unavailable material.
+    for phase in range(2):
+        flow = wp.float64(0.0)
+        weight = wp.float64(1.0)
+        for s in range(first, last + 1):
+            if active[s] != 0:
+                c = wp.float64(compliance[s])
+                d = wp.max(
+                    c * (weight * tension - wp.float64(raw_damping[s])),
+                    c * weight * tension / (wp.float64(1.0) + c * wp.float64(damping[s] / dt)),
+                )
+                flow += wp.float64(stretch[s]) - d
+                if s != last:
+                    link = right_link[s]
+                    old = transfer[link]
+                    weight = _next_sliding_weight(weight, ratio[link], old)
+                    updated = wp.float64(old) + flow
+                    if phase == 0 and ratio[link] > 1.0 and wp.float64(old) * updated <= wp.float64(0.0):
+                        return  # A stick/slip transition needs another pair projection.
+                    if phase == 1:
+                        transfer[link] = float(updated)
+                if phase == 0:
+                    if d >= wp.float64(length[s] - min_rest):
+                        return
+                else:
+                    stretch[s] = float(d)
+
+
+@wp.func
 def _material_sweep_contact_error(
     tension_l: float,
     tension_r: float,
@@ -1608,6 +1730,14 @@ def _make_solve_tendon_material(direct_enabled: bool):
                         seg_stretch[left] = seg_stretch[left] - seg_rolling_delta_r[left]
                         seg_stretch[right] = seg_stretch[right] - seg_rolling_delta_l[right]
 
+                unit_guides = int(0)
+                if adaptive_cone_sweeps != 0 and sigmoid_ea_low <= 0.0:
+                    for i in range(1, num_links - 1):
+                        link = link_start + i
+                        if tendon_link_cone_seg_l[link] >= 0 and tendon_link_cap_ratio[link] == 1.0:
+                            unit_guides += 1
+                            if unit_guides == 2:
+                                break
                 has_slack = int(0)
                 if sigmoid_ea_low <= 0.0 and direct.slack_enabled:
                     first = seg_offset
@@ -1617,17 +1747,19 @@ def _make_solve_tendon_material(direct_enabled: bool):
                             continue
                         last = first
                         while True:
-                            link = seg_active_link_r[last]
-                            kind = tendon_link_type[link]
-                            enabled = (
-                                apply_rolling_transfer != 0
-                                and kind == int(TendonLinkType.ROLLING)
-                                and tendon_link_active[link]
-                            ) or (apply_pinhole_slip != 0 and kind == int(TendonLinkType.PINHOLE))
-                            right = tendon_link_cone_seg_r[link]
-                            if not enabled or tendon_link_cone_seg_l[link] != last:
-                                break
-                            if right <= last or right >= seg_offset + num_segs or seg_active[right] == 0:
+                            right = _next_transfer_segment(
+                                last,
+                                seg_offset + num_segs,
+                                seg_active,
+                                seg_active_link_r,
+                                tendon_link_type,
+                                tendon_link_active,
+                                tendon_link_cone_seg_l,
+                                tendon_link_cone_seg_r,
+                                apply_rolling_transfer,
+                                apply_pinhole_slip,
+                            )
+                            if right < 0:
                                 break
                             last = right
                         project_slack_component(
@@ -1642,6 +1774,7 @@ def _make_solve_tendon_material(direct_enabled: bool):
                             link_material_transfer,
                             direct.slack,
                             direct.slack_blocks,
+                            unit_guides >= 2,
                         )
                         has_slack = wp.max(has_slack, direct.slack[first])
                         first = last + 1
@@ -1846,6 +1979,59 @@ def _make_solve_tendon_material(direct_enabled: bool):
                         # here would lose small corrections on short, stiff spans.
                         seg_stretch[seg_left] = current_l - change
                         seg_stretch[seg_right] = current_r + change
+
+                    # Propagate tension across short, stiff segments in one block.
+                    # Alternate the unit-ratio block with its sliding neighbors:
+                    # even if a guessed slip direction is rejected, the frictionless
+                    # interior can still exchange material on the return sweep.
+                    if unit_guides >= 2:
+                        first_run = seg_offset
+                        while first_run < seg_offset + num_segs:
+                            if seg_active[first_run] == 0:
+                                first_run += 1
+                                continue
+                            last_run = first_run
+                            run_size = int(1)
+                            while True:
+                                right = _next_transfer_segment(
+                                    last_run,
+                                    seg_offset + num_segs,
+                                    seg_active,
+                                    seg_active_link_r,
+                                    tendon_link_type,
+                                    tendon_link_active,
+                                    tendon_link_cone_seg_l,
+                                    tendon_link_cone_seg_r,
+                                    apply_rolling_transfer,
+                                    apply_pinhole_slip,
+                                )
+                                if right < 0:
+                                    break
+                                link = seg_active_link_r[last_run]
+                                if tendon_link_cap_ratio[link] != 1.0 and (
+                                    material_sweep % 2 == 1 or link_material_transfer[link] == 0.0
+                                ):
+                                    break
+                                last_run = right
+                                run_size += 1
+                            if run_size >= 3:
+                                if has_slack == 0 or direct.slack[first_run] == 0:
+                                    _balance_sliding_run(
+                                        first_run,
+                                        last_run,
+                                        seg_active,
+                                        seg_length,
+                                        seg_active_compliance,
+                                        seg_damping_tension,
+                                        seg_active_damping,
+                                        seg_stretch,
+                                        seg_active_link_r,
+                                        link_material_transfer,
+                                        tendon_link_cap_ratio,
+                                        dt,
+                                        min_rest,
+                                    )
+                            first_run = last_run + 1
 
                     # Check the final state after every neighbor has applied its update.
                     # Small changes alone do not establish balance, and a large update

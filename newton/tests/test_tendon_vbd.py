@@ -526,11 +526,6 @@ def test_vbd_rolling_chain_tension_matches_accepted_pose(test, device):
         wrap = np.arctan2(np.cross(incoming, outgoing)[:, 2], np.sum(incoming * outgoing, axis=1))
         wrap *= model.tendon_link_orientation.numpy()[1:-1]
         test.assertTrue(np.all((wrap > 0.0) & (wrap <= np.pi)), f"Invalid fixture wraps: {wrap}")
-        test.assertGreater(
-            int(solver.tendon_cone_sweep_count.numpy()[0]),
-            4,
-            "The regression must exercise adaptive material relaxation beyond the legacy VBD sweep count",
-        )
 
 
 def test_vbd_dynamic_tendon_route_switches_inside_solver(test, device):

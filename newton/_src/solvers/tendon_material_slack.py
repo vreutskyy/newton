@@ -61,14 +61,16 @@ def project_slack_component(
     transfer: wp.array[float],
     slack: wp.array[int],
     blocks: wp.array[TendonSlackBlock],
+    advance_payout: bool = False,
 ):
-    """Find the zero-force allocation with minimum squared net material transfer.
+    """Project a slack component, or advance unavoidable payout in a taut one.
 
     Pairwise cone projections can approach zero only asymptotically. A tiny
     positive residual then activates the full elastic stiffness in VBD. For a
     connected component whose total material permits zero force, solve that
     branch explicitly, including signed damping and the minimum rest length.
-    No force threshold is used; taut components are left to the friction sweeps.
+    When enabled, the taut branch removes only the prefix extension outside
+    its feasible range before the friction sweeps.
 
     With d_i = trial_stretch_i - zero_force_limit_i, cumulative transfer q_j
     gives final stretch_i = trial_stretch_i + q_(i-1) - q_i. Writing
@@ -80,6 +82,8 @@ def project_slack_component(
     capacity = wp.float64(0.0)
     capacity_error = wp.float64(0.0)
     unchanged = bool(True)
+    has_spare = bool(False)
+    can_pull_taut = bool(True)
     for seg in range(first, last + 1):
         if active[seg] == 0:
             continue
@@ -91,7 +95,35 @@ def project_slack_component(
         capacity, capacity_error = _add(capacity, capacity_error, wp.float64(limit))
         capacity, capacity_error = _add(capacity, capacity_error, -wp.float64(stretch[seg]))
         unchanged = unchanged and stretch[seg] <= limit
+        if advance_payout:
+            has_spare = has_spare or stretch[seg] < limit
+            can_pull_taut = can_pull_taut and -compliance[seg] * wp.min(damping[seg], 0.0) < length[seg] - 1.0e-6
+            can_pull_taut = can_pull_taut and stretch[seg] <= length[seg] - 1.0e-6
     if capacity + capacity_error < wp.float64(0.0):
+        if advance_payout and has_spare and can_pull_taut:
+            # For a taut cable, each segment's extension above its zero-force limit
+            # is nonnegative. Thus the sum to the left of any guide must be in
+            # [0, excess], even with friction. Move only the material required to
+            # reach that interval; the pair sweeps still determine the capstan forces.
+            # Clamping both adjacent prefixes moves each stretch toward its
+            # zero-force limit, so it cannot cross the checked rest-length floor.
+            excess = -(capacity + capacity_error)
+            trial = wp.float64(0.0)
+            error = wp.float64(0.0)
+            previous_prefix = wp.float64(0.0)
+            for seg in range(first, last + 1):
+                if active[seg] == 0:
+                    continue
+                limit = _limit(length[seg], compliance[seg], damping[seg])
+                trial, error = _add(trial, error, wp.float64(stretch[seg]) - wp.float64(limit))
+                prefix = trial + error
+                corrected = wp.clamp(prefix, wp.float64(0.0), excess)
+                if seg == last:
+                    corrected = excess  # No transfer through the component boundary.
+                else:
+                    transfer[right_link[seg]] = float(prefix - corrected)
+                stretch[seg] = float(wp.float64(limit) + (corrected - previous_prefix))
+                previous_prefix = corrected
         return
     if unchanged:
         for seg in range(first, last + 1):
